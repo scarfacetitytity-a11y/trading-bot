@@ -29,6 +29,7 @@ from strategies.macd import MACDStrategy
 from strategies.bollinger_bands import BollingerBands
 from strategies.sniper import SniperStrategy
 from strategies.forex_master import ForexMasterStrategy
+from strategies.sniper_master import SniperMasterStrategy
 
 logger = logging.getLogger(__name__)
 
@@ -39,6 +40,7 @@ STRATEGIES = {
     "bollinger_bands": BollingerBands,
     "sniper": SniperStrategy,
     "forex_master": ForexMasterStrategy,
+    "sniper_master": SniperMasterStrategy,
 }
 
 # Seconds per timeframe — used to sleep until next bar
@@ -184,7 +186,7 @@ def _safety_check(cfg: dict) -> bool:
 
 def main():
     parser = argparse.ArgumentParser(description="Run the live trading bot.")
-    parser.add_argument("--strategy", default="forex_master", choices=list(STRATEGIES))
+    parser.add_argument("--strategy", default="sniper_master", choices=list(STRATEGIES))
     parser.add_argument("--symbol", default=None,
                         help="Single symbol to trade (default: all in config)")
     parser.add_argument("--dry-run", action="store_true",

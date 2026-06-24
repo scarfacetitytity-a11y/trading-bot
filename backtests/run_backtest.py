@@ -18,6 +18,7 @@ from strategies.macd import MACDStrategy
 from strategies.bollinger_bands import BollingerBands
 from strategies.sniper import SniperStrategy
 from strategies.forex_master import ForexMasterStrategy
+from strategies.sniper_master import SniperMasterStrategy
 
 STRATEGIES = {
     "sma_crossover": SMACrossover,
@@ -26,6 +27,7 @@ STRATEGIES = {
     "bollinger_bands": BollingerBands,
     "sniper": SniperStrategy,
     "forex_master": ForexMasterStrategy,
+    "sniper_master": SniperMasterStrategy,
 }
 
 
