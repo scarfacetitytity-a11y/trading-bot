@@ -19,6 +19,10 @@ from strategies.bollinger_bands import BollingerBands
 from strategies.sniper import SniperStrategy
 from strategies.forex_master import ForexMasterStrategy
 from strategies.sniper_master import SniperMasterStrategy
+from strategies.sniper_trend import SniperTrendStrategy
+from strategies.london_breakout import LondonBreakoutStrategy
+from strategies.ict_smart_money import ICTSmartMoneyStrategy
+from strategies.donchian_breakout import DonchianBreakoutStrategy
 
 STRATEGIES = {
     "sma_crossover": SMACrossover,
@@ -28,6 +32,10 @@ STRATEGIES = {
     "sniper": SniperStrategy,
     "forex_master": ForexMasterStrategy,
     "sniper_master": SniperMasterStrategy,
+    "sniper_trend": SniperTrendStrategy,
+    "london_breakout": LondonBreakoutStrategy,
+    "ict_smart_money": ICTSmartMoneyStrategy,
+    "donchian_breakout": DonchianBreakoutStrategy,
 }
 
 
