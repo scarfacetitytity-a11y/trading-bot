@@ -1,0 +1,42 @@
+# Copy this file to config.yaml and adjust as needed.
+# config.yaml is gitignored - non-secret settings only go here.
+# Credentials (login/password/server) live in .env, not here.
+
+mt5:
+  # Path to terminal64.exe. Update this to match your installed MT5 terminal.
+  terminal_path: "C:/Program Files/MetaTrader 5/terminal64.exe"
+
+data:
+  symbols:
+    - XAUUSD
+    - US30
+    - US100
+    - GBPUSD
+  timeframe: M15        # M1, M5, M15, M30, H1, H4, D1, W1, MN1
+
+  # If both start_date and end_date are set (YYYY-MM-DD), the pipeline pulls
+  # that exact date range. Leave either one blank/empty to instead pull the
+  # most recent `num_bars` candles.
+  start_date: "2022-01-01"
+  end_date: "2025-01-01"    # 3 years gives per-year comparison in run_compare
+  num_bars: 5000             # fallback if start/end dates are blank
+
+logging:
+  level: INFO
+  log_dir: logs
+  log_file: data_pipeline.log
+
+trading:
+  strategy: sma_crossover         # sma_crossover | rsi | macd | bollinger_bands
+  magic: 234001                    # unique number to tag bot orders in MT5
+  lookback_bars: 500               # bars of history loaded for signal generation
+
+  # Position sizing
+  risk_mode: fixed                 # 'fixed' = use lot_size; 'risk_pct' = size by risk %
+  lot_size: 0.01                   # used when risk_mode=fixed
+  risk_pct: 1.0                    # % of balance to risk per trade (risk_mode=risk_pct)
+  stop_loss_points: 200            # SL distance in points (also used for risk_pct sizing)
+  take_profit_points: 0            # 0 = no TP (rely on strategy exit signal)
+
+  # Safety: must explicitly set to true to trade a real (non-demo) account
+  allow_real_account: false

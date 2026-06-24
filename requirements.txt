@@ -1,0 +1,16 @@
+# --- Data handling ---
+pandas
+numpy
+
+# --- MetaTrader 5 integration (Windows only) ---
+MetaTrader5
+
+# --- Config management ---
+PyYAML
+python-dotenv
+
+# --- Testing ---
+pytest
+
+# --- Backtest analysis / plotting ---
+matplotlib

@@ -1,0 +1,28 @@
+# Virtual environment
+venv/
+.venv/
+
+# Python bytecode / packaging
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+
+# Secrets / local config
+.env
+config/config.yaml
+
+# Logs
+logs/*.log
+
+# Historical/processed data (regenerate from source, don't commit)
+data/raw/*
+data/processed/*
+!data/raw/.gitkeep
+!data/processed/.gitkeep
+
+# Editor/IDE
+.vscode/
+.idea/
