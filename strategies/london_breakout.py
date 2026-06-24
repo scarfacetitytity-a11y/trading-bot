@@ -1,15 +1,22 @@
-"""London Breakout Strategy.
+"""London Breakout Strategy — improved.
 
 Asian session (00:00-07:00 UTC) forms a consolidation range.
 At London open (07:00 UTC) trade the breakout of that range.
 
-Long  : price breaks ABOVE Asian session high at London open
-Short : price breaks BELOW Asian session low at London open
+Improvements over basic version:
+  1. SMA 200 trend filter — only trade breakouts in direction of the trend
+  2. Range-based stop     — stop at opposite side of Asian range (logical SL)
+  3. Minimum range filter — skip days where Asian range < min_range_atr * ATR
+                            (tight ranges = choppy = fake breakouts)
+
+Entry:
+  Long  : price > Asian high at 07:00 AND price > SMA200 AND range wide enough
+  Short : price < Asian low  at 07:00 AND price < SMA200 AND range wide enough
 
 Exit (whichever hits first):
-  1. ATR stop    — entry ± atr_mult * ATR
-  2. 2:1 target  — profit target = atr_target * ATR from entry
-  3. Session end — close any open trade at 17:00 UTC (NY close)
+  1. Range stop   — opposite Asian range extreme (Asian low for longs, high for shorts)
+  2. ATR target   — atr_target * ATR from entry
+  3. Session end  — force close at 17:00 UTC
 """
 import numpy as np
 import pandas as pd
@@ -20,58 +27,70 @@ from strategies.base import Strategy
 class LondonBreakoutStrategy(Strategy):
     def __init__(
         self,
-        asian_start: int = 0,    # UTC hour Asian session starts
-        asian_end: int = 7,      # UTC hour London opens
-        session_close: int = 17, # UTC hour to force-close trades
+        asian_start: int = 0,      # UTC hour Asian session starts
+        asian_end: int = 7,        # UTC hour London opens
+        session_close: int = 17,   # UTC hour to force-close all trades
+        sma_period: int = 200,     # trend filter — only trade in SMA direction
+        min_range_atr: float = 0.5,# Asian range must be >= this * ATR (avoids flat days)
         atr_period: int = 14,
-        atr_mult: float = 1.5,   # stop distance
-        atr_target: float = 3.0, # profit target distance
+        atr_target: float = 2.0,   # profit target in ATR multiples
         long_only: bool = False,
     ):
         self.asian_start = asian_start
         self.asian_end = asian_end
         self.session_close = session_close
+        self.sma_period = sma_period
+        self.min_range_atr = min_range_atr
         self.atr_period = atr_period
-        self.atr_mult = atr_mult
         self.atr_target = atr_target
         self.long_only = long_only
 
     @property
     def name(self) -> str:
-        return f"LondonBreakout(atr={self.atr_period}x{self.atr_mult}/tgt{self.atr_target})"
+        return (
+            f"LondonBreakout(sma={self.sma_period}"
+            f",minrange={self.min_range_atr}atr,tgt={self.atr_target}atr)"
+        )
 
     def generate_signals(self, df: pd.DataFrame) -> pd.Series:
         close  = df["close"].astype(float)
         high   = df["high"].astype(float)
         low    = df["low"].astype(float)
 
+        sma    = close.rolling(self.sma_period).mean()
         atr    = _atr(high, low, close, self.atr_period)
         times  = pd.to_datetime(df["time"])
         hour   = times.dt.hour
         date   = times.dt.date
 
-        warmup = self.atr_period
+        warmup = max(self.sma_period, self.atr_period)
+
+        # Pre-compute Asian range per day
+        asian_mask = (hour >= self.asian_start) & (hour < self.asian_end)
+        dates_list = list(date)
+        asian_high = {}
+        asian_low  = {}
+
+        for idx, (d, is_asian, h_val, l_val) in enumerate(
+            zip(dates_list, asian_mask, high, low)
+        ):
+            if is_asian:
+                if d not in asian_high or h_val > asian_high[d]:
+                    asian_high[d] = h_val
+                if d not in asian_low or l_val < asian_low[d]:
+                    asian_low[d] = l_val
 
         signals     = pd.Series(0, index=df.index)
         position    = 0
         stop_loss   = None
         take_profit = None
 
-        # Pre-compute Asian range per day
-        asian_mask  = (hour >= self.asian_start) & (hour < self.asian_end)
-        asian_high  = {}
-        asian_low   = {}
-        for d in pd.Series(date).unique():
-            mask = (pd.Series(date) == d) & asian_mask
-            if mask.any():
-                asian_high[d] = high[mask].max()
-                asian_low[d]  = low[mask].min()
-
         for i in range(warmup, len(df)):
             c       = close.iloc[i]
             h       = hour.iloc[i]
-            d       = date[i]
+            d       = dates_list[i]
             atr_val = atr.iloc[i]
+            sma_val = sma.iloc[i]
 
             # --- Force close at session end ---
             if position != 0 and h >= self.session_close:
@@ -95,13 +114,23 @@ class LondonBreakoutStrategy(Strategy):
                 a_low  = asian_low.get(d)
 
                 if a_high is not None and a_low is not None:
-                    if c > a_high:
+                    asian_range = a_high - a_low
+
+                    # Skip tight/flat days
+                    if asian_range < self.min_range_atr * atr_val:
+                        signals.iloc[i] = position
+                        continue
+
+                    # Long: breakout above Asian high AND above SMA (uptrend)
+                    if c > a_high and c > sma_val:
                         position    = 1
-                        stop_loss   = c - self.atr_mult * atr_val
+                        stop_loss   = a_low                        # stop below Asian range
                         take_profit = c + self.atr_target * atr_val
-                    elif not self.long_only and c < a_low:
+
+                    # Short: breakout below Asian low AND below SMA (downtrend)
+                    elif not self.long_only and c < a_low and c < sma_val:
                         position    = -1
-                        stop_loss   = c + self.atr_mult * atr_val
+                        stop_loss   = a_high                       # stop above Asian range
                         take_profit = c - self.atr_target * atr_val
 
             signals.iloc[i] = position
