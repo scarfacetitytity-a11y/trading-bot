@@ -1,24 +1,30 @@
 """Sniper Master Strategy.
 
-Combines the Sniper's high-precision confluence entries with a trend backbone,
-ATR stop loss, volume confirmation, candle confirmation, and trailing stop exit.
+Takes the original Sniper's high-precision entries and adds:
+  - ATR stop loss (2.0x)       — cuts losers before they grow
+  - Volume confirmation         — avoids low-volume false moves
+  - Candle confirmation         — entry bar must close in trade direction
+  - Break-even trailing stop    — moves stop to entry once price hits BB midline
+  - Full target at opposite BB  — rides the full reversion instead of stopping at midline
+
+Works on any pair and any timeframe. No trend filter — the sniper's own
+confluence (RSI extreme + MACD cross + BB band breach) already identifies
+genuine turning points without needing a macro trend gate.
 
 Entry logic (ALL must be true):
-  Long  : SMA50 > SMA200                          (uptrend)
-           AND RSI < rsi_oversold                  (extreme oversold pullback)
-           AND MACD bullish cross within 5 bars    (momentum turning up)
-           AND price below BB lower band           (stretched, snap-back likely)
-           AND volume > 20-bar avg volume          (real buying pressure)
-           AND entry bar closes bullish (close > open)  (candle confirms buyers)
-           AND London or NY session (intraday only)
+  Long  : RSI < rsi_oversold                      (extreme oversold)
+           AND MACD bullish cross within 10 bars   (momentum turning up)
+           AND price below BB lower band           (stretched too far down)
+           AND volume > 70% of 20-bar avg          (real participation)
+           AND entry bar closes bullish            (candle confirms buyers)
+           AND London or NY session (intraday only — skipped on D1+)
 
-  Short : mirror of above with bearish conditions
+  Short : mirror with bearish conditions
 
-Exit logic (whichever hits first):
-  1. ATR stop (2.0x)   — initial hard stop below entry
-  2. Break-even trail  — when price reaches BB midline, stop moves to entry price
-  3. Full target       — exit at BB upper band (longs) / BB lower band (shorts)
-  4. Trend flip        — SMA50/200 crosses against position, exit immediately
+Exit (whichever hits first):
+  1. ATR stop (2.0x)    — hard stop below entry
+  2. Break-even trail   — stop moves to entry price when BB midline is reached
+  3. Full target        — exit at BB upper (longs) / BB lower (shorts)
 """
 import numpy as np
 import pandas as pd
@@ -29,25 +35,22 @@ from strategies.base import Strategy
 class SniperMasterStrategy(Strategy):
     def __init__(
         self,
-        sma_fast: int = 50,
-        sma_slow: int = 200,
         rsi_period: int = 14,
         rsi_oversold: float = 35.0,
         rsi_overbought: float = 65.0,
         macd_fast: int = 12,
         macd_slow: int = 26,
         macd_signal: int = 9,
-        macd_cross_window: int = 5,
+        macd_cross_window: int = 10,
         bb_period: int = 20,
         bb_std: float = 2.0,
         atr_period: int = 14,
-        atr_mult: float = 2.0,          # 2.0x ATR — wider stop for daily bars
-        vol_period: int = 20,           # volume spike lookback
+        atr_mult: float = 2.0,
+        vol_period: int = 20,
+        vol_threshold: float = 0.7,
         session_filter: bool = True,
         long_only: bool = False,
     ):
-        self.sma_fast = sma_fast
-        self.sma_slow = sma_slow
         self.rsi_period = rsi_period
         self.rsi_oversold = rsi_oversold
         self.rsi_overbought = rsi_overbought
@@ -60,14 +63,14 @@ class SniperMasterStrategy(Strategy):
         self.atr_period = atr_period
         self.atr_mult = atr_mult
         self.vol_period = vol_period
+        self.vol_threshold = vol_threshold
         self.session_filter = session_filter
         self.long_only = long_only
 
     @property
     def name(self) -> str:
         return (
-            f"SniperMaster(sma={self.sma_fast}/{self.sma_slow}"
-            f",rsi={self.rsi_oversold}/{self.rsi_overbought}"
+            f"SniperMaster(rsi={self.rsi_oversold}/{self.rsi_overbought}"
             f",bb={self.bb_period},atr={self.atr_period}x{self.atr_mult})"
         )
 
@@ -78,18 +81,12 @@ class SniperMasterStrategy(Strategy):
         low    = df["low"].astype(float)
         volume = df["tick_volume"].astype(float)
 
-        # --- Trend ---
-        sma_fast  = close.rolling(self.sma_fast).mean()
-        sma_slow  = close.rolling(self.sma_slow).mean()
-        uptrend   = sma_fast > sma_slow
-        downtrend = sma_fast < sma_slow
-
         # --- RSI ---
         rsi = _rsi(close, self.rsi_period)
 
-        # --- MACD crossover ---
-        ema_f       = close.ewm(span=self.macd_fast,   adjust=False).mean()
-        ema_s       = close.ewm(span=self.macd_slow,   adjust=False).mean()
+        # --- MACD crossover (recent within window) ---
+        ema_f       = close.ewm(span=self.macd_fast,    adjust=False).mean()
+        ema_s       = close.ewm(span=self.macd_slow,    adjust=False).mean()
         macd_line   = ema_f - ema_s
         signal_line = macd_line.ewm(span=self.macd_signal, adjust=False).mean()
         bull_cross  = (macd_line > signal_line) & (macd_line.shift(1) <= signal_line.shift(1))
@@ -106,15 +103,15 @@ class SniperMasterStrategy(Strategy):
         # --- ATR ---
         atr = _atr(high, low, close, self.atr_period)
 
-        # --- Volume spike: current bar volume > 20-bar average ---
-        vol_avg     = volume.rolling(self.vol_period).mean()
-        vol_spike   = volume > vol_avg
+        # --- Volume: above threshold * rolling average ---
+        vol_avg   = volume.rolling(self.vol_period).mean()
+        vol_ok    = volume > (vol_avg * self.vol_threshold)
 
         # --- Candle direction ---
-        bullish_bar = close > open_   # green candle
-        bearish_bar = close < open_   # red candle
+        bullish_bar = close > open_
+        bearish_bar = close < open_
 
-        # --- Session filter ---
+        # --- Session filter (auto-skipped on daily+ bars) ---
         if self.session_filter and "time" in df.columns:
             times = pd.to_datetime(df["time"])
             median_hours = times.diff().dt.total_seconds().median() / 3600
@@ -126,28 +123,28 @@ class SniperMasterStrategy(Strategy):
         else:
             in_session = pd.Series(True, index=df.index)
 
-        warmup = max(self.sma_slow, self.macd_slow + self.macd_signal,
-                     self.bb_period, self.atr_period, self.vol_period)
+        warmup = max(self.macd_slow + self.macd_signal, self.bb_period,
+                     self.atr_period, self.vol_period)
 
         signals      = pd.Series(0, index=df.index)
         position     = 0
         stop_loss    = None
         entry_price  = None
-        be_triggered = False   # has break-even stop been activated?
+        be_triggered = False
 
         for i in range(warmup, len(df)):
             c       = close.iloc[i]
             atr_val = atr.iloc[i]
 
-            # --- Trail stop to break-even when price reaches BB midline ---
+            # --- Trail stop to break-even at BB midline ---
             if position == 1 and not be_triggered and c >= bb_mid.iloc[i]:
-                stop_loss    = entry_price   # move stop to entry (no-loss trade)
+                stop_loss    = entry_price
                 be_triggered = True
             elif position == -1 and not be_triggered and c <= bb_mid.iloc[i]:
                 stop_loss    = entry_price
                 be_triggered = True
 
-            # --- ATR / break-even stop hit ---
+            # --- Stop hit (ATR or break-even) ---
             if position == 1 and stop_loss is not None and c <= stop_loss:
                 position = 0; stop_loss = None; entry_price = None; be_triggered = False
             elif position == -1 and stop_loss is not None and c >= stop_loss:
@@ -159,30 +156,22 @@ class SniperMasterStrategy(Strategy):
             elif position == -1 and c <= bb_lower.iloc[i]:
                 position = 0; stop_loss = None; entry_price = None; be_triggered = False
 
-            # --- Trend flip exit ---
-            if position == 1 and downtrend.iloc[i]:
-                position = 0; stop_loss = None; entry_price = None; be_triggered = False
-            elif position == -1 and uptrend.iloc[i]:
-                position = 0; stop_loss = None; entry_price = None; be_triggered = False
-
             # --- Entries ---
             if position == 0 and not np.isnan(atr_val):
                 long_entry = (
-                    uptrend.iloc[i]
-                    and rsi.iloc[i] < self.rsi_oversold
+                    rsi.iloc[i] < self.rsi_oversold
                     and recent_bull.iloc[i]
                     and c < bb_lower.iloc[i]
-                    and vol_spike.iloc[i]
+                    and vol_ok.iloc[i]
                     and bullish_bar.iloc[i]
                     and in_session.iloc[i]
                 )
                 short_entry = (
                     not self.long_only
-                    and downtrend.iloc[i]
                     and rsi.iloc[i] > self.rsi_overbought
                     and recent_bear.iloc[i]
                     and c > bb_upper.iloc[i]
-                    and vol_spike.iloc[i]
+                    and vol_ok.iloc[i]
                     and bearish_bar.iloc[i]
                     and in_session.iloc[i]
                 )
