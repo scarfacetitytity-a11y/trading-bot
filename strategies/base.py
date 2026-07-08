@@ -22,6 +22,12 @@ class Strategy(ABC):
     def generate_signals(self, df: pd.DataFrame) -> pd.Series:
         """Return a signal series aligned to df's index."""
 
+    def generate_signals_and_stops(self, df: pd.DataFrame) -> tuple:
+        """Return (signals, stop_prices). Strategies populate self._stops in their loop."""
+        signals = self.generate_signals(df)
+        stops = getattr(self, "_stops", pd.Series(float("nan"), index=df.index))
+        return signals, stops
+
     @property
     def name(self) -> str:
         return self.__class__.__name__

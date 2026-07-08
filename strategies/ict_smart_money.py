@@ -60,6 +60,7 @@ class ICTSmartMoneyStrategy(Strategy):
         warmup = max(self.swing_period, self.atr_period)
 
         signals     = pd.Series(0, index=df.index)
+        self._stops = pd.Series(float("nan"), index=df.index)
         position    = 0
         stop_loss   = None
         take_profit = None
@@ -110,7 +111,8 @@ class ICTSmartMoneyStrategy(Strategy):
                     stop_loss   = h + (0.1 * atr_val)   # just above the wick
                     take_profit = c - self.atr_target * atr_val
 
-            signals.iloc[i] = position
+            signals.iloc[i]     = position
+            self._stops.iloc[i] = stop_loss if stop_loss is not None else float("nan")
 
         return signals
 

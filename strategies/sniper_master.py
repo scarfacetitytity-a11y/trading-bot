@@ -127,6 +127,7 @@ class SniperMasterStrategy(Strategy):
                      self.atr_period, self.vol_period)
 
         signals      = pd.Series(0, index=df.index)
+        self._stops  = pd.Series(float("nan"), index=df.index)
         position     = 0
         stop_loss    = None
         entry_price  = None
@@ -187,7 +188,8 @@ class SniperMasterStrategy(Strategy):
                     stop_loss    = c + self.atr_mult * atr_val
                     be_triggered = False
 
-            signals.iloc[i] = position
+            signals.iloc[i]     = position
+            self._stops.iloc[i] = stop_loss if stop_loss is not None else float("nan")
 
         return signals
 

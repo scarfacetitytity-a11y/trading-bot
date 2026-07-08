@@ -58,6 +58,7 @@ class DonchianBreakoutStrategy(Strategy):
         warmup = max(self.entry_period, self.atr_period)
 
         signals     = pd.Series(0, index=df.index)
+        self._stops = pd.Series(float("nan"), index=df.index)
         position    = 0
         stop_loss   = None
         trail_stop  = None
@@ -104,7 +105,8 @@ class DonchianBreakoutStrategy(Strategy):
                     stop_loss  = c + self.atr_mult * atr_val
                     trail_stop = stop_loss
 
-            signals.iloc[i] = position
+            signals.iloc[i]     = position
+            self._stops.iloc[i] = stop_loss if stop_loss is not None else float("nan")
 
         return signals
 

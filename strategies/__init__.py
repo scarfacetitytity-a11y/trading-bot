@@ -10,6 +10,8 @@ from strategies.sniper_trend import SniperTrendStrategy
 from strategies.london_breakout import LondonBreakoutStrategy
 from strategies.ict_smart_money import ICTSmartMoneyStrategy
 from strategies.donchian_breakout import DonchianBreakoutStrategy
+from strategies.trend_rider import TrendRiderStrategy
+from strategies.ict_amd import ICTAMDDisplacementStrategy, ICTAMDBreakerStrategy
 
 __all__ = [
     "Strategy",

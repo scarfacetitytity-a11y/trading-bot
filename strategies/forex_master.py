@@ -110,7 +110,8 @@ class ForexMasterStrategy(Strategy):
         warmup = max(self.sma_slow, self.macd_slow + self.macd_signal,
                      self.bb_period, self.atr_period)
 
-        signals   = pd.Series(0, index=df.index)
+        signals     = pd.Series(0, index=df.index)
+        self._stops = pd.Series(float("nan"), index=df.index)
         position  = 0
         stop_loss = None   # price level that triggers exit
 
@@ -155,7 +156,8 @@ class ForexMasterStrategy(Strategy):
                     position  = -1
                     stop_loss = c + self.atr_mult * atr_val
 
-            signals.iloc[i] = position
+            signals.iloc[i]     = position
+            self._stops.iloc[i] = stop_loss if stop_loss is not None else float("nan")
 
         return signals
 

@@ -81,6 +81,7 @@ class LondonBreakoutStrategy(Strategy):
                     asian_low[d] = l_val
 
         signals     = pd.Series(0, index=df.index)
+        self._stops = pd.Series(float("nan"), index=df.index)
         position    = 0
         stop_loss   = None
         take_profit = None
@@ -118,7 +119,8 @@ class LondonBreakoutStrategy(Strategy):
 
                     # Skip tight/flat days
                     if asian_range < self.min_range_atr * atr_val:
-                        signals.iloc[i] = position
+                        signals.iloc[i]     = position
+                        self._stops.iloc[i] = stop_loss if stop_loss is not None else float("nan")
                         continue
 
                     # Long: breakout above Asian high AND above SMA (uptrend)
@@ -133,7 +135,8 @@ class LondonBreakoutStrategy(Strategy):
                         stop_loss   = a_high                       # stop above Asian range
                         take_profit = c - self.atr_target * atr_val
 
-            signals.iloc[i] = position
+            signals.iloc[i]     = position
+            self._stops.iloc[i] = stop_loss if stop_loss is not None else float("nan")
 
         return signals
 
