@@ -1,4 +1,4 @@
-"""Pair scanner — find every symbol on the broker, pull D1 data, rank by ForexMaster performance.
+"""Pair scanner — find every symbol on the broker, pull D1 data, rank by TrendRider performance.
 
 Usage (project root, venv active, MT5 open and logged in):
     python -m backtests.scanner
@@ -19,7 +19,7 @@ from backtests.mt5_connector import connect, disconnect
 from backtests.data_loader import TIMEFRAME_MAP, save_raw
 from backtests.data_cleaner import clean_data
 from backtests.engine import Backtest
-from strategies.sniper_master import SniperMasterStrategy
+from strategies.trend_rider import TrendRiderStrategy
 
 logger = logging.getLogger(__name__)
 
@@ -62,7 +62,7 @@ def scan(min_years: float, top_n: int) -> None:
     symbols = get_all_symbols()
     logger.info("Found %d symbols on broker — screening all of them...", len(symbols))
 
-    strategy = SniperMasterStrategy()
+    strategy = TrendRiderStrategy()
     results  = []
 
     for i, symbol in enumerate(symbols, 1):
@@ -118,7 +118,7 @@ def scan(min_years: float, top_n: int) -> None:
     ].sort_values("cagr", ascending=False)
 
     print(f"\n{'='*90}")
-    print(f"  TOP PAIRS — ForexMaster strategy aligned  ({START_DATE} to {END_DATE}, D1)")
+    print(f"  TOP PAIRS — TrendRider D1  ({START_DATE} to {END_DATE})")
     print(f"{'='*90}")
     if profitable.empty:
         print("  No profitable pairs found with these filters.")
@@ -132,7 +132,7 @@ def scan(min_years: float, top_n: int) -> None:
                   f"{r['sharpe']:>7.3f} {r['win_rate']:>5.1f}% "
                   f"{r['profit_factor']:>6.3f} {r['trades']:>7}")
 
-    print(f"\n  Scanned {len(symbols)} symbols → {len(df_res)} had trades → "
+    print(f"\n  Scanned {len(symbols)} symbols | {len(df_res)} had trades | "
           f"{len(profitable)} are profitable\n")
 
     # Save full results

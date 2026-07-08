@@ -23,6 +23,8 @@ from strategies.sniper_trend import SniperTrendStrategy
 from strategies.london_breakout import LondonBreakoutStrategy
 from strategies.ict_smart_money import ICTSmartMoneyStrategy
 from strategies.donchian_breakout import DonchianBreakoutStrategy
+from strategies.trend_rider import TrendRiderStrategy
+from strategies.ict_amd import ICTAMDDisplacementStrategy, ICTAMDBreakerStrategy
 
 STRATEGIES = {
     "sma_crossover": SMACrossover,
@@ -36,6 +38,9 @@ STRATEGIES = {
     "london_breakout": LondonBreakoutStrategy,
     "ict_smart_money": ICTSmartMoneyStrategy,
     "donchian_breakout": DonchianBreakoutStrategy,
+    "trend_rider": TrendRiderStrategy,
+    "ict_amd_disp": ICTAMDDisplacementStrategy,
+    "ict_amd_breaker": ICTAMDBreakerStrategy,
 }
 
 

@@ -77,5 +77,5 @@ def log_run_summary(run_type: str, data, extra: dict | None = None):
     with open(out, "w") as f:
         json.dump(payload, f, indent=2, default=str)
 
-    print(f"  [log] Run summary saved → {out.relative_to(Path.cwd()) if out.is_relative_to(Path.cwd()) else out}")
+    print(f"  [log] Run summary saved -> {out.relative_to(Path.cwd()) if out.is_relative_to(Path.cwd()) else out}")
     return out
