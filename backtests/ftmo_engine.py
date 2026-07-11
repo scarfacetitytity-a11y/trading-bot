@@ -271,7 +271,11 @@ def _daily_equity_from_events(
 ) -> pd.Series:
     dates = [pd.to_datetime(t).date() for t in event_times]
     s = pd.Series(event_equity, index=dates)
-    return s.groupby(s.index).last()
+    s = s.groupby(s.index).last()
+    # Forward-fill across calendar days so _ftmo_windows always has dense coverage
+    full_idx = pd.date_range(s.index[0], s.index[-1], freq="D").date
+    s = s.reindex(full_idx).ffill()
+    return s
 
 
 def _compute_metrics(

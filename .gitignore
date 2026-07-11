@@ -26,3 +26,7 @@ data/processed/*
 # Editor/IDE
 .vscode/
 .idea/
+
+# BASE knowledge graph (auto-generated, local only)
+.base/
+.base-ast-cache/
