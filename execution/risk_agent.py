@@ -17,7 +17,7 @@ State is persisted to logs/risk_agent_state.json so it survives restarts.
 from __future__ import annotations
 import json
 from dataclasses import dataclass, field, asdict
-from datetime import datetime, date, timedelta
+from datetime import datetime, date, timedelta, timezone
 from pathlib import Path
 from typing import Optional
 
@@ -120,8 +120,8 @@ class RiskAgent:
 
         # 1. Active pause (consecutive losses or manual pause)
         if s.pause_until:
-            pause_dt = datetime.fromisoformat(s.pause_until)
-            if datetime.utcnow() < pause_dt:
+            pause_dt = datetime.fromisoformat(s.pause_until).replace(tzinfo=timezone.utc)
+            if datetime.now(timezone.utc) < pause_dt:
                 return False, 0.0, f"Paused until {s.pause_until} (consecutive losses)"
             else:
                 s.pause_until = None
@@ -186,7 +186,7 @@ class RiskAgent:
         # Trigger pause if consecutive loss limit hit
         if s.consecutive_losses >= self.config.max_consecutive_losses:
             cooldown = timedelta(hours=self.config.consecutive_loss_cooldown_h)
-            s.pause_until = (datetime.utcnow() + cooldown).isoformat()
+            s.pause_until = (datetime.now(timezone.utc) + cooldown).isoformat()
             print(
                 f"  [RiskAgent] {s.consecutive_losses} consecutive losses — "
                 f"pausing until {s.pause_until}"

@@ -46,6 +46,7 @@ class FVGOrderBlockStrategy(Strategy):
         ob_required: bool    = True,   # require OB confirmation
         session_filter: bool = False,  # filter to London/NY sessions only
         max_active_fvgs: int = 5,      # cap on simultaneous tracked FVGs
+        long_only: bool      = True,   # AiDEN constraint: no short positions
     ):
         self.min_fvg_atr     = min_fvg_atr
         self.max_fvg_wait    = max_fvg_wait
@@ -57,6 +58,7 @@ class FVGOrderBlockStrategy(Strategy):
         self.ob_required     = ob_required
         self.session_filter  = session_filter
         self.max_active_fvgs = max_active_fvgs
+        self.long_only       = long_only
 
     @property
     def name(self) -> str:
@@ -64,7 +66,8 @@ class FVGOrderBlockStrategy(Strategy):
             f"FVG_OB(gap={self.min_fvg_atr}atr"
             f",wait={self.max_fvg_wait}/{self.max_entry_wait}"
             f",rr={self.rr_target}"
-            f",ob={'on' if self.ob_required else 'off'})"
+            f",ob={'on' if self.ob_required else 'off'}"
+            f",{'long_only' if self.long_only else 'bidir'})"
         )
 
     def generate_signals(self, df: pd.DataFrame) -> pd.Series:
@@ -111,7 +114,7 @@ class FVGOrderBlockStrategy(Strategy):
                     position = 0; stop_loss = take_profit = None
                 elif take_profit is not None and hv >= take_profit:
                     position = 0; stop_loss = take_profit = None
-            elif position == -1:
+            elif position == -1 and not self.long_only:
                 if stop_loss is not None and hv >= stop_loss:
                     position = 0; stop_loss = take_profit = None
                 elif take_profit is not None and lv <= take_profit:
@@ -137,17 +140,18 @@ class FVGOrderBlockStrategy(Strategy):
                         })
 
                 # Bearish FVG: gap between c[-2].low and c[0].high
-                bear_gap = l2 - hv
-                if bear_gap >= min_gap:
-                    if not self.ob_required or _has_ob(open_, close, i - 2, self.ob_lookback, "bear"):
-                        active_fvgs.append({
-                            "dir":      "bear",
-                            "fvg_lo":   hv,     # bottom of the gap (c[0].high)
-                            "fvg_hi":   l2,     # top of the gap (c[-2].low)
-                            "formed":   i,
-                            "tested":   False,
-                            "test_bar": None,
-                        })
+                if not self.long_only:
+                    bear_gap = l2 - hv
+                    if bear_gap >= min_gap:
+                        if not self.ob_required or _has_ob(open_, close, i - 2, self.ob_lookback, "bear"):
+                            active_fvgs.append({
+                                "dir":      "bear",
+                                "fvg_lo":   hv,     # bottom of the gap (c[0].high)
+                                "fvg_hi":   l2,     # top of the gap (c[-2].low)
+                                "formed":   i,
+                                "tested":   False,
+                                "test_bar": None,
+                            })
 
                 # Trim oldest if over cap
                 if len(active_fvgs) > self.max_active_fvgs:

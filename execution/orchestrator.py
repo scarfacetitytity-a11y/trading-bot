@@ -27,6 +27,7 @@ Usage:
 """
 import argparse
 import logging
+import math
 import sys
 import time
 import threading
@@ -46,6 +47,9 @@ from backtests.data_loader import TIMEFRAME_MAP
 from execution import trader, risk
 from strategies.sniper import SniperStrategy
 from strategies.london_breakout import LondonBreakoutStrategy
+from strategies.fvg_ob import FVGOrderBlockStrategy
+from execution.risk_agent import RiskAgent, RiskConfig
+from execution.ftmo_tracker import FTMOTracker
 
 logger = logging.getLogger(__name__)
 
@@ -65,6 +69,7 @@ _TF_SECONDS = {
 STRATEGY_MAP = {
     "sniper":          SniperStrategy,
     "london_breakout": LondonBreakoutStrategy,
+    "fvg_ob":          FVGOrderBlockStrategy,
 }
 
 
@@ -347,19 +352,83 @@ class TradingEngine(Component):
         strategy,
         tf_str: str,
         trade_cfg: dict,
+        risk_agent: RiskAgent,
+        ftmo_tracker=None,
         dry_run: bool = False,
     ):
         name = f"TradingEngine[{symbol}]"
         tf_secs = _TF_SECONDS.get(tf_str, 3600)
         super().__init__(name, registry, kill_switch, beat_timeout=tf_secs * 4)
-        self._symbol    = symbol
-        self._strategy  = strategy
-        self._tf_str    = tf_str
-        self._tf_code   = TIMEFRAME_MAP.get(tf_str)
-        self._trade_cfg = trade_cfg
-        self._dry_run   = dry_run
-        self._lookback  = trade_cfg.get("lookback_bars", 500)
-        self._last_bar  = None
+        self._symbol      = symbol
+        self._strategy    = strategy
+        self._tf_str      = tf_str
+        self._tf_code     = TIMEFRAME_MAP.get(tf_str)
+        self._trade_cfg   = trade_cfg
+        self._risk_agent   = risk_agent
+        self._ftmo_tracker = ftmo_tracker
+        self._dry_run      = dry_run
+        self._lookback    = trade_cfg.get("lookback_bars", 500)
+        self._last_bar    = None
+        self._open_entry_price: Optional[float] = None
+
+    def _size_order(
+        self,
+        direction: int,
+        balance: float,
+        size_mult: float,
+    ) -> tuple[Optional[float], Optional[float], float]:
+        """Return (sl_price, tp_price, lots) for the next order.
+
+        Prefers strategy-computed ATR stops over config fixed points.
+        Falls back to config if the strategy provides no stop.
+        """
+        sl: Optional[float] = None
+        tp: Optional[float] = None
+        atr_sized = False
+
+        # Try to get price-level SL from strategy (e.g. FVG_OB stores ATR stops)
+        stops = getattr(self._strategy, "_stops", None)
+        if stops is not None and len(stops) > 0:
+            raw_sl = float(stops.iloc[-1])
+            if not math.isnan(raw_sl) and raw_sl > 0:
+                sl = raw_sl
+
+        if sl is not None:
+            # Compute entry from live tick
+            tick = mt5.symbol_info_tick(self._symbol)
+            entry = tick.ask if direction == 1 else tick.bid
+            dist = abs(entry - sl)
+
+            # Size lots so that SL hit = risk_pct of balance
+            risk_pct = float(self._trade_cfg.get("risk_pct", 1.0)) / 100
+            info = mt5.symbol_info(self._symbol)
+            if info and info.trade_tick_size > 0 and dist > 0:
+                point_value_per_lot = (
+                    info.trade_tick_value / info.trade_tick_size * info.point
+                )
+                sl_points = dist / info.point
+                sl_value_per_lot = sl_points * point_value_per_lot
+                raw_lots = (balance * risk_pct) / sl_value_per_lot if sl_value_per_lot > 0 else 0.01
+            else:
+                raw_lots = float(self._trade_cfg.get("lot_size", 0.01))
+
+            # Compute TP via strategy RR ratio
+            rr = getattr(self._strategy, "rr_target", 2.0)
+            tp = (entry + rr * dist) if direction == 1 else (entry - rr * dist)
+            if info:
+                tp = round(tp, info.digits)
+                sl = round(sl, info.digits)
+            atr_sized = True
+        else:
+            # Fallback: config fixed points
+            raw_lots = float(self._trade_cfg.get("lot_size", 0.01))
+            sl, tp   = risk.calculate_sl_tp(self._symbol, direction, self._trade_cfg)
+
+        lots = raw_lots if atr_sized else risk.calculate_lots(self._symbol, self._trade_cfg, balance)
+        lots = round(lots * size_mult, 2)
+        lots = max(lots, 0.01)
+
+        return sl, tp, lots
 
     def run(self) -> None:
         tf_secs      = _TF_SECONDS.get(self._tf_str, 3600)
@@ -409,25 +478,42 @@ class TradingEngine(Component):
                 if desired == current:
                     continue
 
-                # Close existing position
+                account = trader.get_account()
+                equity  = account["equity"] if "equity" in account else account["balance"]
+
+                # Close existing position and record trade outcome
                 if current != 0:
                     if self._dry_run:
                         logger.info("[%s] DRY RUN: close %s", self.name,
                                     "LONG" if current == 1 else "SHORT")
                     else:
                         trader.close_all(self._symbol)
+                        if self._open_entry_price is not None:
+                            r_mult = (equity - account["balance"]) / account["balance"]
+                            self._risk_agent.record_trade(r_mult, equity)
+                            if self._ftmo_tracker is not None:
+                                self._ftmo_tracker.record_trade_day(equity)
+                            self._open_entry_price = None
 
-                # Open new position
+                # Open new position — gate through RiskAgent first
                 if desired != 0:
-                    account = trader.get_account()
-                    lots    = risk.calculate_lots(self._symbol, self._trade_cfg, account["balance"])
-                    sl, tp  = risk.calculate_sl_tp(self._symbol, desired, self._trade_cfg)
+                    open_count = len(mt5.positions_get() or [])
+                    can_trade, size_mult, reason = self._risk_agent.pre_trade_check(
+                        equity, open_count
+                    )
+                    if not can_trade:
+                        logger.warning("[%s] RiskAgent blocked trade: %s", self.name, reason)
+                        continue
+
+                    sl, tp, lots = self._size_order(desired, account["balance"], size_mult)
                     direction_str = "BUY" if desired == 1 else "SELL"
                     if self._dry_run:
-                        logger.info("[%s] DRY RUN: %s %.2f lots SL=%s TP=%s",
-                                    self.name, direction_str, lots, sl, tp)
+                        logger.info("[%s] DRY RUN: %s %.2f lots SL=%s TP=%s | risk=%s",
+                                    self.name, direction_str, lots, sl, tp, reason)
                     else:
                         trader.place_order(self._symbol, desired, lots, sl=sl, tp=tp)
+                        tick = mt5.symbol_info_tick(self._symbol)
+                        self._open_entry_price = tick.ask if desired == 1 else tick.bid
 
             except Exception as exc:
                 self.registry.fail(self.name, str(exc))
@@ -464,9 +550,15 @@ class Orchestrator:
         trader.set_magic(trade_cfg.get("magic", 234001))
 
         # Build strategy map: symbol → strategy instance
-        strategy_name = trade_cfg.get("strategy", "sniper")
-        strategy_cls  = STRATEGY_MAP.get(strategy_name, SniperStrategy)
+        strategy_name = trade_cfg.get("strategy", "fvg_ob")
+        strategy_cls  = STRATEGY_MAP.get(strategy_name, FVGOrderBlockStrategy)
         self._strategies = {s: strategy_cls() for s in self._symbols}
+
+        # Shared RiskAgent + FTMO tracker — both persist state to disk
+        initial_equity = trade_cfg.get("initial_equity", 10_000)
+        challenge_type = trade_cfg.get("ftmo_challenge", "2step-p1")
+        self._risk_agent    = RiskAgent(initial_equity=initial_equity)
+        self._ftmo_tracker  = FTMOTracker(initial_equity=initial_equity, challenge=challenge_type)
 
     # ── Startup ──────────────────────────────────────────────────────────────
 
@@ -479,6 +571,15 @@ class Orchestrator:
         if not connect(self._terminal_path):
             logger.critical("Cannot connect to MT5. Aborting.")
             sys.exit(1)
+
+        # Log FTMO challenge status before anything trades
+        try:
+            account = mt5.account_info()
+            if account:
+                for line in self._ftmo_tracker.report(account.equity).splitlines():
+                    logger.info(line)
+        except Exception:
+            pass
 
         if not self._safety_check():
             disconnect()
@@ -498,6 +599,8 @@ class Orchestrator:
                 self._strategies[symbol],
                 self._tf_str,
                 self._trade_cfg,
+                risk_agent=self._risk_agent,
+                ftmo_tracker=self._ftmo_tracker,
                 dry_run=self.dry_run,
             ))
 
@@ -539,6 +642,14 @@ class Orchestrator:
                 f"  {r['name']:<30} {r['status']:<10} {age_str:>10}  {r['message'][:60]}"
             )
         lines.append(f"  {'─'*82}")
+
+        try:
+            account = mt5.account_info()
+            if account:
+                lines.append(f"  {self._ftmo_tracker.status_line(account.equity)}")
+        except Exception:
+            pass
+
         lines.append("")
         for line in lines:
             logger.info(line)

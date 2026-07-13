@@ -23,16 +23,45 @@ from strategies.sma_crossover import SMACrossover
 from strategies.rsi import RSIStrategy
 from strategies.macd import MACDStrategy
 from strategies.bollinger_bands import BollingerBands
+from strategies.fvg_ob import FVGOrderBlockStrategy
+from strategies.sniper import SniperStrategy
+from strategies.london_breakout import LondonBreakoutStrategy
+from strategies.ict_amd import ICTAMDDisplacementStrategy, ICTAMDBreakerStrategy
+from strategies.vwap_reversion import VWAPReversionStrategy, VWAPMomentumStrategy
+from strategies.trend_rider import TrendRiderStrategy
 
 PROCESSED_DIR = Path(__file__).resolve().parent.parent / "data" / "processed"
 REPORTS_DIR = Path(__file__).resolve().parent.parent / "logs" / "reports"
 
+# ICT AMD default lookbacks are tuned for M5 ([48,144,288] bars = 4h/12h/24h).
+# H1 equivalent: [8, 24, 48] bars = 8h/24h/2day.
+_H1_AMD_LOOKBACKS = [8, 24, 48]
+
 STRATEGIES = {
-    "SMA(20,50)":    SMACrossover(fast=20, slow=50),
-    "SMA(50,200)":   SMACrossover(fast=50, slow=200),
-    "RSI(14)":       RSIStrategy(period=14),
-    "MACD(12,26,9)": MACDStrategy(fast=12, slow=26, signal=9),
-    "BB(20,2)":      BollingerBands(period=20, std_dev=2.0),
+    # Baseline technical strategies
+    "SMA(20,50)":     SMACrossover(fast=20, slow=50),
+    "SMA(50,200)":    SMACrossover(fast=50, slow=200),
+    "RSI(14)":        RSIStrategy(period=14),
+    "MACD(12,26,9)":  MACDStrategy(fast=12, slow=26, signal=9),
+    "BB(20,2)":       BollingerBands(period=20, std_dev=2.0),
+    # FVG Order Block — bidir and long-only
+    "FVG-OB":         FVGOrderBlockStrategy(min_fvg_atr=0.1, rr_target=3.0, atr_stop_buffer=0.5, ob_required=True, long_only=False),
+    "FVG-OB-Long":    FVGOrderBlockStrategy(min_fvg_atr=0.1, rr_target=3.0, atr_stop_buffer=0.5, ob_required=True, long_only=True),
+    # Sniper — bidir and long-only
+    "Sniper":         SniperStrategy(),
+    "Sniper-Long":    SniperStrategy(long_only=True),
+    # London Breakout — bidir and long-only
+    "London":         LondonBreakoutStrategy(),
+    "London-Long":    LondonBreakoutStrategy(long_only=True),
+    # ICT AMD — H1-adjusted lookbacks, bidir
+    "ICT-Displace":   ICTAMDDisplacementStrategy(swing_lookbacks=_H1_AMD_LOOKBACKS),
+    "ICT-Breaker":    ICTAMDBreakerStrategy(swing_lookbacks=_H1_AMD_LOOKBACKS),
+    # VWAP strategies
+    "VWAP-Rev":       VWAPReversionStrategy(),
+    "VWAP-Mom":       VWAPMomentumStrategy(),
+    # Trend Rider — bidir and long-only
+    "TrendRider":     TrendRiderStrategy(),
+    "TrendRider-L":   TrendRiderStrategy(long_only=True),
 }
 
 MIN_BARS = 150  # skip a period slice if it has fewer bars than this

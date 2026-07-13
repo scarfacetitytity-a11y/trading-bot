@@ -16,6 +16,7 @@ config/config.yaml
 
 # Logs
 logs/*.log
+logs/reports/
 
 # Historical/processed data (regenerate from source, don't commit)
 data/raw/*
