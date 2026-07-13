@@ -1,27 +1,31 @@
-"""AiDEN Index Strategy — full OS confluence stack for US100 / US30.
+"""AiDEN Index Strategy v2 — bidirectional FVG + OB confluence, all sessions.
 
-Cadre roles in this module:
-  Sage   (MEM-001) — architecture: multi-TF H4 bias gate + H1 FVG/OB entry
-  Quant  (MEM-002) — parameters tuned for US100/US30 FTMO drawdown compliance
-  Builder(MEM-003) — implementation
-  Scout  (MEM-004) — instrument pivot: US100 primary, US30 secondary (gold deprioritised)
+Cadre:
+  Sage   (MEM-001) — bidirectional gate: H4 EMA bullish = longs only, bearish = shorts only
+  Quant  (MEM-002) — dynamic RR: Model 3 + trend strength extend target to 3.5-5.0R
+  Builder(MEM-003) — implementation, shorts mirror, regime scoring
+  Scout  (MEM-004) — 7-instrument universe confirmed
 
-OS Confluence scoring (max 7 points per setup):
-  HTF bias bullish (H4 HH+HL structure) .... +2  [hard gate — 0 skips trade entirely]
-  Price in discount zone (<50% H4 swing)  .. +1
-  Liquidity swept before FVG ............... +1
-  OB + FVG zone aligned (Model 3) .......... +2  [preferred setup]
-  FVG only, no OB overlap (Model 1) ........ +1  [minimum acceptable]
-  Session confirmed (NY hours) ............. +1
+OS Confluence scoring (max 10 per setup):
+  HTF bias confirmed (H4 EMA direction) ......... +2  [hard gate]
+  Price in discount (long) / premium (short) .... +1
+  Liquidity swept (lows for longs / highs for shorts) +1
+  OB + FVG aligned — Model 3 ................... +2
+  FVG only — Model 1 ........................... +1
+  Session (in active window) ................... +1
+  Session prime window (NY first hour 13-15 UTC) +1  [stacks with session]
+  RSI pullback zone ............................ +1
+  Trend regime (H4 EMA strongly trending) ...... +1
 
-Trade fires only if score >= min_score (default 4).
-HTF bias gate: if h4_bias != bullish, setup is not considered regardless of score.
+Dynamic RR:
+  Base: rr_target (default 2.5)
+  Model 3 trade: + rr_model3_bonus (default +0.5)
+  Strong H4 trend: + rr_trend_bonus (default +0.5)
+  Cap: rr_max (default 5.0)
 
-Entry models (from trading-os/strategy/entry_models.md):
-  Model 1 — FVG retest in HTF discount zone
-  Model 3 — OB + FVG aligned zone (higher conviction, tighter stop off OB low)
-
-Session defaults for indices: 12:00–21:00 UTC (pre-market + full NY session).
+Parameter units:
+  htf_lookback, h4_swing_lookback → H4 BARS (TF-independent after resample)
+  Everything else → input-TF bars (scale ×4 for M15 vs H1)
 """
 from __future__ import annotations
 
@@ -43,29 +47,47 @@ def _atr(high: pd.Series, low: pd.Series, close: pd.Series, period: int) -> pd.S
     return tr.rolling(period).mean()
 
 
+def _rsi(close: pd.Series, period: int = 14) -> pd.Series:
+    delta = close.diff()
+    gain  = delta.clip(lower=0).rolling(period).mean()
+    loss  = (-delta.clip(upper=0)).rolling(period).mean()
+    rs    = gain / loss.replace(0, np.nan)
+    return 100 - 100 / (1 + rs)
+
+
 def _resample_h4(df: pd.DataFrame) -> pd.DataFrame:
-    """Resample H1 OHLCV to H4, aligned to 4-hour UTC boundaries."""
     times = pd.to_datetime(df["time"])
-    tmp = df[["open", "high", "low", "close"]].copy()
+    tmp   = df[["open", "high", "low", "close"]].copy()
     tmp.index = times
     h4 = tmp.resample("4h", closed="left", label="left").agg({
-        "open":  "first",
-        "high":  "max",
-        "low":   "min",
-        "close": "last",
+        "open": "first", "high": "max", "low": "min", "close": "last",
     }).dropna()
     h4 = h4.reset_index().rename(columns={"index": "time"})
     h4["time"] = pd.to_datetime(h4["time"])
     return h4
 
 
-def _compute_h4_bias(h4: pd.DataFrame, lookback: int) -> pd.Series:
+def _compute_h4_bias_ema(
+    h4: pd.DataFrame, fast_n: int, slow_n: int
+) -> tuple[pd.Series, pd.Series]:
+    """Returns (bias_series, ema_spread_series).
+
+    bias:   1=bullish, -1=bearish, 0=neutral
+    spread: (fast-slow)/slow as fraction — magnitude = trend strength
     """
-    For each H4 bar, classify bias: 1=bullish, -1=bearish, 0=ranging.
-    Bullish = HH+HL: second half of lookback window has higher swing highs AND
-    higher swing lows than the first half.
-    """
+    close  = h4["close"]
+    fast   = close.ewm(span=fast_n, adjust=False).mean()
+    slow   = close.ewm(span=slow_n, adjust=False).mean()
+    spread = (fast - slow) / slow.replace(0, np.nan)
+
     bias = pd.Series(0, index=h4.index, dtype=int)
+    bias[(fast > slow) & (close > fast)] = 1
+    bias[(fast < slow) & (close < fast)] = -1
+    return bias, spread
+
+
+def _compute_h4_bias_swing(h4: pd.DataFrame, lookback: int) -> tuple[pd.Series, pd.Series]:
+    bias  = pd.Series(0, index=h4.index, dtype=int)
     highs = h4["high"].values
     lows  = h4["low"].values
     mid   = lookback // 2
@@ -73,109 +95,140 @@ def _compute_h4_bias(h4: pd.DataFrame, lookback: int) -> pd.Series:
     for i in range(lookback, len(h4)):
         w_hi = highs[i - lookback:i]
         w_lo = lows[i  - lookback:i]
-        h_first  = w_hi[:mid].max()
-        h_second = w_hi[mid:].max()
-        l_first  = w_lo[:mid].min()
-        l_second = w_lo[mid:].min()
-        if h_second > h_first and l_second > l_first:
+        if w_hi[mid:].max() > w_hi[:mid].max() and w_lo[mid:].min() > w_lo[:mid].min():
             bias.iloc[i] = 1
-        elif h_second < h_first and l_second < l_first:
+        elif w_hi[mid:].max() < w_hi[:mid].max() and w_lo[mid:].min() < w_lo[:mid].min():
             bias.iloc[i] = -1
 
-    return bias
+    spread = pd.Series(0.0, index=h4.index)  # swing method has no spread metric
+    return bias, spread
 
 
-def _find_bullish_ob(
-    open_: pd.Series,
-    close: pd.Series,
-    high: pd.Series,
-    low: pd.Series,
-    start_i: int,
-    lookback: int,
-) -> tuple[float | None, float | None]:
-    """Last bearish candle before start_i = bullish order block zone.
-
-    Returns (ob_low, ob_high) using candle body, or (None, None).
-    """
-    end_i = max(0, start_i - lookback)
-    for j in range(start_i, end_i, -1):
+def _find_bullish_ob(open_, close, high, low, start_i, lookback):
+    """Last bearish candle before start_i (body zone)."""
+    for j in range(start_i, max(0, start_i - lookback), -1):
         if close.iloc[j] < open_.iloc[j]:
             return float(min(open_.iloc[j], close.iloc[j])), float(max(open_.iloc[j], close.iloc[j]))
     return None, None
 
 
-def _liquidity_swept(low: pd.Series, i: int, lookback: int) -> bool:
-    """True if any candle in the last 5 bars wicked below the prior N-bar swing low."""
+def _find_bearish_ob(open_, close, high, low, start_i, lookback):
+    """Last bullish candle before start_i (body zone) — bearish OB for short setups."""
+    for j in range(start_i, max(0, start_i - lookback), -1):
+        if close.iloc[j] > open_.iloc[j]:
+            return float(min(open_.iloc[j], close.iloc[j])), float(max(open_.iloc[j], close.iloc[j]))
+    return None, None
+
+
+def _liq_swept_low(low: pd.Series, i: int, lookback: int) -> bool:
+    """Wick below prior N-bar swing low — used for LONG setups."""
     if i < lookback + 2:
         return False
     swing_low = low.iloc[i - lookback:i - 1].min()
-    for j in range(max(0, i - 5), i):
-        if low.iloc[j] < swing_low:
-            return True
-    return False
+    return any(low.iloc[j] < swing_low for j in range(max(0, i - 5), i))
+
+
+def _liq_swept_high(high: pd.Series, i: int, lookback: int) -> bool:
+    """Wick above prior N-bar swing high — used for SHORT setups."""
+    if i < lookback + 2:
+        return False
+    swing_high = high.iloc[i - lookback:i - 1].max()
+    return any(high.iloc[j] > swing_high for j in range(max(0, i - 5), i))
 
 
 # ── Strategy ──────────────────────────────────────────────────────────────────
 
 class AiDENIndexStrategy(Strategy):
-    """Multi-timeframe FVG + OB confluence strategy for US indices.
-
-    Implements AiDEN's three-gate execution model at the strategy level:
-    signal only fires when the full OS confluence stack scores >= min_score.
-    """
 
     def __init__(
         self,
         # Confluence gate
-        min_score: int          = 4,    # minimum points to trade (max 7)
-        # H4 bias
-        htf_lookback: int       = 20,   # H4 bars for HH/HL detection
-        h4_swing_lookback: int  = 40,   # H4 bars for discount zone range
-        discount_pct: float     = 0.5,  # price must be below this fraction of H4 swing
-        # FVG
-        min_fvg_atr: float      = 0.15,
-        max_fvg_wait: int       = 40,
-        max_entry_wait: int     = 8,
-        max_active_fvgs: int    = 3,
+        min_score: int           = 4,
+        # H4 bias — in H4 BARS
+        htf_lookback: int        = 20,
+        h4_swing_lookback: int   = 40,
+        h4_bias_method: str      = "ema",
+        discount_pct: float      = 0.5,
+        # FVG — in input-TF bars
+        min_fvg_atr: float       = 0.10,
+        max_fvg_wait: int        = 40,
+        max_entry_wait: int      = 8,
+        max_active_fvgs: int     = 3,
         # OB
-        ob_lookback: int        = 20,
+        ob_lookback: int         = 20,
         # Liquidity sweep
-        liq_lookback: int       = 10,
-        # Risk
-        rr_target: float        = 2.5,
-        atr_period: int         = 14,
-        atr_stop_buffer: float  = 0.3,
-        # Session (UTC hours, indices default = NY session)
-        session_start: int      = 12,
-        session_end: int        = 21,
-        long_only: bool         = True,
+        liq_lookback: int        = 10,
+        # Risk / RR
+        rr_target: float         = 2.5,
+        rr_model3_bonus: float   = 0.5,   # extra R when OB+FVG aligned
+        rr_trend_bonus: float    = 0.5,   # extra R in strong trend regime
+        rr_trend_threshold: float= 0.003, # H4 EMA spread > 0.3% = strong trend
+        rr_max: float            = 5.0,
+        atr_period: int          = 14,
+        atr_stop_buffer: float   = 0.3,
+        # RSI
+        rsi_period: int          = 14,
+        rsi_long_lo: float       = 25.0,  # RSI zone for LONG entries
+        rsi_long_hi: float       = 55.0,
+        rsi_short_lo: float      = 45.0,  # RSI zone for SHORT entries
+        rsi_short_hi: float      = 75.0,
+        use_rsi: bool            = True,
+        # Session
+        session_start: int       = 12,
+        session_end: int         = 21,
+        session_prime_start: int = 13,    # NY open first hour bonus window
+        session_prime_end: int   = 15,
+        # Direction
+        long_only: bool          = False,  # False = both longs and shorts
     ):
-        self.min_score         = min_score
-        self.htf_lookback      = htf_lookback
-        self.h4_swing_lookback = h4_swing_lookback
-        self.discount_pct      = discount_pct
-        self.min_fvg_atr       = min_fvg_atr
-        self.max_fvg_wait      = max_fvg_wait
-        self.max_entry_wait    = max_entry_wait
-        self.max_active_fvgs   = max_active_fvgs
-        self.ob_lookback       = ob_lookback
-        self.liq_lookback      = liq_lookback
-        self.rr_target         = rr_target
-        self.atr_period        = atr_period
-        self.atr_stop_buffer   = atr_stop_buffer
-        self.session_start     = session_start
-        self.session_end       = session_end
-        self.long_only         = long_only
+        self.min_score            = min_score
+        self.htf_lookback         = htf_lookback
+        self.h4_swing_lookback    = h4_swing_lookback
+        self.h4_bias_method       = h4_bias_method
+        self.discount_pct         = discount_pct
+        self.min_fvg_atr          = min_fvg_atr
+        self.max_fvg_wait         = max_fvg_wait
+        self.max_entry_wait       = max_entry_wait
+        self.max_active_fvgs      = max_active_fvgs
+        self.ob_lookback          = ob_lookback
+        self.liq_lookback         = liq_lookback
+        self.rr_target            = rr_target
+        self.rr_model3_bonus      = rr_model3_bonus
+        self.rr_trend_bonus       = rr_trend_bonus
+        self.rr_trend_threshold   = rr_trend_threshold
+        self.rr_max               = rr_max
+        self.atr_period           = atr_period
+        self.atr_stop_buffer      = atr_stop_buffer
+        self.rsi_period           = rsi_period
+        self.rsi_long_lo          = rsi_long_lo
+        self.rsi_long_hi          = rsi_long_hi
+        self.rsi_short_lo         = rsi_short_lo
+        self.rsi_short_hi         = rsi_short_hi
+        self.use_rsi              = use_rsi
+        self.session_start        = session_start
+        self.session_end          = session_end
+        self.session_prime_start  = session_prime_start
+        self.session_prime_end    = session_prime_end
+        self.long_only            = long_only
 
     @property
     def name(self) -> str:
+        direction = "long" if self.long_only else "bi"
         return (
-            f"AiDEN-Index("
-            f"score>={self.min_score}"
-            f",fvg={self.min_fvg_atr}atr"
-            f",rr={self.rr_target}"
-            f",sess={self.session_start}-{self.session_end}UTC)"
+            f"AiDEN-v2({direction}"
+            f",s>={self.min_score}"
+            f",{self.h4_bias_method}"
+            f",rr={self.rr_target}+dyn"
+            f",sess={self.session_start}-{self.session_end})"
         )
+
+    def _dynamic_rr(self, is_model3: bool, trend_strength: float) -> float:
+        rr = self.rr_target
+        if is_model3:
+            rr += self.rr_model3_bonus
+        if abs(trend_strength) > self.rr_trend_threshold:
+            rr += self.rr_trend_bonus
+        return min(rr, self.rr_max)
 
     def generate_signals(self, df: pd.DataFrame) -> pd.Series:
         close  = df["close"].astype(float)
@@ -185,19 +238,28 @@ class AiDENIndexStrategy(Strategy):
         times  = pd.to_datetime(df["time"])
         hours  = times.dt.hour
 
-        atr = _atr(high, low, close, self.atr_period)
+        atr_s = _atr(high, low, close, self.atr_period)
+        rsi_s = _rsi(close, self.rsi_period) if self.use_rsi else None
 
-        # Build H4 bias and swing range lookup
-        h4       = _resample_h4(df)
-        h4_bias  = _compute_h4_bias(h4, self.htf_lookback)
-        h4["bias"] = h4_bias.values
-        h4_times   = h4["time"]
+        h4 = _resample_h4(df)
+        fast_n = max(self.htf_lookback // 2, 5)
 
-        def _bias_at(bar_time) -> int:
+        if self.h4_bias_method == "ema":
+            h4_bias, h4_spread = _compute_h4_bias_ema(h4, fast_n, self.htf_lookback)
+        else:
+            h4_bias, h4_spread = _compute_h4_bias_swing(h4, self.htf_lookback)
+
+        h4["bias"]   = h4_bias.values
+        h4["spread"] = h4_spread.values
+        h4_times     = h4["time"]
+
+        def _h4_at(bar_time):
             idx = h4_times.searchsorted(bar_time, side="right") - 1
-            return int(h4["bias"].iloc[idx]) if idx >= 0 else 0
+            if idx < 0:
+                return 0, 0.0
+            return int(h4["bias"].iloc[idx]), float(h4["spread"].iloc[idx])
 
-        def _swing_range_at(bar_time) -> tuple[float, float]:
+        def _swing_range_at(bar_time):
             idx = h4_times.searchsorted(bar_time, side="right") - 1
             if idx < self.h4_swing_lookback:
                 return float("nan"), float("nan")
@@ -212,14 +274,16 @@ class AiDENIndexStrategy(Strategy):
         take_profit = None
         active_fvgs: list[dict] = []
 
-        warmup = max(self.atr_period + 3, self.ob_lookback, self.liq_lookback)
+        warmup = max(self.atr_period + 3, self.ob_lookback, self.liq_lookback,
+                     self.rsi_period + 2 if self.use_rsi else 0)
 
         for i in range(warmup, len(df)):
             cv       = float(close.iloc[i])
             lv       = float(low.iloc[i])
             hv       = float(high.iloc[i])
-            atr_val  = float(atr.iloc[i])
+            atr_val  = float(atr_s.iloc[i])
             bar_time = times.iloc[i]
+            hour     = int(hours.iloc[i])
 
             if np.isnan(atr_val):
                 signals.iloc[i]     = position
@@ -232,105 +296,176 @@ class AiDENIndexStrategy(Strategy):
                     position = 0; stop_loss = take_profit = None
                 elif take_profit is not None and hv >= take_profit:
                     position = 0; stop_loss = take_profit = None
+            elif position == -1:
+                if stop_loss is not None and hv >= stop_loss:
+                    position = 0; stop_loss = take_profit = None
+                elif take_profit is not None and lv <= take_profit:
+                    position = 0; stop_loss = take_profit = None
 
             if position == 0 and i >= warmup + 2:
-                # ── 2. HTF bias gate ──────────────────────────────────────
-                htf_bias = _bias_at(bar_time)
-                if htf_bias != 1:
-                    # Not in bullish H4 structure — no new setups
-                    self._process_active_fvgs(
-                        active_fvgs, cv, lv, hv, atr_val, i,
-                        signals, position, stop_loss, take_profit
-                    )
+                htf_bias, trend_strength = _h4_at(bar_time)
+                swing_hi, swing_lo       = _swing_range_at(bar_time)
+                in_session   = self.session_start <= hour < self.session_end
+                in_prime     = self.session_prime_start <= hour < self.session_prime_end
+                rsi_val      = float(rsi_s.iloc[i]) if rsi_s is not None else float("nan")
+                strongly_trending = abs(trend_strength) > self.rr_trend_threshold
+
+                # Remove invalidated FVGs
+                if htf_bias == 0:
+                    self._expire_fvgs_neutral(active_fvgs, cv)
                     signals.iloc[i]     = position
-                    self._stops.iloc[i] = stop_loss if stop_loss is not None else float("nan")
+                    self._stops.iloc[i] = float("nan")
                     continue
 
-                # ── 3. Detect bullish FVG ────────────────────────────────
-                h2      = float(high.iloc[i - 2])
-                bull_gap = lv - h2
-                min_gap  = self.min_fvg_atr * atr_val
+                # ── 2. Detect new FVGs ───────────────────────────────────
+                h2  = float(high.iloc[i - 2])
+                l2  = float(low.iloc[i - 2])
 
-                if bull_gap >= min_gap:
-                    fvg_lo = h2
-                    fvg_hi = lv
+                # LONG setup — bullish FVG
+                if htf_bias == 1:
+                    bull_gap = lv - h2
+                    if bull_gap >= self.min_fvg_atr * atr_val:
+                        score = 2  # HTF bias +2
 
-                    score = 2  # HTF bias confirmed (+2)
+                        if not np.isnan(swing_hi) and swing_hi > swing_lo:
+                            mid = swing_lo + (swing_hi - swing_lo) * self.discount_pct
+                            if cv < mid:
+                                score += 1  # discount zone
 
-                    # Discount zone
-                    swing_hi, swing_lo = _swing_range_at(bar_time)
-                    if not np.isnan(swing_hi) and swing_hi > swing_lo:
-                        mid_zone = swing_lo + (swing_hi - swing_lo) * self.discount_pct
-                        if cv < mid_zone:
+                        if _liq_swept_low(low, i, self.liq_lookback):
                             score += 1
 
-                    # Liquidity sweep
-                    if _liquidity_swept(low, i, self.liq_lookback):
-                        score += 1
+                        ob_lo, ob_hi = _find_bullish_ob(open_, close, high, low, i - 2, self.ob_lookback)
+                        if ob_lo is not None and min(ob_hi, lv) - max(ob_lo, h2) > 0:
+                            score += 2; is_model3 = True
+                        else:
+                            score += 1; is_model3 = False
 
-                    # OB detection + Model 3 check
-                    ob_lo, ob_hi = _find_bullish_ob(open_, close, high, low, i - 2, self.ob_lookback)
-                    if ob_lo is not None:
-                        overlap = min(ob_hi, fvg_hi) - max(ob_lo, fvg_lo)
-                        if overlap > 0:
-                            score += 2  # Model 3: OB + FVG aligned
-                        # OB found but not overlapping — no bonus (FVG alone = +1 below)
-                    else:
-                        score += 1  # Model 1: FVG only
+                        if in_session:
+                            score += 1
+                        if in_prime:
+                            score += 1  # stacks — prime window bonus
 
-                    # Session
-                    if self.session_start <= int(hours.iloc[i]) < self.session_end:
-                        score += 1
+                        if self.use_rsi and not np.isnan(rsi_val):
+                            if self.rsi_long_lo <= rsi_val <= self.rsi_long_hi:
+                                score += 1
 
-                    if score >= self.min_score:
-                        active_fvgs.append({
-                            "dir":      "bull",
-                            "fvg_lo":   fvg_lo,
-                            "fvg_hi":   fvg_hi,
-                            "score":    score,
-                            "formed":   i,
-                            "tested":   False,
-                            "test_bar": None,
-                            "ob_lo":    ob_lo,
-                            "ob_hi":    ob_hi,
-                        })
+                        if strongly_trending:
+                            score += 1  # regime bonus
 
-                    # Keep highest-scoring FVGs if over cap
-                    if len(active_fvgs) > self.max_active_fvgs:
-                        active_fvgs.sort(key=lambda x: x["score"], reverse=True)
-                        active_fvgs = active_fvgs[:self.max_active_fvgs]
+                        if score >= self.min_score:
+                            active_fvgs.append({
+                                "dir":      "bull",
+                                "fvg_lo":   h2,
+                                "fvg_hi":   lv,
+                                "ob_lo":    ob_lo,
+                                "ob_hi":    ob_hi,
+                                "score":    score,
+                                "formed":   i,
+                                "tested":   False,
+                                "test_bar": None,
+                                "model3":   is_model3,
+                                "trend_s":  trend_strength,
+                            })
 
-                # ── 4. Process queued FVGs ───────────────────────────────
+                # SHORT setup — bearish FVG
+                if htf_bias == -1 and not self.long_only:
+                    bear_gap = l2 - hv
+                    if bear_gap >= self.min_fvg_atr * atr_val:
+                        score = 2  # HTF bias +2
+
+                        if not np.isnan(swing_hi) and swing_hi > swing_lo:
+                            mid = swing_lo + (swing_hi - swing_lo) * self.discount_pct
+                            if cv > mid:
+                                score += 1  # premium zone for short
+
+                        if _liq_swept_high(high, i, self.liq_lookback):
+                            score += 1
+
+                        ob_lo, ob_hi = _find_bearish_ob(open_, close, high, low, i - 2, self.ob_lookback)
+                        if ob_lo is not None and min(ob_hi, l2) - max(ob_lo, hv) > 0:
+                            score += 2; is_model3 = True
+                        else:
+                            score += 1; is_model3 = False
+
+                        if in_session:
+                            score += 1
+                        if in_prime:
+                            score += 1
+
+                        if self.use_rsi and not np.isnan(rsi_val):
+                            if self.rsi_short_lo <= rsi_val <= self.rsi_short_hi:
+                                score += 1
+
+                        if strongly_trending:
+                            score += 1
+
+                        if score >= self.min_score:
+                            active_fvgs.append({
+                                "dir":      "bear",
+                                "fvg_lo":   hv,   # bottom of bearish FVG gap
+                                "fvg_hi":   l2,   # top of bearish FVG gap
+                                "ob_lo":    ob_lo,
+                                "ob_hi":    ob_hi,
+                                "score":    score,
+                                "formed":   i,
+                                "tested":   False,
+                                "test_bar": None,
+                                "model3":   is_model3,
+                                "trend_s":  trend_strength,
+                            })
+
+                # Trim FVG queue
+                if len(active_fvgs) > self.max_active_fvgs * 2:
+                    active_fvgs.sort(key=lambda x: x["score"], reverse=True)
+                    active_fvgs = active_fvgs[:self.max_active_fvgs * 2]
+
+                # ── 3. Process queued FVGs ───────────────────────────────
                 to_remove = []
                 for fvg in active_fvgs:
                     fvg_lo = fvg["fvg_lo"]
                     fvg_hi = fvg["fvg_hi"]
 
-                    if cv < fvg_lo:
-                        to_remove.append(fvg)
-                        continue
+                    if (i - fvg["formed"]) > self.max_fvg_wait:
+                        to_remove.append(fvg); continue
 
-                    if not fvg["tested"] and (i - fvg["formed"]) > self.max_fvg_wait:
-                        to_remove.append(fvg)
-                        continue
+                    if fvg["dir"] == "bull":
+                        if cv < fvg_lo:
+                            to_remove.append(fvg); continue
+                        if not fvg["tested"] and lv <= fvg_hi:
+                            fvg["tested"] = True; fvg["test_bar"] = i
+                        if fvg["tested"]:
+                            if (i - fvg["test_bar"]) > self.max_entry_wait:
+                                to_remove.append(fvg)
+                            elif cv > fvg_hi and position == 0:
+                                stop_anchor = fvg["ob_lo"] if fvg["ob_lo"] is not None else fvg_lo
+                                sl   = stop_anchor - self.atr_stop_buffer * atr_val
+                                dist = cv - sl
+                                if dist > 0:
+                                    rr       = self._dynamic_rr(fvg["model3"], fvg["trend_s"])
+                                    position    = 1
+                                    stop_loss   = sl
+                                    take_profit = cv + rr * dist
+                                to_remove.append(fvg)
 
-                    if not fvg["tested"] and lv <= fvg_hi:
-                        fvg["tested"]   = True
-                        fvg["test_bar"] = i
-
-                    if fvg["tested"]:
-                        if (i - fvg["test_bar"]) > self.max_entry_wait:
-                            to_remove.append(fvg)
-                        elif cv > fvg_hi and position == 0:
-                            # Stop off OB low when available (tighter — Model 3)
-                            stop_anchor = fvg["ob_lo"] if fvg["ob_lo"] is not None else fvg_lo
-                            sl   = stop_anchor - self.atr_stop_buffer * atr_val
-                            dist = cv - sl
-                            if dist > 0:
-                                position    = 1
-                                stop_loss   = sl
-                                take_profit = cv + self.rr_target * dist
-                            to_remove.append(fvg)
+                    else:  # bear
+                        if cv > fvg_hi:
+                            to_remove.append(fvg); continue
+                        if not fvg["tested"] and hv >= fvg_lo:
+                            fvg["tested"] = True; fvg["test_bar"] = i
+                        if fvg["tested"]:
+                            if (i - fvg["test_bar"]) > self.max_entry_wait:
+                                to_remove.append(fvg)
+                            elif cv < fvg_lo and position == 0:
+                                stop_anchor = fvg["ob_hi"] if fvg["ob_hi"] is not None else fvg_hi
+                                sl   = stop_anchor + self.atr_stop_buffer * atr_val
+                                dist = sl - cv
+                                if dist > 0:
+                                    rr       = self._dynamic_rr(fvg["model3"], fvg["trend_s"])
+                                    position    = -1
+                                    stop_loss   = sl
+                                    take_profit = cv - rr * dist
+                                to_remove.append(fvg)
 
                 for fvg in to_remove:
                     if fvg in active_fvgs:
@@ -341,13 +476,11 @@ class AiDENIndexStrategy(Strategy):
 
         return signals
 
-    def _process_active_fvgs(self, active_fvgs, cv, lv, hv, atr_val, i,
-                              signals, position, stop_loss, take_profit):
-        """Expire/invalidate queued FVGs when HTF bias is not bullish."""
-        to_remove = []
-        for fvg in active_fvgs:
-            if cv < fvg["fvg_lo"]:
-                to_remove.append(fvg)
-        for fvg in to_remove:
-            if fvg in active_fvgs:
-                active_fvgs.remove(fvg)
+    def _expire_fvgs_neutral(self, active_fvgs: list, cv: float) -> None:
+        to_remove = [
+            f for f in active_fvgs
+            if (f["dir"] == "bull" and cv < f["fvg_lo"]) or
+               (f["dir"] == "bear" and cv > f["fvg_hi"])
+        ]
+        for f in to_remove:
+            active_fvgs.remove(f)
