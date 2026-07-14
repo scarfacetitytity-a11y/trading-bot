@@ -48,14 +48,19 @@ from execution import trader, risk
 from strategies.sniper import SniperStrategy
 from strategies.london_breakout import LondonBreakoutStrategy
 from strategies.fvg_ob import FVGOrderBlockStrategy
+from strategies.aiden_index import AiDENIndexStrategy
 from execution.risk_agent import RiskAgent, RiskConfig
 from execution.ftmo_tracker import FTMOTracker
+from backtests.run_multi_instrument import (
+    INSTRUMENTS, OPTIMISED_PARAMS, TRAIL_CONFIGS, BIDIRECTIONAL, M15_PARAMS,
+)
 
 logger = logging.getLogger(__name__)
 
-# ── Risk limits (FTMO Phase 1 / 2 compatible) ────────────────────────────────
-MAX_DAILY_LOSS_PCT  = 4.5   # halt at 4.5% daily loss (FTMO limit is 5%)
-MAX_TOTAL_LOSS_PCT  = 9.0   # halt at 9% total drawdown (FTMO limit is 10%)
+# ── Risk limits (Council of 12 — tighter than FTMO stated limits) ────────────
+MAX_DAILY_LOSS_PCT  = 2.0   # circuit breaker: halt all new entries (FTMO limit 5%)
+SOFT_DD_HALT_PCT    = 7.0   # soft halt: no new entries, let open trades run (FTMO limit 10%)
+MAX_TOTAL_LOSS_PCT  = 9.5   # hard kill switch: emergency close all (FTMO 10% hard floor)
 MAX_RECONNECT_TRIES = 5
 MAX_RESTARTS        = 10
 MONITOR_INTERVAL    = 60    # seconds between orchestrator health checks
@@ -70,7 +75,47 @@ STRATEGY_MAP = {
     "sniper":          SniperStrategy,
     "london_breakout": LondonBreakoutStrategy,
     "fvg_ob":          FVGOrderBlockStrategy,
+    "aiden_index":     AiDENIndexStrategy,
 }
+
+
+def _build_aiden_strategy(symbol: str) -> AiDENIndexStrategy:
+    """Build a per-symbol AiDENIndexStrategy with correct live params."""
+    cfg   = INSTRUMENTS.get(symbol, {})
+    tf_p  = M15_PARAMS.copy()
+    v2    = dict(
+        long_only=(symbol not in BIDIRECTIONAL),
+        rr_model3_bonus=0.5, rr_trend_bonus=0.5, rr_trend_threshold=0.003, rr_max=5.0,
+        session_prime_start=13, session_prime_end=15,
+        use_rsi=True, rsi_period=56,
+        rsi_long_lo=25.0, rsi_long_hi=55.0, rsi_short_lo=45.0, rsi_short_hi=75.0,
+        trail_to_be=symbol in TRAIL_CONFIGS,
+        trail_be_r=TRAIL_CONFIGS[symbol].get("trail_be_r", 1.0) if symbol in TRAIL_CONFIGS else 1.0,
+        trail_lock_r=TRAIL_CONFIGS[symbol].get("trail_lock_r", 2.0) if symbol in TRAIL_CONFIGS else 2.0,
+    )
+    if symbol in OPTIMISED_PARAMS:
+        opt  = OPTIMISED_PARAMS[symbol].copy()
+        bias = opt.pop("h4_bias_method", tf_p.pop("h4_bias_method", "ema"))
+        stop = opt.pop("atr_stop_buffer", tf_p.pop("atr_stop_buffer", 0.5))
+        return AiDENIndexStrategy(
+            min_score=opt.get("min_score", 4),
+            min_fvg_atr=opt.get("min_fvg_atr", 0.10),
+            rr_target=opt.get("rr_target", 2.5),
+            session_start=opt.get("session_start", cfg.get("session_start", 7)),
+            session_end=opt.get("session_end", cfg.get("session_end", 21)),
+            h4_bias_method=bias, atr_stop_buffer=stop,
+            **{k: v for k, v in tf_p.items() if k not in ("h4_bias_method", "atr_stop_buffer")},
+            **v2,
+        )
+    bias = tf_p.pop("h4_bias_method", "ema")
+    stop = tf_p.pop("atr_stop_buffer", 0.5)
+    return AiDENIndexStrategy(
+        min_score=4, min_fvg_atr=0.10, rr_target=2.5,
+        session_start=cfg.get("session_start", 7),
+        session_end=cfg.get("session_end", 21),
+        h4_bias_method=bias, atr_stop_buffer=stop,
+        **tf_p, **v2,
+    )
 
 
 # ── Status enum ──────────────────────────────────────────────────────────────
@@ -271,12 +316,13 @@ class DataWatcher(Component):
 # ── Risk Guard ───────────────────────────────────────────────────────────────
 
 class RiskGuard(Component):
-    """Enforces FTMO daily and total loss limits. Triggers kill switch on breach."""
+    """Enforces Council limits: 2% daily halt, 7% soft halt, 9.5% hard kill."""
 
     CHECK_INTERVAL = 60
 
-    def __init__(self, registry, kill_switch):
+    def __init__(self, registry, kill_switch, soft_halt_event: threading.Event):
         super().__init__("RiskGuard", registry, kill_switch, beat_timeout=180)
+        self._soft_halt       = soft_halt_event
         self._day_start_equity: Optional[float] = None
         self._session_start_equity: Optional[float] = None
         self._today: Optional[int] = None
@@ -289,53 +335,52 @@ class RiskGuard(Component):
                 time.sleep(self.CHECK_INTERVAL)
                 continue
 
-            equity  = info.equity
-            balance = info.balance
-            today   = datetime.now().day
+            equity = info.equity
+            today  = datetime.now().day
 
-            # Reset daily high-water mark at start of a new day
             if today != self._today:
                 self._today            = today
                 self._day_start_equity = equity
-                logger.info("[RiskGuard] New day — day start equity=%.2f", equity)
+                # Clear daily halt on new day — soft halt persists until manual reset
+                logger.info("[RiskGuard] New day — equity=%.2f", equity)
 
-            # Set session baseline on first run
             if self._session_start_equity is None:
-                self._session_start_equity = balance
-                logger.info("[RiskGuard] Session start equity=%.2f", balance)
+                self._session_start_equity = equity
+                logger.info("[RiskGuard] Session start equity=%.2f", equity)
 
-            daily_loss_pct = (
+            daily_pct = (
                 (equity - self._day_start_equity) / self._day_start_equity * 100
                 if self._day_start_equity else 0.0
             )
-            total_loss_pct = (
+            total_pct = (
                 (equity - self._session_start_equity) / self._session_start_equity * 100
                 if self._session_start_equity else 0.0
             )
 
-            status_msg = (
-                f"equity={equity:.2f} | "
-                f"daily={daily_loss_pct:+.2f}% | "
-                f"total={total_loss_pct:+.2f}%"
-            )
+            msg = (f"eq={equity:.2f} daily={daily_pct:+.2f}% total={total_pct:+.2f}%"
+                   f"{' [SOFT-HALT]' if self._soft_halt.is_set() else ''}")
 
-            if daily_loss_pct <= -MAX_DAILY_LOSS_PCT:
-                msg = (f"DAILY LOSS LIMIT HIT: {daily_loss_pct:.2f}% "
-                       f"(limit -{MAX_DAILY_LOSS_PCT}%)")
-                logger.critical("[RiskGuard] %s — triggering kill switch", msg)
-                self.registry.halt(self.name, msg)
+            # Tier 1: daily circuit breaker — halt new entries for rest of day
+            if daily_pct <= -MAX_DAILY_LOSS_PCT:
+                if not self._soft_halt.is_set():
+                    logger.critical("[RiskGuard] DAILY CIRCUIT BREAKER: %.2f%% — no new entries today", daily_pct)
+                    self._soft_halt.set()
+
+            # Tier 2: soft halt — cumulative 7%, halt new entries
+            if total_pct <= -SOFT_DD_HALT_PCT:
+                if not self._soft_halt.is_set():
+                    logger.critical("[RiskGuard] SOFT HALT: cumulative %.2f%% — no new entries until manual reset", total_pct)
+                    self._soft_halt.set()
+
+            # Tier 3: hard kill — 9.5% cumulative, emergency stop
+            if total_pct <= -MAX_TOTAL_LOSS_PCT:
+                kill_msg = f"HARD KILL: cumulative {total_pct:.2f}% — FTMO breach imminent"
+                logger.critical("[RiskGuard] %s", kill_msg)
+                self.registry.halt(self.name, kill_msg)
                 self.kill_switch.set()
                 return
 
-            if total_loss_pct <= -MAX_TOTAL_LOSS_PCT:
-                msg = (f"TOTAL LOSS LIMIT HIT: {total_loss_pct:.2f}% "
-                       f"(limit -{MAX_TOTAL_LOSS_PCT}%)")
-                logger.critical("[RiskGuard] %s — triggering kill switch", msg)
-                self.registry.halt(self.name, msg)
-                self.kill_switch.set()
-                return
-
-            self.beat(status_msg)
+            self.beat(msg)
             time.sleep(self.CHECK_INTERVAL)
 
 
@@ -354,22 +399,25 @@ class TradingEngine(Component):
         trade_cfg: dict,
         risk_agent: RiskAgent,
         ftmo_tracker=None,
+        soft_halt_event: Optional[threading.Event] = None,
         dry_run: bool = False,
     ):
         name = f"TradingEngine[{symbol}]"
         tf_secs = _TF_SECONDS.get(tf_str, 3600)
         super().__init__(name, registry, kill_switch, beat_timeout=tf_secs * 4)
-        self._symbol      = symbol
-        self._strategy    = strategy
-        self._tf_str      = tf_str
-        self._tf_code     = TIMEFRAME_MAP.get(tf_str)
-        self._trade_cfg   = trade_cfg
-        self._risk_agent   = risk_agent
-        self._ftmo_tracker = ftmo_tracker
-        self._dry_run      = dry_run
-        self._lookback    = trade_cfg.get("lookback_bars", 500)
-        self._last_bar    = None
+        self._symbol           = symbol
+        self._strategy         = strategy
+        self._tf_str           = tf_str
+        self._tf_code          = TIMEFRAME_MAP.get(tf_str)
+        self._trade_cfg        = trade_cfg
+        self._risk_agent       = risk_agent
+        self._ftmo_tracker     = ftmo_tracker
+        self._soft_halt        = soft_halt_event
+        self._dry_run          = dry_run
+        self._lookback         = trade_cfg.get("lookback_bars", 500)
+        self._last_bar         = None
         self._open_entry_price: Optional[float] = None
+        self._open_sl:          Optional[float] = None   # initial SL at entry — for trail calc
 
     def _size_order(
         self,
@@ -430,6 +478,54 @@ class TradingEngine(Component):
 
         return sl, tp, lots
 
+    def _manage_trail_stop(self) -> None:
+        """Bar-by-bar SL modification for symbols in TRAIL_CONFIGS (e.g. XAUUSD)."""
+        if self._symbol not in TRAIL_CONFIGS:
+            return
+        positions = trader.get_positions(self._symbol)
+        if not positions or self._open_entry_price is None or self._open_sl is None:
+            return
+
+        pos       = positions[0]
+        entry     = self._open_entry_price
+        init_sl   = self._open_sl
+        trail_cfg = TRAIL_CONFIGS[self._symbol]
+        be_r      = trail_cfg.get("trail_be_r", 1.0)
+        lock_r    = trail_cfg.get("trail_lock_r", 2.0)
+        risk_dist = abs(entry - init_sl)
+        if risk_dist <= 0:
+            return
+
+        tick      = mt5.symbol_info_tick(self._symbol)
+        if tick is None:
+            return
+        mid_price = (tick.bid + tick.ask) / 2.0
+        current_sl = pos.sl
+
+        if pos.type == mt5.ORDER_TYPE_BUY:
+            if mid_price >= entry + lock_r * risk_dist:
+                new_sl = max(current_sl, entry + risk_dist)
+            elif mid_price >= entry + be_r * risk_dist:
+                new_sl = max(current_sl, entry)
+            else:
+                return
+            if new_sl > current_sl + 1e-8:
+                if not self._dry_run:
+                    trader.modify_sl_tp(self._symbol, pos.ticket, new_sl=new_sl, new_tp=pos.tp)
+                logger.info("[%s] Trail SL: %.5f -> %.5f (long)", self.name, current_sl, new_sl)
+
+        elif pos.type == mt5.ORDER_TYPE_SELL:
+            if mid_price <= entry - lock_r * risk_dist:
+                new_sl = min(current_sl, entry - risk_dist)
+            elif mid_price <= entry - be_r * risk_dist:
+                new_sl = min(current_sl, entry)
+            else:
+                return
+            if new_sl < current_sl - 1e-8:
+                if not self._dry_run:
+                    trader.modify_sl_tp(self._symbol, pos.ticket, new_sl=new_sl, new_tp=pos.tp)
+                logger.info("[%s] Trail SL: %.5f -> %.5f (short)", self.name, current_sl, new_sl)
+
     def run(self) -> None:
         tf_secs      = _TF_SECONDS.get(self._tf_str, 3600)
         poll_interval = min(30, max(5, tf_secs // 30))
@@ -475,6 +571,9 @@ class TradingEngine(Component):
                 logger.info("[%s] bar=%s signal=%+d pos=%+d",
                             self.name, bar_dt.strftime("%Y-%m-%d %H:%M UTC"), desired, current)
 
+                # Trail stop management — runs on every new bar regardless of signal
+                self._manage_trail_stop()
+
                 if desired == current:
                     continue
 
@@ -494,26 +593,41 @@ class TradingEngine(Component):
                             if self._ftmo_tracker is not None:
                                 self._ftmo_tracker.record_trade_day(equity)
                             self._open_entry_price = None
+                            self._open_sl          = None
 
-                # Open new position — gate through RiskAgent first
+                # Open new position — gate through soft halt, RiskAgent, FTMOTracker
                 if desired != 0:
+                    # Soft halt check (2% daily or 7% cumulative DD)
+                    if self._soft_halt is not None and self._soft_halt.is_set():
+                        logger.warning("[%s] SOFT HALT active — blocking new entry", self.name)
+                        continue
+
                     open_count = len(mt5.positions_get() or [])
                     can_trade, size_mult, reason = self._risk_agent.pre_trade_check(
                         equity, open_count
                     )
                     if not can_trade:
-                        logger.warning("[%s] RiskAgent blocked trade: %s", self.name, reason)
+                        logger.warning("[%s] RiskAgent blocked: %s", self.name, reason)
                         continue
+
+                    # FTMO daily DD check (Compliance #05 pre-trade gate)
+                    if self._ftmo_tracker is not None:
+                        ftmo_status = self._ftmo_tracker.check(equity)
+                        if ftmo_status["total_dd_pct"] >= ftmo_status["total_dd_limit"]:
+                            logger.critical("[%s] FTMO total DD limit — blocking entry", self.name)
+                            continue
 
                     sl, tp, lots = self._size_order(desired, account["balance"], size_mult)
                     direction_str = "BUY" if desired == 1 else "SELL"
                     if self._dry_run:
-                        logger.info("[%s] DRY RUN: %s %.2f lots SL=%s TP=%s | risk=%s",
+                        logger.info("[%s] DRY RUN: %s %.2f lots SL=%s TP=%s | %s",
                                     self.name, direction_str, lots, sl, tp, reason)
                     else:
-                        trader.place_order(self._symbol, desired, lots, sl=sl, tp=tp)
-                        tick = mt5.symbol_info_tick(self._symbol)
-                        self._open_entry_price = tick.ask if desired == 1 else tick.bid
+                        ok = trader.place_order(self._symbol, desired, lots, sl=sl, tp=tp)
+                        if ok:
+                            tick = mt5.symbol_info_tick(self._symbol)
+                            self._open_entry_price = tick.ask if desired == 1 else tick.bid
+                            self._open_sl = sl
 
             except Exception as exc:
                 self.registry.fail(self.name, str(exc))
@@ -529,19 +643,20 @@ class Orchestrator:
     """Floor manager — owns every component and monitors their heartbeats."""
 
     def __init__(self, cfg: dict, dry_run: bool = False, symbol_override: Optional[str] = None):
-        self.cfg         = cfg
-        self.dry_run     = dry_run
-        self.kill_switch = threading.Event()
-        self.registry    = HeartbeatRegistry()
-        self._threads: list  = []
+        self.cfg          = cfg
+        self.dry_run      = dry_run
+        self.kill_switch  = threading.Event()
+        self.soft_halt    = threading.Event()   # 2% daily or 7% cumulative — no new entries
+        self.registry     = HeartbeatRegistry()
+        self._threads: list   = []
         self._components: list = []
 
-        mt5_cfg     = cfg.get("mt5", {})
-        data_cfg    = cfg.get("data", {})
-        trade_cfg   = cfg.get("trading", {})
+        mt5_cfg   = cfg.get("mt5", {})
+        data_cfg  = cfg.get("data", {})
+        trade_cfg = cfg.get("trading", {})
 
         self._terminal_path = mt5_cfg.get("terminal_path") or None
-        self._tf_str        = data_cfg.get("timeframe", "H1").upper()
+        self._tf_str        = data_cfg.get("timeframe", "M15").upper()
         self._symbols       = (
             [symbol_override] if symbol_override
             else data_cfg.get("symbols", ["XAUUSD"])
@@ -549,16 +664,19 @@ class Orchestrator:
         self._trade_cfg = trade_cfg
         trader.set_magic(trade_cfg.get("magic", 234001))
 
-        # Build strategy map: symbol → strategy instance
-        strategy_name = trade_cfg.get("strategy", "fvg_ob")
-        strategy_cls  = STRATEGY_MAP.get(strategy_name, FVGOrderBlockStrategy)
-        self._strategies = {s: strategy_cls() for s in self._symbols}
+        # Build per-symbol strategy instances
+        strategy_name = trade_cfg.get("strategy", "aiden_index")
+        if strategy_name == "aiden_index":
+            self._strategies = {s: _build_aiden_strategy(s) for s in self._symbols}
+        else:
+            strategy_cls = STRATEGY_MAP.get(strategy_name, FVGOrderBlockStrategy)
+            self._strategies = {s: strategy_cls() for s in self._symbols}
 
         # Shared RiskAgent + FTMO tracker — both persist state to disk
         initial_equity = trade_cfg.get("initial_equity", 10_000)
         challenge_type = trade_cfg.get("ftmo_challenge", "2step-p1")
-        self._risk_agent    = RiskAgent(initial_equity=initial_equity)
-        self._ftmo_tracker  = FTMOTracker(initial_equity=initial_equity, challenge=challenge_type)
+        self._risk_agent   = RiskAgent(initial_equity=initial_equity)
+        self._ftmo_tracker = FTMOTracker(initial_equity=initial_equity, challenge=challenge_type)
 
     # ── Startup ──────────────────────────────────────────────────────────────
 
@@ -588,7 +706,7 @@ class Orchestrator:
         components: list[Component] = [
             MT5Monitor(self.registry, self.kill_switch, self._terminal_path),
             DataWatcher(self.registry, self.kill_switch, self._symbols, self._tf_str),
-            RiskGuard(self.registry, self.kill_switch),
+            RiskGuard(self.registry, self.kill_switch, soft_halt_event=self.soft_halt),
         ]
 
         for symbol in self._symbols:
@@ -601,6 +719,7 @@ class Orchestrator:
                 self._trade_cfg,
                 risk_agent=self._risk_agent,
                 ftmo_tracker=self._ftmo_tracker,
+                soft_halt_event=self.soft_halt,
                 dry_run=self.dry_run,
             ))
 

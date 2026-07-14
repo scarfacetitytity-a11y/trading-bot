@@ -157,6 +157,34 @@ def close_all(symbol: str) -> int:
     return closed
 
 
+def modify_sl_tp(
+    symbol: str,
+    ticket: int,
+    new_sl: float | None = None,
+    new_tp: float | None = None,
+) -> bool:
+    """Modify SL and/or TP of an open position via TRADE_ACTION_SLTP."""
+    info = mt5.symbol_info(symbol)
+    if info is None:
+        logger.error("modify_sl_tp: no symbol info for %s", symbol)
+        return False
+
+    request: dict = {"action": mt5.TRADE_ACTION_SLTP, "symbol": symbol, "position": ticket}
+    if new_sl is not None:
+        request["sl"] = round(new_sl, info.digits)
+    if new_tp is not None:
+        request["tp"] = round(new_tp, info.digits)
+
+    result = mt5.order_send(request)
+    if result is None or result.retcode != mt5.TRADE_RETCODE_DONE:
+        code = result.retcode if result else "None"
+        logger.error("modify_sl_tp FAILED: ticket=%s retcode=%s", ticket, code)
+        return False
+
+    logger.info("modify_sl_tp OK: ticket=%s sl=%s tp=%s", ticket, new_sl, new_tp)
+    return True
+
+
 # ---------------------------------------------------------------------------
 # Internal helpers
 # ---------------------------------------------------------------------------

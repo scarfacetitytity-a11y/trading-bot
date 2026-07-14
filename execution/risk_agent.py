@@ -31,13 +31,13 @@ class RiskConfig:
     consecutive_loss_cooldown_h: int = 24   # hours to pause after hitting limit
 
     # Daily loss limit (% of account balance at day start)
-    max_daily_loss_pct: float     = 0.04    # 4% — inside FTMO 5% daily limit
+    max_daily_loss_pct: float     = 0.02    # 2% — Council circuit breaker (FTMO limit is 5%)
 
     # Weekly drawdown limit (% of week-start balance)
     max_weekly_dd_pct: float      = 0.07    # 7%
 
     # Account-level circuit breaker (% from peak equity)
-    max_account_dd_pct: float     = 0.08    # 8% — inside FTMO 10% limit
+    max_account_dd_pct: float     = 0.07    # 7% — Council soft halt (FTMO limit is 10%)
 
     # Rolling win rate — scale down if recent WR is bad
     wr_lookback_trades: int       = 10      # last N trades
