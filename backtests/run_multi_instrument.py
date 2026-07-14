@@ -96,6 +96,13 @@ H1_PARAMS = dict(
 )
 
 
+# ── Per-instrument trailing stop config ──────────────────────────────────────────
+# XAUUSD only — gold trends cleanly, trailing stop captured +55pp more return in A/B test.
+# All other instruments: trail_to_be=False (run to full SL/TP — guards against whipsaw re-entry).
+TRAIL_CONFIGS: dict[str, dict] = {
+    "XAUUSD": dict(trail_to_be=True, trail_be_r=1.0, trail_lock_r=2.0),
+}
+
 # ── Per-instrument sweep-optimised params (populated after sweep_m15_instruments) ─
 # Format: {symbol: {min_score, rr_target, min_fvg_atr, atr_stop_buffer, h4_bias_method,
 #                   session_start, session_end}}
@@ -124,7 +131,12 @@ OPTIMISED_PARAMS: dict[str, dict] = {
 }
 
 
-def _load(symbol: str, tf: str, since: pd.Timestamp | None = None) -> pd.DataFrame | None:
+def _load(
+    symbol: str,
+    tf: str,
+    since: pd.Timestamp | None = None,
+    until: pd.Timestamp | None = None,
+) -> pd.DataFrame | None:
     path = PROCESSED / f"{symbol}_{tf}.csv"
     if not path.exists():
         print(f"  SKIP {symbol}_{tf}: not found at {path}", file=sys.stderr)
@@ -134,6 +146,8 @@ def _load(symbol: str, tf: str, since: pd.Timestamp | None = None) -> pd.DataFra
     df = df.dropna(subset=["time"]).sort_values("time").reset_index(drop=True)
     if since is not None:
         df = df[df["time"] >= since].reset_index(drop=True)
+    if until is not None:
+        df = df[df["time"] < until].reset_index(drop=True)
     return df if len(df) > 100 else None
 
 
@@ -146,8 +160,9 @@ def _generate_returns(
     tf: str,
     commission: float,
     since: pd.Timestamp | None = None,
+    until: pd.Timestamp | None = None,
 ) -> tuple[pd.Series, pd.Series, pd.DataFrame] | None:
-    df = _load(symbol, tf, since=since)
+    df = _load(symbol, tf, since=since, until=until)
     if df is None:
         return None
 
@@ -168,7 +183,12 @@ def _generate_returns(
         rsi_long_hi=55.0,
         rsi_short_lo=45.0,
         rsi_short_hi=75.0,
+        trail_to_be=False,
+        trail_be_r=1.0,
+        trail_lock_r=2.0,
     )
+    if symbol in TRAIL_CONFIGS:
+        v2_defaults.update(TRAIL_CONFIGS[symbol])
 
     if symbol in OPTIMISED_PARAMS:
         opt  = OPTIMISED_PARAMS[symbol].copy()   # copy — don't mutate the module-level dict
@@ -222,6 +242,7 @@ def run_combined(
     initial_capital: float = 10_000,
     tf: str          = "M15",
     since: pd.Timestamp | None = None,
+    until: pd.Timestamp | None = None,
     period_label: str = "",
 ) -> dict:
     instruments = list(INSTRUMENTS.keys())
@@ -235,7 +256,7 @@ def run_combined(
     all_trades: list[pd.DataFrame] = []
 
     for symbol, cfg in INSTRUMENTS.items():
-        result = _generate_returns(symbol, cfg, score, fvg_atr, rr, tf, commission, since=since)
+        result = _generate_returns(symbol, cfg, score, fvg_atr, rr, tf, commission, since=since, until=until)
         if result is None:
             continue
         _times, returns, trades = result
