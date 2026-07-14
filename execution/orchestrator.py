@@ -53,6 +53,7 @@ from execution.risk_agent import RiskAgent, RiskConfig
 from execution.ftmo_tracker import FTMOTracker
 from backtests.run_multi_instrument import (
     INSTRUMENTS, OPTIMISED_PARAMS, TRAIL_CONFIGS, BIDIRECTIONAL, M15_PARAMS,
+    _size_mult_from_score,
 )
 
 logger = logging.getLogger(__name__)
@@ -617,11 +618,17 @@ class TradingEngine(Component):
                             logger.critical("[%s] FTMO total DD limit — blocking entry", self.name)
                             continue
 
-                    sl, tp, lots = self._size_order(desired, account["balance"], size_mult)
+                    # Score-based sizing: psychology_mult * score_mult
+                    _sc          = getattr(self._strategy, "_scores", None)
+                    signal_score = int(_sc.iloc[-1]) if _sc is not None else 0
+                    score_mult   = _size_mult_from_score(signal_score) if signal_score > 0 else 1.0
+                    combined_mult = size_mult * score_mult
+                    sl, tp, lots = self._size_order(desired, account["balance"], combined_mult)
                     direction_str = "BUY" if desired == 1 else "SELL"
                     if self._dry_run:
-                        logger.info("[%s] DRY RUN: %s %.2f lots SL=%s TP=%s | %s",
-                                    self.name, direction_str, lots, sl, tp, reason)
+                        logger.info("[%s] DRY RUN: %s %.2f lots SL=%s TP=%s | score=%d x%.2f | %s",
+                                    self.name, direction_str, lots, sl, tp,
+                                    signal_score, combined_mult, reason)
                     else:
                         ok = trader.place_order(self._symbol, desired, lots, sl=sl, tp=tp)
                         if ok:
