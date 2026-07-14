@@ -96,6 +96,19 @@ H1_PARAMS = dict(
 )
 
 
+# ── Variable lot sizing by score ─────────────────────────────────────────────────
+# Higher score = more confluence = larger size. Reduces exposure on marginal setups.
+# Applied per-trade: scale the bar returns for that trade's duration.
+SIZE_CONFIGS: dict[int, float] = {
+    4: 0.75,   # min pass — reduced size
+    5: 1.00,   # one extra gate — standard size
+}
+SIZE_CONFIGS_DEFAULT = 1.5  # score >= 6 — full high-conviction size
+
+def _size_mult_from_score(score: int) -> float:
+    return SIZE_CONFIGS.get(score, SIZE_CONFIGS_DEFAULT)
+
+
 # ── Per-instrument trailing stop config ──────────────────────────────────────────
 # XAUUSD only — gold trends cleanly, trailing stop captured +55pp more return in A/B test.
 # All other instruments: trail_to_be=False (run to full SL/TP — guards against whipsaw re-entry).
@@ -161,6 +174,8 @@ def _generate_returns(
     commission: float,
     since: pd.Timestamp | None = None,
     until: pd.Timestamp | None = None,
+    use_variable_sizing: bool = True,
+    use_prime_bonus: bool = False,
 ) -> tuple[pd.Series, pd.Series, pd.DataFrame] | None:
     df = _load(symbol, tf, since=since, until=until)
     if df is None:
@@ -186,6 +201,7 @@ def _generate_returns(
         trail_to_be=False,
         trail_be_r=1.0,
         trail_lock_r=2.0,
+        use_prime_bonus=use_prime_bonus,
     )
     if symbol in TRAIL_CONFIGS:
         v2_defaults.update(TRAIL_CONFIGS[symbol])
@@ -229,6 +245,34 @@ def _generate_returns(
 
     trades = r.trades.copy()
     trades["symbol"] = symbol
+
+    # Attach per-trade score. Signal fires at bar i, engine shifts by 1 so
+    # execution (entry_time) is at bar i+1. Map score to the execution bar.
+    if hasattr(strat, "_scores") and "entry_time" in trades.columns:
+        score_map = {
+            df["time"].iloc[i + 1]: int(strat._scores.iloc[i])
+            for i in range(len(df) - 1)
+            if strat._scores.iloc[i] > 0
+        }
+        trades["score"] = trades["entry_time"].map(score_map).fillna(0).astype(int)
+
+    # Apply variable sizing: scale bar returns for each trade's duration by its size_mult.
+    if use_variable_sizing and "score" in trades.columns and "entry_time" in trades.columns:
+        mult_s = pd.Series(1.0, index=returns.index)
+        for _, t in trades.iterrows():
+            if t["score"] == 0:
+                continue
+            m = _size_mult_from_score(int(t["score"]))
+            if m == 1.0:
+                continue
+            et = t["entry_time"]
+            xt = t.get("exit_time", None)
+            if xt is not None:
+                mask = (returns.index >= et) & (returns.index <= xt)
+            else:
+                mask = returns.index >= et
+            mult_s[mask] = m
+        returns = returns * mult_s
 
     return times, returns, trades
 

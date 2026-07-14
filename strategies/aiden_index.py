@@ -178,6 +178,7 @@ class AiDENIndexStrategy(Strategy):
         session_end: int         = 21,
         session_prime_start: int = 13,    # NY open first hour bonus window
         session_prime_end: int   = 15,
+        use_prime_bonus: bool    = True,   # False = prime session as context only, not a score gate
         # Direction
         long_only: bool          = False,  # False = both longs and shorts
         # Trailing stop — move SL to breakeven once trade reaches +trail_be_r profit
@@ -214,6 +215,7 @@ class AiDENIndexStrategy(Strategy):
         self.session_end          = session_end
         self.session_prime_start  = session_prime_start
         self.session_prime_end    = session_prime_end
+        self.use_prime_bonus      = use_prime_bonus
         self.long_only            = long_only
         self.trail_to_be          = trail_to_be
         self.trail_be_r           = trail_be_r
@@ -274,8 +276,9 @@ class AiDENIndexStrategy(Strategy):
             w = h4.iloc[idx - self.h4_swing_lookback:idx]
             return float(w["high"].max()), float(w["low"].min())
 
-        signals     = pd.Series(0, index=df.index)
-        self._stops = pd.Series(float("nan"), index=df.index)
+        signals      = pd.Series(0, index=df.index)
+        self._stops  = pd.Series(float("nan"), index=df.index)
+        self._scores = pd.Series(0, index=df.index)
 
         position    = 0
         stop_loss   = None
@@ -374,8 +377,8 @@ class AiDENIndexStrategy(Strategy):
 
                         if in_session:
                             score += 1
-                        if in_prime:
-                            score += 1  # stacks — prime window bonus
+                        if in_prime and self.use_prime_bonus:
+                            score += 1
 
                         if self.use_rsi and not np.isnan(rsi_val):
                             if self.rsi_long_lo <= rsi_val <= self.rsi_long_hi:
@@ -478,6 +481,7 @@ class AiDENIndexStrategy(Strategy):
                                     stop_loss   = sl
                                     take_profit = cv + rr * dist
                                     entry_price = cv
+                                    self._scores.iloc[i] = fvg["score"]
                                 to_remove.append(fvg)
 
                     else:  # bear
@@ -498,6 +502,7 @@ class AiDENIndexStrategy(Strategy):
                                     stop_loss   = sl
                                     take_profit = cv - rr * dist
                                     entry_price = cv
+                                    self._scores.iloc[i] = fvg["score"]
                                 to_remove.append(fvg)
 
                 for fvg in to_remove:
