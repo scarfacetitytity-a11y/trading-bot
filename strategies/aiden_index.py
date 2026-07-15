@@ -391,12 +391,6 @@ class AiDENIndexStrategy(Strategy):
                     self._stops.iloc[i] = float("nan")
                     continue
 
-                # Hard session gate — no new FVG detection outside active hours
-                if not in_session:
-                    signals.iloc[i]     = position
-                    self._stops.iloc[i] = stop_loss if stop_loss is not None else float("nan")
-                    continue
-
                 # ── 2. Detect new FVGs ───────────────────────────────────
                 h2  = float(high.iloc[i - 2])
                 l2  = float(low.iloc[i - 2])

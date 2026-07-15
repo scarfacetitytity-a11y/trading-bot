@@ -52,6 +52,7 @@ from strategies.aiden_index import AiDENIndexStrategy
 from execution.risk_agent import RiskAgent, RiskConfig
 from execution.ftmo_tracker import FTMOTracker
 from execution.trade_journal import TradeJournal
+from execution import telegram_notify as tg
 from backtests.run_multi_instrument import (
     INSTRUMENTS, OPTIMISED_PARAMS, TRAIL_CONFIGS, BIDIRECTIONAL, M15_PARAMS,
     _size_mult_from_score,
@@ -609,15 +610,6 @@ class TradingEngine(Component):
 
                 # Open new position — gate through soft halt, RiskAgent, FTMOTracker
                 if desired != 0:
-                    # Execution-level session gate — never open outside active hours
-                    live_hour = datetime.now(tz=timezone.utc).hour
-                    sess_start = getattr(self._strategy, "session_start", 0)
-                    sess_end   = getattr(self._strategy, "session_end", 24)
-                    if not (sess_start <= live_hour < sess_end):
-                        logger.debug("[%s] Outside session (%dUTC, window %d-%d) — no new entry",
-                                     self.name, live_hour, sess_start, sess_end)
-                        continue
-
                     # Soft halt check (2% daily or 7% cumulative DD)
                     if self._soft_halt is not None and self._soft_halt.is_set():
                         logger.warning("[%s] SOFT HALT active — blocking new entry", self.name)
@@ -734,6 +726,7 @@ class Orchestrator:
 
         if not connect(self._terminal_path):
             logger.critical("Cannot connect to MT5. Aborting.")
+            tg.notify_council_flag("01 Principal", "MT5 connection FAILED on startup. Bot aborted.")
             sys.exit(1)
 
         # Log FTMO challenge status before anything trades
@@ -748,6 +741,9 @@ class Orchestrator:
         if not self._safety_check():
             disconnect()
             sys.exit(1)
+
+        account = mt5.account_info()
+        tg.notify_startup(self._symbols, self.dry_run, account.equity if account else 0.0)
 
         components: list[Component] = [
             MT5Monitor(self.registry, self.kill_switch, self._terminal_path),
@@ -878,6 +874,10 @@ class Orchestrator:
             t.join(timeout=15)
         disconnect()
         self._journal.push_to_github()
+        account = mt5.account_info()
+        equity  = account.equity if account else 0.0
+        session_pnl = equity - (self._risk_agent.initial_equity if hasattr(self._risk_agent, "initial_equity") else equity)
+        tg.notify_shutdown(equity, session_pnl)
         logger.info("Orchestrator stopped.")
 
 

@@ -20,6 +20,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
+from execution import telegram_notify as tg
+
 logger = logging.getLogger(__name__)
 
 # Backtest baseline — from M2P10 26-month run
@@ -87,6 +89,11 @@ class TradeJournal:
         )
         logger.info("[Journal] OPEN %s dir=%+d score=%d entry=%.5f SL=%.5f TP=%s",
                     symbol, direction, score, entry_price, sl_price, tp_price)
+        tg.notify_trade_open(
+            symbol=symbol, direction=direction, score=score,
+            entry=entry_price, sl=sl_price, tp=tp_price,
+            lots=lots, equity=equity,
+        )
 
     def close_trade(self, symbol: str, close_price: float, equity_after: float) -> None:
         rec = self._open.pop(symbol, None)
@@ -113,6 +120,19 @@ class TradeJournal:
 
         self._append(rec)
         self._council_review(rec)
+        session_pnl = sum(
+            t.get("pnl_usd", 0) or 0
+            for t in self._load_recent(200)
+            if t.get("open_time", "")[:10] == datetime.now(tz=timezone.utc).date().isoformat()
+        )
+        tg.notify_trade_close(
+            symbol=rec.symbol, direction=rec.direction,
+            outcome=rec.outcome or "unknown",
+            r_multiple=rec.r_multiple or 0.0,
+            pnl_usd=rec.pnl_usd or 0.0,
+            equity=equity_after,
+            session_pnl=session_pnl,
+        )
 
     # ── Rolling stats ─────────────────────────────────────────────────────────
 
@@ -159,11 +179,9 @@ class TradeJournal:
         # Council #12 — consecutive losses
         consec = stats.get("consec_losses", 0)
         if consec >= _CONSEC_LOSS_LIMIT:
-            logger.critical(
-                "[Council #12 Devil's Advocate] %d consecutive losses. "
-                "Review market regime before next entry.",
-                consec,
-            )
+            msg = f"{consec} consecutive losses. Review market regime before next entry."
+            logger.critical("[Council #12 Devil's Advocate] %s", msg)
+            tg.notify_council_flag("12 Devil's Advocate", msg)
 
         logger.info(
             "[Journal] CLOSE %s outcome=%s R=%.2f | rolling(%d): WR=%.1f%% avgR=%.3f",
