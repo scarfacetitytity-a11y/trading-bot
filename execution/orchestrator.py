@@ -51,6 +51,7 @@ from strategies.fvg_ob import FVGOrderBlockStrategy
 from strategies.aiden_index import AiDENIndexStrategy
 from execution.risk_agent import RiskAgent, RiskConfig
 from execution.ftmo_tracker import FTMOTracker
+from execution.trade_journal import TradeJournal
 from backtests.run_multi_instrument import (
     INSTRUMENTS, OPTIMISED_PARAMS, TRAIL_CONFIGS, BIDIRECTIONAL, M15_PARAMS,
     _size_mult_from_score,
@@ -402,6 +403,7 @@ class TradingEngine(Component):
         ftmo_tracker=None,
         soft_halt_event: Optional[threading.Event] = None,
         dry_run: bool = False,
+        journal: Optional["TradeJournal"] = None,
     ):
         name = f"TradingEngine[{symbol}]"
         tf_secs = _TF_SECONDS.get(tf_str, 3600)
@@ -415,10 +417,13 @@ class TradingEngine(Component):
         self._ftmo_tracker     = ftmo_tracker
         self._soft_halt        = soft_halt_event
         self._dry_run          = dry_run
+        self._journal          = journal
         self._lookback         = trade_cfg.get("lookback_bars", 500)
         self._last_bar         = None
         self._open_entry_price: Optional[float] = None
         self._open_sl:          Optional[float] = None   # initial SL at entry — for trail calc
+        self._open_tp:          Optional[float] = None
+        self._open_score:       int = 0
 
     def _size_order(
         self,
@@ -587,14 +592,20 @@ class TradingEngine(Component):
                         logger.info("[%s] DRY RUN: close %s", self.name,
                                     "LONG" if current == 1 else "SHORT")
                     else:
+                        tick = mt5.symbol_info_tick(self._symbol)
+                        close_px = tick.bid if current == 1 else tick.ask
                         trader.close_all(self._symbol)
                         if self._open_entry_price is not None:
                             r_mult = (equity - account["balance"]) / account["balance"]
                             self._risk_agent.record_trade(r_mult, equity)
                             if self._ftmo_tracker is not None:
                                 self._ftmo_tracker.record_trade_day(equity)
+                            if self._journal is not None:
+                                self._journal.close_trade(self._symbol, close_px, equity)
                             self._open_entry_price = None
                             self._open_sl          = None
+                            self._open_tp          = None
+                            self._open_score        = 0
 
                 # Open new position — gate through soft halt, RiskAgent, FTMOTracker
                 if desired != 0:
@@ -634,7 +645,20 @@ class TradingEngine(Component):
                         if ok:
                             tick = mt5.symbol_info_tick(self._symbol)
                             self._open_entry_price = tick.ask if desired == 1 else tick.bid
-                            self._open_sl = sl
+                            self._open_sl   = sl
+                            self._open_tp   = tp
+                            self._open_score = signal_score
+                            if self._journal is not None:
+                                self._journal.open_trade(
+                                    symbol=self._symbol,
+                                    direction=desired,
+                                    score=signal_score,
+                                    entry_price=self._open_entry_price,
+                                    sl_price=sl or 0.0,
+                                    tp_price=tp,
+                                    lots=lots,
+                                    equity=equity,
+                                )
 
             except Exception as exc:
                 self.registry.fail(self.name, str(exc))
@@ -684,6 +708,8 @@ class Orchestrator:
         challenge_type = trade_cfg.get("ftmo_challenge", "2step-p1")
         self._risk_agent   = RiskAgent(initial_equity=initial_equity)
         self._ftmo_tracker = FTMOTracker(initial_equity=initial_equity, challenge=challenge_type)
+        log_cfg            = cfg.get("logging", {})
+        self._journal      = TradeJournal(log_dir=log_cfg.get("log_dir", "logs"))
 
     # ── Startup ──────────────────────────────────────────────────────────────
 
@@ -728,6 +754,7 @@ class Orchestrator:
                 ftmo_tracker=self._ftmo_tracker,
                 soft_halt_event=self.soft_halt,
                 dry_run=self.dry_run,
+                journal=self._journal,
             ))
 
         self._components = components
@@ -837,6 +864,7 @@ class Orchestrator:
         for t in self._threads:
             t.join(timeout=15)
         disconnect()
+        self._journal.push_to_github()
         logger.info("Orchestrator stopped.")
 
 
