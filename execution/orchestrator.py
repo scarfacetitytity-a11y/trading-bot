@@ -609,6 +609,15 @@ class TradingEngine(Component):
 
                 # Open new position — gate through soft halt, RiskAgent, FTMOTracker
                 if desired != 0:
+                    # Execution-level session gate — never open outside active hours
+                    live_hour = datetime.now(tz=timezone.utc).hour
+                    sess_start = getattr(self._strategy, "session_start", 0)
+                    sess_end   = getattr(self._strategy, "session_end", 24)
+                    if not (sess_start <= live_hour < sess_end):
+                        logger.debug("[%s] Outside session (%dUTC, window %d-%d) — no new entry",
+                                     self.name, live_hour, sess_start, sess_end)
+                        continue
+
                     # Soft halt check (2% daily or 7% cumulative DD)
                     if self._soft_halt is not None and self._soft_halt.is_set():
                         logger.warning("[%s] SOFT HALT active — blocking new entry", self.name)
@@ -629,11 +638,15 @@ class TradingEngine(Component):
                             logger.critical("[%s] FTMO total DD limit — blocking entry", self.name)
                             continue
 
-                    # Score-based sizing: psychology_mult * score_mult
+                    # Score-based sizing: psychology_mult * score_mult * concentration_mult
                     _sc          = getattr(self._strategy, "_scores", None)
                     signal_score = int(_sc.iloc[-1]) if _sc is not None else 0
                     score_mult   = _size_mult_from_score(signal_score) if signal_score > 0 else 1.0
-                    combined_mult = size_mult * score_mult
+                    # Concentration mult: fewer concurrent positions = more size per trade
+                    # 0-1 open → 2x  |  2-3 open → 1.5x  |  4+ open → 1x
+                    n_open = len(mt5.positions_get() or [])
+                    concentration_mult = 2.0 if n_open <= 1 else (1.5 if n_open <= 3 else 1.0)
+                    combined_mult = size_mult * score_mult * concentration_mult
                     sl, tp, lots = self._size_order(desired, account["balance"], combined_mult)
                     direction_str = "BUY" if desired == 1 else "SELL"
                     if self._dry_run:
