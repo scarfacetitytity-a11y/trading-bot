@@ -272,6 +272,7 @@ class AiDENIndexStrategy(Strategy):
         hours  = times.dt.hour
 
         atr_s = _atr(high, low, close, self.atr_period)
+        self._atr_cache = atr_s
         rsi_s = _rsi(close, self.rsi_period) if self.use_rsi else None
 
         vol_s    = df["tick_volume"].astype(float) if "tick_volume" in df.columns else None

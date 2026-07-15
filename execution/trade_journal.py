@@ -73,6 +73,8 @@ class TradeJournal:
         tp_price: Optional[float],
         lots: float,
         equity: float,
+        atr: Optional[float] = None,
+        df=None,
     ) -> None:
         now = datetime.now(tz=timezone.utc)
         self._open[symbol] = TradeRecord(
@@ -92,7 +94,7 @@ class TradeJournal:
         tg.notify_trade_open(
             symbol=symbol, direction=direction, score=score,
             entry=entry_price, sl=sl_price, tp=tp_price,
-            lots=lots, equity=equity,
+            lots=lots, equity=equity, atr=atr, df=df,
         )
 
     def close_trade(self, symbol: str, close_price: float, equity_after: float) -> None:

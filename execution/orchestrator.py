@@ -654,6 +654,9 @@ class TradingEngine(Component):
                             self._open_tp   = tp
                             self._open_score = signal_score
                             if self._journal is not None:
+                                import numpy as np
+                                _atr_series = getattr(self._strategy, "_atr_cache", None)
+                                _atr_val = float(_atr_series.iloc[-1]) if _atr_series is not None and not np.isnan(float(_atr_series.iloc[-1])) else None
                                 self._journal.open_trade(
                                     symbol=self._symbol,
                                     direction=desired,
@@ -663,6 +666,8 @@ class TradingEngine(Component):
                                     tp_price=tp,
                                     lots=lots,
                                     equity=equity,
+                                    atr=_atr_val,
+                                    df=df,
                                 )
 
             except Exception as exc:
