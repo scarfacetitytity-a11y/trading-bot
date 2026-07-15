@@ -1,12 +1,12 @@
 {
   "consecutive_losses": 0,
   "pause_until": null,
-  "daily_start_equity": 10000,
-  "daily_date": "2026-07-08",
-  "weekly_start_equity": 10000,
-  "weekly_start_date": "2026-07-06",
-  "peak_equity": 10000,
-  "current_equity": 10000,
+  "daily_start_equity": 100000,
+  "daily_date": "2026-07-15",
+  "weekly_start_equity": 100000,
+  "weekly_start_date": "2026-07-13",
+  "peak_equity": 100000,
+  "current_equity": 100000,
   "recent_trades": [],
   "trade_log": []
 }

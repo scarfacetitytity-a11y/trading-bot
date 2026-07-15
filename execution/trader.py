@@ -110,8 +110,8 @@ def place_order(
         return False
 
     logger.info(
-        "Order OK: %s %s %.2f lots @ %.5f | ticket=%s",
-        "BUY" if direction == 1 else "SELL", symbol, lots, price, result.order,
+        "Order OK: %s %s %.2f lots @ %.5f | SL=%s TP=%s | ticket=%s",
+        "BUY" if direction == 1 else "SELL", symbol, lots, price, sl, tp, result.order,
     )
     return True
 

@@ -77,16 +77,14 @@ def _run_month(since: pd.Timestamp, until: pd.Timestamp) -> dict | None:
 
 def main():
     today  = pd.Timestamp.now(tz="UTC")
+    start  = pd.Timestamp(2024, 5, 1, tz="UTC")
     months = []
-    y, m   = today.year, today.month - 1
-    if m == 0:
-        y -= 1; m = 12
-    for _ in range(12):
+    y, m   = start.year, start.month
+    while pd.Timestamp(y, m, 1, tz="UTC") <= today:
         months.append((y, m))
-        m -= 1
-        if m == 0:
-            y -= 1; m = 12
-    months.reverse()
+        m += 1
+        if m == 13:
+            y += 1; m = 1
 
     print("\n" + "=" * 110)
     print("  AiDEN MONTHLY BREAKDOWN  |  8 instruments, M15, XAUUSD trail-on, score=4  |  1% risk/trade")

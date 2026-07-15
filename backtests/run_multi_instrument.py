@@ -175,7 +175,7 @@ def _generate_returns(
     since: pd.Timestamp | None = None,
     until: pd.Timestamp | None = None,
     use_variable_sizing: bool = True,
-    use_prime_bonus: bool = False,
+    use_prime_bonus: bool = True,
 ) -> tuple[pd.Series, pd.Series, pd.DataFrame] | None:
     df = _load(symbol, tf, since=since, until=until)
     if df is None:
@@ -202,6 +202,10 @@ def _generate_returns(
         trail_be_r=1.0,
         trail_lock_r=2.0,
         use_prime_bonus=use_prime_bonus,
+        use_vol_spike=False,
+        vol_spike_mult=1.5,
+        require_ce=False,
+        use_d1_bias=False,
     )
     if symbol in TRAIL_CONFIGS:
         v2_defaults.update(TRAIL_CONFIGS[symbol])
@@ -278,7 +282,7 @@ def _generate_returns(
 
 
 def run_combined(
-    score: int       = 5,
+    score: int       = 4,
     fvg_atr: float   = 0.10,
     rr: float        = 2.5,
     daily_halt: float = 0.025,
@@ -288,19 +292,20 @@ def run_combined(
     since: pd.Timestamp | None = None,
     until: pd.Timestamp | None = None,
     period_label: str = "",
+    use_prime_bonus: bool = True,
 ) -> dict:
     instruments = list(INSTRUMENTS.keys())
     label = f"  [{period_label}]" if period_label else ""
     print(f"\nAiDEN Multi-Instrument Backtest  [{tf}]{label}")
     print(f"Universe : {', '.join(instruments)}")
-    print(f"Config   : score>={score}  fvg_atr={fvg_atr}  rr={rr}  halt={daily_halt*100:.1f}%")
+    print(f"Config   : score>={score}  fvg_atr={fvg_atr}  rr={rr}  halt={daily_halt*100:.1f}%  prime_bonus={use_prime_bonus}")
     print(f"Capital  : {initial_capital:,.0f}  Commission: {commission}\n")
 
     per_instrument: dict[str, pd.Series] = {}
     all_trades: list[pd.DataFrame] = []
 
     for symbol, cfg in INSTRUMENTS.items():
-        result = _generate_returns(symbol, cfg, score, fvg_atr, rr, tf, commission, since=since, until=until)
+        result = _generate_returns(symbol, cfg, score, fvg_atr, rr, tf, commission, since=since, until=until, use_prime_bonus=use_prime_bonus)
         if result is None:
             continue
         _times, returns, trades = result
@@ -438,7 +443,7 @@ def _estimate_bpy(returns: pd.Series) -> float:
 def main() -> None:
     parser = argparse.ArgumentParser(description="AiDEN multi-instrument backtest")
     parser.add_argument("--tf",      default="M15",  help="Timeframe: M15 or H1")
-    parser.add_argument("--score",   type=int,   default=5)
+    parser.add_argument("--score",   type=int,   default=4)
     parser.add_argument("--fvg",     type=float, default=0.10)
     parser.add_argument("--rr",      type=float, default=2.5)
     parser.add_argument("--halt",    type=float, default=0.025)

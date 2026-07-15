@@ -55,6 +55,18 @@ def _rsi(close: pd.Series, period: int = 14) -> pd.Series:
     return 100 - 100 / (1 + rs)
 
 
+def _resample_d1(df: pd.DataFrame) -> pd.DataFrame:
+    times = pd.to_datetime(df["time"])
+    tmp   = df[["open", "high", "low", "close"]].copy()
+    tmp.index = times
+    d1 = tmp.resample("1D", closed="left", label="left").agg({
+        "open": "first", "high": "max", "low": "min", "close": "last",
+    }).dropna()
+    d1 = d1.reset_index().rename(columns={"index": "time"})
+    d1["time"] = pd.to_datetime(d1["time"])
+    return d1
+
+
 def _resample_h4(df: pd.DataFrame) -> pd.DataFrame:
     times = pd.to_datetime(df["time"])
     tmp   = df[["open", "high", "low", "close"]].copy()
@@ -178,7 +190,14 @@ class AiDENIndexStrategy(Strategy):
         session_end: int         = 21,
         session_prime_start: int = 13,    # NY open first hour bonus window
         session_prime_end: int   = 15,
-        use_prime_bonus: bool    = True,   # False = prime session as context only, not a score gate
+        use_prime_bonus: bool    = True,
+        # Volume spike — +1 score when FVG-forming bar volume > mult * 20-bar avg
+        use_vol_spike: bool      = False,
+        vol_spike_mult: float    = 1.5,
+        # CE (Consequent Encroachment) — require price to reach FVG midpoint before entry
+        require_ce: bool         = False,
+        # D1 bias alignment — +1 score when Daily EMA agrees with H4 EMA
+        use_d1_bias: bool        = False,
         # Direction
         long_only: bool          = False,  # False = both longs and shorts
         # Trailing stop — move SL to breakeven once trade reaches +trail_be_r profit
@@ -216,6 +235,10 @@ class AiDENIndexStrategy(Strategy):
         self.session_prime_start  = session_prime_start
         self.session_prime_end    = session_prime_end
         self.use_prime_bonus      = use_prime_bonus
+        self.use_vol_spike        = use_vol_spike
+        self.vol_spike_mult       = vol_spike_mult
+        self.require_ce           = require_ce
+        self.use_d1_bias          = use_d1_bias
         self.long_only            = long_only
         self.trail_to_be          = trail_to_be
         self.trail_be_r           = trail_be_r
@@ -251,6 +274,9 @@ class AiDENIndexStrategy(Strategy):
         atr_s = _atr(high, low, close, self.atr_period)
         rsi_s = _rsi(close, self.rsi_period) if self.use_rsi else None
 
+        vol_s    = df["tick_volume"].astype(float) if "tick_volume" in df.columns else None
+        vol_mean = vol_s.rolling(20).mean() if vol_s is not None else None
+
         h4 = _resample_h4(df)
         fast_n = max(self.htf_lookback // 2, 5)
 
@@ -258,6 +284,20 @@ class AiDENIndexStrategy(Strategy):
             h4_bias, h4_spread = _compute_h4_bias_ema(h4, fast_n, self.htf_lookback)
         else:
             h4_bias, h4_spread = _compute_h4_bias_swing(h4, self.htf_lookback)
+
+        # D1 bias — three-TF alignment gate
+        d1_bias_at = None
+        if self.use_d1_bias:
+            d1 = _resample_d1(df)
+            if len(d1) >= 10:
+                d1_fast_n = max(3, self.htf_lookback // 4)
+                d1_slow_n = max(5, self.htf_lookback // 2)
+                d1_b, _   = _compute_h4_bias_ema(d1, d1_fast_n, d1_slow_n)
+                d1_times  = d1["time"]
+                def _d1_bias_at(bar_time, _d1b=d1_b, _d1t=d1_times):
+                    idx = _d1t.searchsorted(bar_time, side="right") - 1
+                    return int(_d1b.iloc[idx]) if idx >= 0 else 0
+                d1_bias_at = _d1_bias_at
 
         h4["bias"]   = h4_bias.values
         h4["spread"] = h4_spread.values
@@ -387,11 +427,20 @@ class AiDENIndexStrategy(Strategy):
                         if strongly_trending:
                             score += 1  # regime bonus
 
+                        if self.use_vol_spike and vol_mean is not None:
+                            vm = float(vol_mean.iloc[i])
+                            if vm > 0 and float(vol_s.iloc[i]) > self.vol_spike_mult * vm:
+                                score += 1
+
+                        if d1_bias_at is not None and d1_bias_at(bar_time) == 1:
+                            score += 1
+
                         if score >= self.min_score:
                             active_fvgs.append({
                                 "dir":      "bull",
                                 "fvg_lo":   h2,
                                 "fvg_hi":   lv,
+                                "fvg_ce":   (h2 + lv) / 2,
                                 "ob_lo":    ob_lo,
                                 "ob_hi":    ob_hi,
                                 "score":    score,
@@ -424,7 +473,7 @@ class AiDENIndexStrategy(Strategy):
 
                         if in_session:
                             score += 1
-                        if in_prime:
+                        if in_prime and self.use_prime_bonus:
                             score += 1
 
                         if self.use_rsi and not np.isnan(rsi_val):
@@ -434,11 +483,20 @@ class AiDENIndexStrategy(Strategy):
                         if strongly_trending:
                             score += 1
 
+                        if self.use_vol_spike and vol_mean is not None:
+                            vm = float(vol_mean.iloc[i])
+                            if vm > 0 and float(vol_s.iloc[i]) > self.vol_spike_mult * vm:
+                                score += 1
+
+                        if d1_bias_at is not None and d1_bias_at(bar_time) == -1:
+                            score += 1
+
                         if score >= self.min_score:
                             active_fvgs.append({
                                 "dir":      "bear",
-                                "fvg_lo":   hv,   # bottom of bearish FVG gap
-                                "fvg_hi":   l2,   # top of bearish FVG gap
+                                "fvg_lo":   hv,
+                                "fvg_hi":   l2,
+                                "fvg_ce":   (hv + l2) / 2,
                                 "ob_lo":    ob_lo,
                                 "ob_hi":    ob_hi,
                                 "score":    score,
@@ -466,7 +524,8 @@ class AiDENIndexStrategy(Strategy):
                     if fvg["dir"] == "bull":
                         if cv < fvg_lo:
                             to_remove.append(fvg); continue
-                        if not fvg["tested"] and lv <= fvg_hi:
+                        ce_level = fvg.get("fvg_ce", fvg_hi) if self.require_ce else fvg_hi
+                        if not fvg["tested"] and lv <= ce_level:
                             fvg["tested"] = True; fvg["test_bar"] = i
                         if fvg["tested"]:
                             if (i - fvg["test_bar"]) > self.max_entry_wait:
@@ -487,7 +546,8 @@ class AiDENIndexStrategy(Strategy):
                     else:  # bear
                         if cv > fvg_hi:
                             to_remove.append(fvg); continue
-                        if not fvg["tested"] and hv >= fvg_lo:
+                        ce_level = fvg.get("fvg_ce", fvg_lo) if self.require_ce else fvg_lo
+                        if not fvg["tested"] and hv >= ce_level:
                             fvg["tested"] = True; fvg["test_bar"] = i
                         if fvg["tested"]:
                             if (i - fvg["test_bar"]) > self.max_entry_wait:
@@ -511,6 +571,9 @@ class AiDENIndexStrategy(Strategy):
 
             signals.iloc[i]     = position
             self._stops.iloc[i] = stop_loss if stop_loss is not None else float("nan")
+            # Carry entry score forward while in a position so orchestrator reads it correctly
+            if position != 0 and i > 0 and self._scores.iloc[i] == 0:
+                self._scores.iloc[i] = self._scores.iloc[i - 1]
 
         return signals
 
