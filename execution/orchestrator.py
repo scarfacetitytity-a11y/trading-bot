@@ -52,6 +52,7 @@ from execution.trade_manager import TradeManager, PositionState, ActionType
 from execution.signal_detectors import (
     detect_m5_entry_trigger, detect_accumulation, detect_liquidity_draw,
 )
+from execution.trade_analyzer import analyze_entry
 from strategies.sniper import SniperStrategy
 from strategies.london_breakout import LondonBreakoutStrategy
 from strategies.fvg_ob import FVGOrderBlockStrategy
@@ -451,6 +452,7 @@ class TradingEngine(Component):
         self._open_entry_price: Optional[float] = None
         self._open_sl:          Optional[float] = None   # initial SL at entry — never moved
         self._open_tp:          Optional[float] = None
+        self._last_plan               = None    # last TradePlan from analyze_entry
         self._open_score:       int = 0
         self._t1_hit:           bool = False
         self._bars_since_entry: int  = 0
@@ -543,9 +545,31 @@ class TradingEngine(Component):
             else:
                 raw_lots = float(self._trade_cfg.get("lot_size", 0.01))
 
-            # Compute TP via strategy RR ratio
-            rr = getattr(self._strategy, "rr_target", 2.0)
-            tp = (entry + rr * dist) if direction == 1 else (entry - rr * dist)
+            # ── Liquidity-based target (replaces blind rr_target * dist) ──
+            # Every trade is liquidity-based: the TP is a real draw price is pulled
+            # toward, not arithmetic off the stop. Grade C (no clean draw in reach)
+            # -> min size, so a no-target trade is shrunk to nothing not placed full.
+            rr_fb   = getattr(self._strategy, "rr_target", 2.0)
+            atr_ser = getattr(self._strategy, "_atr_cache", None)
+            atr_val = 0.0
+            if atr_ser is not None and len(atr_ser) > 0:
+                _a = float(atr_ser.iloc[-1])
+                atr_val = _a if not math.isnan(_a) else 0.0
+            df_m15_a = self._fetch_ltf_bars("M15", count=120)
+            df_m5_a  = self._fetch_ltf_bars("M5",  count=120)
+            h4b = (self._strategy.current_h4_bias(df_m15_a)
+                   if df_m15_a is not None and hasattr(self._strategy, "current_h4_bias")
+                   else 0)
+            plan = analyze_entry(
+                df_m15=df_m15_a, df_m5=df_m5_a, direction=direction,
+                entry=entry, stop=sl, atr=atr_val, h4_bias=h4b, rr_fallback=rr_fb,
+            )
+            tp = plan.tp
+            raw_lots *= plan.size_mult
+            self._last_plan = plan
+            logger.info("[%s] PLAN grade=%s type=%s size=%.2fx RR=%.2f | %s",
+                        self.name, plan.grade, plan.trade_type, plan.size_mult,
+                        plan.rr, plan.thesis)
             if info:
                 tp = round(tp, info.digits)
                 sl = round(sl, info.digits)
@@ -1174,7 +1198,16 @@ class TradingEngine(Component):
                     concentration_mult = 2.0 if n_open <= 1 else (1.5 if n_open <= 3 else 1.0)
                     combined_mult = size_mult * score_mult * concentration_mult
                     sl, tp, lots = self._size_order(desired, account["balance"], combined_mult)
+
+                    # ── Liquidity thesis gate: no clean draw within reach = no trade ──
+                    # A trade with no real liquidity target is not a trade — it's
+                    # arithmetic. Skip it rather than place a token lot at a fake TP.
                     direction_str = "BUY" if desired == 1 else "SELL"
+                    if self._last_plan is not None and not self._last_plan.tradeable:
+                        logger.info("[%s] NO-DRAW skip: %s (grade %s) — %s",
+                                    self.name, direction_str,
+                                    self._last_plan.grade, self._last_plan.thesis)
+                        continue
 
                     # ── Council gate: Telegram approval before order fires ──
                     require_approval = self._trade_cfg.get("require_approval", False)
