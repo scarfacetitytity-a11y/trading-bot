@@ -41,6 +41,8 @@ LOGS      = Path(__file__).resolve().parent.parent / "logs"
 DAILY_HALT   = 2.0    # stop new entries when day down this %
 DAILY_FLOOR  = 5.0    # hard close-all
 TOTAL_FLOOR  = 10.0
+MAX_HOLD_DAYS = 5     # time stop — an intraday structural trade held longer is closed
+                      # (prevents 400-day "zombie" holds that never hit SL/TP)
 
 
 @dataclass
@@ -88,6 +90,8 @@ def _resolve_exit(fine, direction, entry, stop, target, start_time):
     if len(sub) == 0 or rd <= 0:
         return None
     hi = sub["high"].values; lo = sub["low"].values
+    st = sub["time"].values
+    time_cap = start_time + pd.Timedelta(days=MAX_HOLD_DAYS)
     best_fav = entry; worst_adv = entry
     for k in range(len(sub)):
         h, l = hi[k], lo[k]
@@ -103,6 +107,12 @@ def _resolve_exit(fine, direction, entry, stop, target, start_time):
             mfe = (best_fav - entry) / rd if direction == 1 else (entry - best_fav) / rd
             mae = (worst_adv - entry) / rd if direction == 1 else (entry - worst_adv) / rd
             return exit_px, reason, mfe, mae, k + 1, ambiguous
+        # time stop — close at this bar if held past the cap
+        if st[k] >= np.datetime64(time_cap):
+            exit_px = float(sub["close"].iloc[k])
+            mfe = (best_fav - entry) / rd if direction == 1 else (entry - best_fav) / rd
+            mae = (worst_adv - entry) / rd if direction == 1 else (entry - worst_adv) / rd
+            return exit_px, "TIME", mfe, mae, k + 1, False
     # never hit — close at last fine close
     last = float(sub["close"].iloc[-1])
     mfe = (best_fav - entry) / rd if direction == 1 else (entry - best_fav) / rd

@@ -68,18 +68,26 @@ def daily_batches(df):
 
 
 def portfolio_heat(df, risk_pct):
-    """Max concurrent open risk (% of account) from real entry/exit windows."""
+    """Portfolio heat = concurrent open risk (% of account) from real entry/exit
+    windows. Reports the p95 (typical busy moment), not the absolute max — one
+    freak overlap shouldn't define the number. Returns p95 risk %."""
     events = []
+    cap = pd.Timedelta(days=5)   # clamp open window — data-gap trades can't overlap for months
     for _, r in df.iterrows():
-        events.append((r["entry_time"], +risk_pct * r["size_mult"]))
-        xt = r["exit_time"] if pd.notna(r["exit_time"]) else r["entry_time"]
+        et = r["entry_time"]
+        xt = r["exit_time"] if pd.notna(r["exit_time"]) else et
+        xt = min(xt, et + cap)   # a trade can't realistically be "open" past the time stop
+        events.append((et, +risk_pct * r["size_mult"]))
         events.append((xt, -risk_pct * r["size_mult"]))
     events.sort(key=lambda e: e[0])
-    heat = peak = 0.0
+    heat = 0.0
+    samples = []
     for _, d in events:
         heat += d
-        peak = max(peak, heat)
-    return peak
+        samples.append(heat)
+    if not samples:
+        return 0.0
+    return float(np.percentile(samples, 95))
 
 
 def sim_phase(rng, batches, risk_frac, target):
