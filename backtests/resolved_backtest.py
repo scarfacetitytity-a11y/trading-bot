@@ -54,8 +54,10 @@ class RTrade:
     hold_bars: int; ambiguous: bool; resolved_on: str
 
 
-def _fine_bars(symbol: str):
-    """Return (df, tf_tag): M1 if available else M5."""
+def _load_fine(symbol: str) -> dict:
+    """Load M1 and M5 fine bars. M1 covers only ~3 months, so per-trade we pick the
+    finest set that actually COVERS the entry time (M1 inside its window, else M5)."""
+    out = {}
     for tf in ("M1", "M5"):
         p = PROCESSED / f"{symbol}_{tf}.csv"
         if p.exists():
@@ -63,7 +65,18 @@ def _fine_bars(symbol: str):
             df["time"] = pd.to_datetime(df["time"], utc=True, errors="coerce")
             df = df.dropna(subset=["time"]).sort_values("time").reset_index(drop=True)
             if len(df) > 100:
-                return df, tf
+                out[tf] = df
+    return out
+
+
+def _pick_fine(fine: dict, entry_time):
+    """Choose finest bar set that covers entry_time. Returns (df, tag) or (None,None)."""
+    m1 = fine.get("M1")
+    if m1 is not None and entry_time >= m1["time"].iloc[0]:
+        return m1, "M1"
+    m5 = fine.get("M5")
+    if m5 is not None:
+        return m5, "M5"
     return None, None
 
 
@@ -101,8 +114,8 @@ def run_symbol(symbol: str) -> list[RTrade]:
     df15, _ = _load_symbol(symbol)
     if df15 is None:
         return []
-    fine, tf_tag = _fine_bars(symbol)
-    if fine is None:
+    fine = _load_fine(symbol)
+    if not fine:
         return []
 
     strat  = _build_strategy(symbol)
@@ -122,21 +135,27 @@ def run_symbol(symbol: str) -> list[RTrade]:
             atr = float(atr_c.iloc[i-1]) if i-1 < len(atr_c) and not np.isnan(atr_c.iloc[i-1]) else 0.0
             if atr <= 0:
                 i += 1; continue
+            fine_df, tf_tag = _pick_fine(fine, etime)   # M1 if covered, else M5 — for EXIT resolution
+            if fine_df is None:
+                i += 1; continue
             m15ctx = df15.iloc[max(0, i-120):i].reset_index(drop=True)
-            m5ctx  = fine[fine["time"] <= etime].tail(120).reset_index(drop=True)
+            # Analyzer context is ALWAYS M5 (proper swing/liquidity structure) — M1
+            # is too micro to read the levels that matter. Exit resolution uses M1.
+            ctx_src = fine.get("M5", fine_df)
+            m5ctx   = ctx_src[ctx_src["time"] <= etime].tail(120).reset_index(drop=True)
             h4b = strat.current_h4_bias(m15ctx) if hasattr(strat, "current_h4_bias") else 0
             plan = analyze_entry(df_m15=m15ctx, df_m5=m5ctx, direction=direction,
                                  entry=entry, stop=float(slv[i-1]), atr=atr, h4_bias=h4b)
             if not plan.tradeable:
                 i += 1; continue
-            res = _resolve_exit(fine, direction, entry, plan.stop, plan.tp, etime)
+            res = _resolve_exit(fine_df, direction, entry, plan.stop, plan.tp, etime)
             if res is None:
                 i += 1; continue
             exit_px, reason, mfe, mae, hold, ambiguous = res
             rd = abs(entry - plan.stop)
             R  = ((exit_px - entry) if direction == 1 else (entry - exit_px)) / rd
             # exit time from fine bars
-            sub = fine[fine["time"] >= etime]
+            sub = fine_df[fine_df["time"] >= etime]
             xtime = str(sub["time"].iloc[min(hold-1, len(sub)-1)])
             hit = (reason == "TP")
             trades.append(RTrade(
@@ -200,8 +219,13 @@ def main(symbols=None, risk=0.5):
         # integrity
         sl = [t for t in all_t if t.reason == "SL"]
         bad = [t for t in sl if t.R > -0.98]
-        print(f"\n  INTEGRITY: {len(sl)-len(bad)}/{len(sl)} SL trades = ~-1R  |  "
-              f"{agg['ambiguous_bars']} ambiguous same-bar SL+TP (assumed SL, need M1)")
+        n_m1 = sum(1 for t in all_t if t.resolved_on == "M1")
+        n_m5 = sum(1 for t in all_t if t.resolved_on == "M5")
+        amb_m5 = sum(1 for t in all_t if t.ambiguous and t.resolved_on == "M5")
+        print(f"\n  RESOLUTION: {n_m1} trades on M1 (exact), {n_m5} on M5 (pre-M1 window)")
+        print(f"  INTEGRITY: {len(sl)-len(bad)}/{len(sl)} SL trades = ~-1R  |  "
+              f"{agg['ambiguous_bars']} ambiguous same-bar (assumed SL); {amb_m5} of them on "
+              f"M5 could flip under M1")
 
     if all_t:
         LOGS.mkdir(exist_ok=True)
