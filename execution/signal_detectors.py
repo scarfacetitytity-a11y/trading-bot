@@ -417,8 +417,8 @@ def detect_sweep_recovery(
 def detect_m5_entry_trigger(
     df: pd.DataFrame,
     signal_dir: int,
-    lookback: int = 20,
-    order: int = 3,
+    lookback: int = 30,
+    order: int = 2,
     atr: float = 0.0,
 ) -> bool:
     """Return True when M5 has broken structure in signal_dir.
@@ -426,6 +426,9 @@ def detect_m5_entry_trigger(
     Used as the LTF entry trigger after an M15 setup fires. Requires a genuine
     BOS on M5 — not just price moving in direction, but actually taking out a
     prior swing high (long) or swing low (short).
+
+    order=2: swing confirmed with 2 bars each side — fast enough to catch
+    a fresh 5-minute BOS within the same M15 candle it forms.
     """
     if df is None or len(df) < lookback:
         return True  # no M5 data — don't block the entry
@@ -436,11 +439,11 @@ def detect_m5_entry_trigger(
 
     if signal_dir == 1:  # looking to buy — need M5 to break above a swing high
         sh = _swing_highs(highs, order=order)
-        valid = highs[sh].iloc[:-1]  # exclude most recent bar
+        valid = highs[sh].iloc[:-1]  # exclude most recent forming bar
         if valid.empty:
             return True
         last_swing_high = valid.iloc[-1]
-        min_break = last_swing_high + (0.05 * atr if atr > 0 else 0)
+        min_break = last_swing_high + (0.02 * atr if atr > 0 else 0)
         return float(closes.iloc[-1]) > min_break
 
     else:  # looking to sell — need M5 to break below a swing low
@@ -449,7 +452,7 @@ def detect_m5_entry_trigger(
         if valid.empty:
             return True
         last_swing_low = valid.iloc[-1]
-        min_break = last_swing_low - (0.05 * atr if atr > 0 else 0)
+        min_break = last_swing_low - (0.02 * atr if atr > 0 else 0)
         return float(closes.iloc[-1]) < min_break
 
 

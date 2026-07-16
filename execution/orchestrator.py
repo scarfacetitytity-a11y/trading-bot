@@ -452,7 +452,7 @@ class TradingEngine(Component):
         self._scaled_in:        bool = False
         self._pending_signal:   int  = 0    # M15 setup waiting for M5 trigger
         self._pending_bars:     int  = 0    # bars elapsed since pending set
-        self._ltf_trigger_bars: int  = 3    # max M15 bars to wait for M5 trigger
+        self._ltf_trigger_bars: int  = 6    # max M15 bars to wait for M5 trigger (90 min)
         self._state_file       = Path("logs") / f"pos_state_{symbol.replace('.','_')}.json"
         self._load_position_state()
 
