@@ -244,18 +244,19 @@ class TestRiskGuardTiers:
         registry    = HeartbeatRegistry()
         kill_switch = threading.Event()
         soft_halt   = threading.Event()
-        guard = RiskGuard(registry, kill_switch, soft_halt)
-        guard._day_start_equity    = 10_000.0
-        guard._session_start_equity = 10_000.0
-        guard._today               = 99          # prevent date-reset branch
+        guard = RiskGuard(registry, kill_switch, soft_halt,
+                          initial_equity=10_000.0, symbols=["XAUUSD"])
+        guard._day_start_equity = 10_000.0
+        guard._server_day       = "2026-01-01"   # prevent new-day reset branch
         return guard, kill_switch, soft_halt
 
     def _run_once(self, guard, equity):
         """Simulate one iteration of the guard's check logic (extracted)."""
         kill_switch = guard.kill_switch
         soft_halt   = guard._soft_halt
-        daily_pct   = (equity - guard._day_start_equity)   / guard._day_start_equity * 100
-        total_pct   = (equity - guard._session_start_equity) / guard._session_start_equity * 100
+        daily_pct   = (equity - guard._day_start_equity) / guard._day_start_equity * 100
+        # Total loss is measured from the STATIC initial balance (restart-safe).
+        total_pct   = (equity - guard._initial_equity) / guard._initial_equity * 100
 
         if daily_pct <= -MAX_DAILY_LOSS_PCT:
             soft_halt.set()
@@ -343,6 +344,37 @@ class TestTradingEngineGates:
         _run_one_bar(engine, kill, signal=0)  # flat signal
 
         trader_mod.place_order.assert_not_called()
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Safety check — real-account block (M3 regression)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestSafetyCheck:
+    """The real-account guard must fire unless allow_real_account is explicitly set."""
+
+    def _orch(self, allow_real):
+        from execution.orchestrator import Orchestrator
+        o = object.__new__(Orchestrator)          # bypass heavy __init__
+        o.cfg = {"trading": {"allow_real_account": allow_real}}
+        return o
+
+    def _account(self, trade_mode):
+        acct = MagicMock()
+        acct.trade_mode = trade_mode
+        _mt5_stub.account_info.return_value = acct
+
+    def test_real_account_blocked_by_default(self):
+        self._account(_mt5_stub.ACCOUNT_TRADE_MODE_REAL)
+        assert self._orch(allow_real=False)._safety_check() is False
+
+    def test_real_account_allowed_when_flag_set(self):
+        self._account(_mt5_stub.ACCOUNT_TRADE_MODE_REAL)
+        assert self._orch(allow_real=True)._safety_check() is True
+
+    def test_demo_account_allowed(self):
+        self._account(_mt5_stub.ACCOUNT_TRADE_MODE_DEMO)
+        assert self._orch(allow_real=False)._safety_check() is True
 
 
 # ═══════════════════════════════════════════════════════════════════════════════

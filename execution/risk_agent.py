@@ -199,7 +199,7 @@ class RiskAgent:
             s.recent_trades = s.recent_trades[-100:]
 
         s.trade_log.append({
-            "time":     datetime.utcnow().isoformat(),
+            "time":     datetime.now(timezone.utc).isoformat(),
             "r":        r_multiple,
             "equity":   equity_after,
         })

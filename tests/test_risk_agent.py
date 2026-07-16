@@ -30,7 +30,13 @@ def test_normal_can_trade(agent):
 # ── Concurrent trade cap ──────────────────────────────────────────────────────
 
 def test_concurrent_trades_cap(agent):
-    can, mult, reason = agent.pre_trade_check(10_000, open_trade_count=4)
+    # Risk is governed by risk_pct per trade; the count cap is intentionally high
+    # (default 20) so valid setups are never blocked by position count alone.
+    cap = agent.config.max_concurrent_trades
+    can, _, _ = agent.pre_trade_check(10_000, open_trade_count=cap - 1)
+    assert can  # below cap → allowed
+
+    can, mult, reason = agent.pre_trade_check(10_000, open_trade_count=cap)
     assert not can
     assert mult == 0.0
     assert "concurrent" in reason.lower()

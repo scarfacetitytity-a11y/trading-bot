@@ -49,6 +49,14 @@ def get_positions(symbol: str) -> list:
     return [p for p in positions if p.magic == _MAGIC]
 
 
+def get_all_positions() -> list:
+    """Return all open bot positions across every symbol (filtered by magic)."""
+    positions = mt5.positions_get()
+    if positions is None:
+        return []
+    return [p for p in positions if p.magic == _MAGIC]
+
+
 def get_position_direction(symbol: str) -> int:
     """Return 1 (long), -1 (short), or 0 (flat) for the bot's position."""
     positions = get_positions(symbol)
