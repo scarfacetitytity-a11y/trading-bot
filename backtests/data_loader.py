@@ -1,5 +1,6 @@
 """Download historical OHLCV data from MT5 and save it to data/raw as CSV."""
-from datetime import datetime
+import time
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
@@ -56,13 +57,17 @@ def fetch_symbol_data(
         )
         return None
 
-    if not info.visible and not mt5.symbol_select(symbol, True):
+    # Always select the symbol to trigger history loading, even if already visible
+    if not mt5.symbol_select(symbol, True):
         logger.error("Could not add '%s' to Market Watch: %s", symbol, mt5.last_error())
         return None
+    # Brief pause to let MT5 load history for this symbol from the server
+    time.sleep(0.5)
 
     if start_date and end_date:
-        date_from = datetime.strptime(start_date, "%Y-%m-%d")
-        date_to = datetime.strptime(end_date, "%Y-%m-%d")
+        # Must be UTC-aware — naive datetimes return 'Invalid params' on MT5 5.0.5735+
+        date_from = datetime.strptime(start_date, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+        date_to   = datetime.strptime(end_date,   "%Y-%m-%d").replace(tzinfo=timezone.utc)
         logger.info("Requesting %s %s from %s to %s", symbol, timeframe_str, start_date, end_date)
         rates = mt5.copy_rates_range(symbol, timeframe, date_from, date_to)
     else:

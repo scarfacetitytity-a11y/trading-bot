@@ -157,6 +157,45 @@ def close_all(symbol: str) -> int:
     return closed
 
 
+def partial_close(position, pct: float) -> bool:
+    """Close pct fraction (0–1) of a position by volume. Returns True on success."""
+    vol = round(position.volume * pct, 2)
+    if vol < 0.01:
+        logger.warning("partial_close: rounded volume %.2f too small, skipping", vol)
+        return False
+
+    close_type = mt5.ORDER_TYPE_SELL if position.type == mt5.ORDER_TYPE_BUY else mt5.ORDER_TYPE_BUY
+    tick = get_tick(position.symbol)
+    price = tick.bid if close_type == mt5.ORDER_TYPE_SELL else tick.ask
+
+    info = mt5.symbol_info(position.symbol)
+    type_filling = _best_filling_mode(info) if info else mt5.ORDER_FILLING_IOC
+
+    request = {
+        "action": mt5.TRADE_ACTION_DEAL,
+        "symbol": position.symbol,
+        "volume": vol,
+        "type": close_type,
+        "position": position.ticket,
+        "price": price,
+        "deviation": 20,
+        "magic": _MAGIC,
+        "comment": "partial_close",
+        "type_time": mt5.ORDER_TIME_GTC,
+        "type_filling": type_filling,
+    }
+    result = mt5.order_send(request)
+    if result is None or result.retcode != mt5.TRADE_RETCODE_DONE:
+        code = result.retcode if result else "None"
+        logger.error("partial_close FAILED: ticket=%s pct=%.0f%% retcode=%s",
+                     position.ticket, pct * 100, code)
+        return False
+
+    logger.info("partial_close OK: ticket=%s pct=%.0f%% vol=%.2f",
+                position.ticket, pct * 100, vol)
+    return True
+
+
 def modify_sl_tp(
     symbol: str,
     ticket: int,

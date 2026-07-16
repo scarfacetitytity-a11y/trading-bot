@@ -33,7 +33,7 @@ import time
 import threading
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from enum import Enum
 from typing import Dict, Optional
 
@@ -45,6 +45,8 @@ from config.logging_setup import setup_logger
 from backtests.mt5_connector import connect, disconnect
 from backtests.data_loader import TIMEFRAME_MAP
 from execution import trader, risk
+from execution import news_gate as ng
+from execution.trade_manager import TradeManager, PositionState, ActionType
 from strategies.sniper import SniperStrategy
 from strategies.london_breakout import LondonBreakoutStrategy
 from strategies.fvg_ob import FVGOrderBlockStrategy
@@ -95,6 +97,9 @@ def _build_aiden_strategy(symbol: str) -> AiDENIndexStrategy:
         trail_to_be=symbol in TRAIL_CONFIGS,
         trail_be_r=TRAIL_CONFIGS[symbol].get("trail_be_r", 1.0) if symbol in TRAIL_CONFIGS else 1.0,
         trail_lock_r=TRAIL_CONFIGS[symbol].get("trail_lock_r", 2.0) if symbol in TRAIL_CONFIGS else 2.0,
+        t1_r=TRAIL_CONFIGS[symbol].get("t1_r", 0.0) if symbol in TRAIL_CONFIGS else 0.0,
+        t1_partial_pct=TRAIL_CONFIGS[symbol].get("t1_partial_pct", 0.5) if symbol in TRAIL_CONFIGS else 0.5,
+        time_stop_bars=TRAIL_CONFIGS[symbol].get("time_stop_bars", 0) if symbol in TRAIL_CONFIGS else 0,
     )
     if symbol in OPTIMISED_PARAMS:
         opt  = OPTIMISED_PARAMS[symbol].copy()
@@ -420,11 +425,17 @@ class TradingEngine(Component):
         self._dry_run          = dry_run
         self._journal          = journal
         self._lookback         = trade_cfg.get("lookback_bars", 500)
+        self._news_gate:        Optional[ng.NewsGate] = None
+        self._event_dir_cache: dict[str, int] = {}
+        self._trade_manager:   TradeManager = TradeManager()
         self._last_bar         = None
         self._open_entry_price: Optional[float] = None
-        self._open_sl:          Optional[float] = None   # initial SL at entry — for trail calc
+        self._open_sl:          Optional[float] = None   # initial SL at entry — never moved
         self._open_tp:          Optional[float] = None
         self._open_score:       int = 0
+        self._t1_hit:           bool = False
+        self._bars_since_entry: int  = 0
+        self._block_entry:      bool = False
 
     def _size_order(
         self,
@@ -485,53 +496,297 @@ class TradingEngine(Component):
 
         return sl, tp, lots
 
-    def _manage_trail_stop(self) -> None:
-        """Bar-by-bar SL modification for symbols in TRAIL_CONFIGS (e.g. XAUUSD)."""
-        if self._symbol not in TRAIL_CONFIGS:
+    def _reset_position_state(self) -> None:
+        self._open_entry_price  = None
+        self._open_sl           = None
+        self._open_tp           = None
+        self._open_score        = 0
+        self._t1_hit            = False
+        self._bars_since_entry  = 0
+
+    def _detect_post_event_direction(
+        self, event_time: datetime, window_min: float = 15.0, threshold_pct: float = 0.10
+    ) -> int:
+        """Measure price direction in window_min after an event fires using M1 bars.
+
+        Returns +1 if price moved up by threshold_pct, -1 if down, 0 if unclear or insufficient data.
+        This is instrument-specific — it tells us how THIS symbol reacted to the event,
+        not the theoretical macro mapping. Market price IS the actual.
+        """
+        tf_m1 = TIMEFRAME_MAP.get("M1")
+        if tf_m1 is None:
+            return 0
+        bars = mt5.copy_rates_range(
+            self._symbol, tf_m1,
+            event_time,
+            event_time + timedelta(minutes=window_min),
+        )
+        if bars is None or len(bars) < 3:
+            return 0
+        open_px  = float(bars[0]["open"])
+        close_px = float(bars[-1]["close"])
+        if open_px <= 0:
+            return 0
+        move_pct = (close_px - open_px) / open_px * 100
+        if move_pct > threshold_pct:
+            return 1
+        if move_pct < -threshold_pct:
+            return -1
+        return 0
+
+    def _price_confirmed_event_direction(self, news_ctx) -> int:
+        """Return the price-action-confirmed direction from recent HIGH events.
+
+        Checks fired events that are settled (>=15 min ago, <=2h ago). Results are
+        cached per event so MT5 is only queried once per event per session.
+        """
+        for event in news_ctx.fired_high:
+            mins = event.minutes_since
+            if mins < 15:
+                continue   # market still reacting, wait for settlement
+            cache_key = event.event_time.isoformat()
+            if cache_key not in self._event_dir_cache:
+                self._event_dir_cache[cache_key] = self._detect_post_event_direction(
+                    event.event_time
+                )
+            d = self._event_dir_cache[cache_key]
+            if d != 0:
+                return d
+        return 0
+
+    def _fetch_ltf_bars(self, tf_str: str, count: int) -> Optional[pd.DataFrame]:
+        """Fetch recent LTF bars; returns None on failure."""
+        tf_code = TIMEFRAME_MAP.get(tf_str)
+        if tf_code is None:
+            return None
+        rates = mt5.copy_rates_from_pos(self._symbol, tf_code, 0, count)
+        if rates is None or len(rates) < 10:
+            return None
+        df = pd.DataFrame(rates)
+        df["time"] = pd.to_datetime(df["time"], unit="s", utc=True)
+        return df[["time", "open", "high", "low", "close", "tick_volume"]]
+
+    def _execute_trade_action(self, action, pos, pos_dir: int, equity: float) -> None:
+        """Execute a TradeAction from the TradeManager."""
+        if action.action == ActionType.HOLD:
+            if action.counter_score > 0 or action.cont_score > 0:
+                logger.debug("[%s] TM: %s", self.name, action.reason)
             return
+
+        logger.info("[%s] TM → %s | %s", self.name, action.action.value, action.reason)
+
+        if action.council_notes:
+            for note in action.council_notes:
+                logger.info("[%s] Council: %s", self.name, note)
+
+        if action.action == ActionType.EXIT:
+            if not self._dry_run:
+                tick     = mt5.symbol_info_tick(self._symbol)
+                close_px = tick.bid if pos_dir == 1 else tick.ask
+                trader.close_all(self._symbol)
+                if self._ftmo_tracker is not None:
+                    self._ftmo_tracker.record_trade_day(equity)
+                if self._journal is not None:
+                    self._journal.close_trade(self._symbol, close_px, equity)
+            self._reset_position_state()
+            self._block_entry = True
+
+        elif action.action == ActionType.WAIT:
+            logger.info("[%s] TM WAIT — sweep_risk=%.2f, holding this bar",
+                        self.name, action.sweep_risk)
+
+        elif action.action == ActionType.PARTIAL_CLOSE:
+            if not self._dry_run:
+                trader.partial_close(pos, action.close_pct or 0.30)
+                if action.new_sl is not None:
+                    trader.modify_sl_tp(self._symbol, pos.ticket,
+                                        new_sl=action.new_sl, new_tp=pos.tp)
+
+        elif action.action == ActionType.TIGHTEN_SL:
+            if action.new_sl is not None and not self._dry_run:
+                trader.modify_sl_tp(self._symbol, pos.ticket,
+                                    new_sl=action.new_sl, new_tp=pos.tp)
+
+        elif action.action == ActionType.EXTEND_TP:
+            if action.new_tp is not None and not self._dry_run:
+                new_sl = action.new_sl if action.new_sl is not None else pos.sl
+                trader.modify_sl_tp(self._symbol, pos.ticket,
+                                    new_sl=new_sl, new_tp=action.new_tp)
+                self._open_tp = action.new_tp
+                logger.info("[%s] TP extended -> %.5f | SL tightened -> %.5f",
+                            self.name, action.new_tp, new_sl)
+
+        elif action.action == ActionType.HOLD_RUNNER:
+            if action.new_sl is not None and not self._dry_run:
+                trader.modify_sl_tp(self._symbol, pos.ticket,
+                                    new_sl=action.new_sl, new_tp=pos.tp)
+                logger.info("[%s] HOLD_RUNNER: SL tightened to structure -> %.5f",
+                            self.name, action.new_sl)
+
+    def _manage_open_position(self) -> None:
+        """Bar-by-bar T1 partial, trail stop, and time stop for open positions."""
         positions = trader.get_positions(self._symbol)
         if not positions or self._open_entry_price is None or self._open_sl is None:
             return
 
         pos       = positions[0]
         entry     = self._open_entry_price
-        init_sl   = self._open_sl
-        trail_cfg = TRAIL_CONFIGS[self._symbol]
-        be_r      = trail_cfg.get("trail_be_r", 1.0)
-        lock_r    = trail_cfg.get("trail_lock_r", 2.0)
+        init_sl   = self._open_sl        # never changed — used for all R calculations
         risk_dist = abs(entry - init_sl)
         if risk_dist <= 0:
             return
 
-        tick      = mt5.symbol_info_tick(self._symbol)
+        tick = mt5.symbol_info_tick(self._symbol)
         if tick is None:
             return
-        mid_price = (tick.bid + tick.ask) / 2.0
+        mid_price  = (tick.bid + tick.ask) / 2.0
         current_sl = pos.sl
 
-        if pos.type == mt5.ORDER_TYPE_BUY:
-            if mid_price >= entry + lock_r * risk_dist:
-                new_sl = max(current_sl, entry + risk_dist)
-            elif mid_price >= entry + be_r * risk_dist:
-                new_sl = max(current_sl, entry)
-            else:
-                return
-            if new_sl > current_sl + 1e-8:
-                if not self._dry_run:
-                    trader.modify_sl_tp(self._symbol, pos.ticket, new_sl=new_sl, new_tp=pos.tp)
-                logger.info("[%s] Trail SL: %.5f -> %.5f (long)", self.name, current_sl, new_sl)
+        t1_r   = getattr(self._strategy, "t1_r", 0.0)
+        t1_pct = getattr(self._strategy, "t1_partial_pct", 0.5)
+        ts_bars = getattr(self._strategy, "time_stop_bars", 0)
 
-        elif pos.type == mt5.ORDER_TYPE_SELL:
-            if mid_price <= entry - lock_r * risk_dist:
-                new_sl = min(current_sl, entry - risk_dist)
-            elif mid_price <= entry - be_r * risk_dist:
-                new_sl = min(current_sl, entry)
-            else:
-                return
-            if new_sl < current_sl - 1e-8:
+        # T1 partial close — fires once
+        if t1_r > 0 and not self._t1_hit:
+            t1_price = entry + t1_r * risk_dist if pos.type == mt5.ORDER_TYPE_BUY else entry - t1_r * risk_dist
+            t1_hit   = (pos.type == mt5.ORDER_TYPE_BUY and mid_price >= t1_price) or \
+                       (pos.type == mt5.ORDER_TYPE_SELL and mid_price <= t1_price)
+            if t1_hit:
+                logger.info("[%s] T1 hit @ %.5f — partial close %.0f%%", self.name, mid_price, t1_pct * 100)
                 if not self._dry_run:
-                    trader.modify_sl_tp(self._symbol, pos.ticket, new_sl=new_sl, new_tp=pos.tp)
-                logger.info("[%s] Trail SL: %.5f -> %.5f (short)", self.name, current_sl, new_sl)
+                    trader.partial_close(pos, t1_pct)
+                    trader.modify_sl_tp(self._symbol, pos.ticket, new_sl=entry, new_tp=pos.tp)
+                self._t1_hit = True
+                current_sl   = entry  # reflect BE move for trail logic below
+
+        # Trail stop (symbol must be in TRAIL_CONFIGS)
+        if self._symbol in TRAIL_CONFIGS:
+            trail_cfg = TRAIL_CONFIGS[self._symbol]
+            be_r      = trail_cfg.get("trail_be_r", 1.0)
+            lock_r    = trail_cfg.get("trail_lock_r", 2.0)
+
+            if pos.type == mt5.ORDER_TYPE_BUY:
+                if mid_price >= entry + lock_r * risk_dist:
+                    new_sl = max(current_sl, entry + risk_dist)
+                elif mid_price >= entry + be_r * risk_dist and not self._t1_hit:
+                    new_sl = max(current_sl, entry)
+                else:
+                    new_sl = current_sl
+                if new_sl > current_sl + 1e-8:
+                    if not self._dry_run:
+                        trader.modify_sl_tp(self._symbol, pos.ticket, new_sl=new_sl, new_tp=pos.tp)
+                    logger.info("[%s] Trail SL: %.5f -> %.5f (long)", self.name, current_sl, new_sl)
+
+            elif pos.type == mt5.ORDER_TYPE_SELL:
+                if mid_price <= entry - lock_r * risk_dist:
+                    new_sl = min(current_sl, entry - risk_dist)
+                elif mid_price <= entry - be_r * risk_dist and not self._t1_hit:
+                    new_sl = min(current_sl, entry)
+                else:
+                    new_sl = current_sl
+                if new_sl < current_sl - 1e-8:
+                    if not self._dry_run:
+                        trader.modify_sl_tp(self._symbol, pos.ticket, new_sl=new_sl, new_tp=pos.tp)
+                    logger.info("[%s] Trail SL: %.5f -> %.5f (short)", self.name, current_sl, new_sl)
+
+        # Time stop — close if no exit after N bars
+        if ts_bars > 0:
+            self._bars_since_entry += 1
+            if self._bars_since_entry >= ts_bars:
+                logger.warning("[%s] Time stop: %d bars elapsed — closing", self.name, ts_bars)
+                if not self._dry_run:
+                    trader.close_all(self._symbol)
+                self._reset_position_state()
+                self._block_entry = True   # skip new entry on this bar
+                return
+
+        # Post-event invalidation: if price confirms opposing direction after HIGH news, close
+        if self._news_gate is not None:
+            news_ctx = self._news_gate.get_context()
+            upcoming = news_ctx.upcoming_summary()
+            if upcoming:
+                logger.info("[%s] Upcoming news: %s", self.name, upcoming)
+            confirmed_dir = self._price_confirmed_event_direction(news_ctx)
+            if confirmed_dir != 0:
+                pos_dir = 1 if pos.type == mt5.ORDER_TYPE_BUY else -1
+                event_names = [e.name for e in news_ctx.fired_high]
+                if confirmed_dir == -pos_dir:
+                    logger.warning(
+                        "[%s] Post-event price invalidates %s (market moved %+d after news) | %s",
+                        self.name, "LONG" if pos_dir == 1 else "SHORT",
+                        confirmed_dir, event_names,
+                    )
+                    if not self._dry_run:
+                        account  = trader.get_account()
+                        equity   = account.get("equity", account.get("balance", 0))
+                        tick     = mt5.symbol_info_tick(self._symbol)
+                        close_px = tick.bid if pos_dir == 1 else tick.ask
+                        trader.close_all(self._symbol)
+                        if self._ftmo_tracker is not None:
+                            self._ftmo_tracker.record_trade_day(equity)
+                        if self._journal is not None:
+                            self._journal.close_trade(self._symbol, close_px, equity)
+                    self._reset_position_state()
+                    self._block_entry = True
+                else:
+                    logger.info(
+                        "[%s] Post-event price confirms position direction (%+d) | %s",
+                        self.name, confirmed_dir, event_names,
+                    )
+
+        # If already exited by news invalidation, don't also run TradeManager
+        if self._block_entry:
+            return
+
+        # ── TradeManager: adaptive multi-timeframe decisions ──────────────────
+        # Refresh positions (may have changed after partial close / news close)
+        positions = trader.get_positions(self._symbol)
+        if not positions:
+            return
+
+        pos           = positions[0]
+        df_m15_struct = self._fetch_ltf_bars(self._tf_str, count=80)
+        if df_m15_struct is None:
+            return
+        df_m5 = self._fetch_ltf_bars("M5", count=60)
+        df_m1 = self._fetch_ltf_bars("M1", count=30)
+
+        h4_bias = (
+            self._strategy.current_h4_bias(df_m15_struct)
+            if hasattr(self._strategy, "current_h4_bias")
+            else getattr(self._strategy, "_last_h4_bias", 0)
+        )
+
+        news_dir = 0
+        if self._news_gate is not None:
+            news_dir = self._price_confirmed_event_direction(
+                self._news_gate.get_context()
+            )
+
+        tm_pos_dir = 1 if pos.type == mt5.ORDER_TYPE_BUY else -1
+        pos_state = PositionState(
+            direction     = tm_pos_dir,
+            entry_price   = self._open_entry_price,
+            initial_sl    = self._open_sl,
+            current_sl    = pos.sl,
+            current_tp    = pos.tp,
+            current_price = mid_price,
+            bars_elapsed  = self._bars_since_entry,
+            t1_hit        = self._t1_hit,
+            h4_bias       = h4_bias,
+        )
+
+        action = self._trade_manager.evaluate(
+            position           = pos_state,
+            df_m15             = df_m15_struct,
+            df_m5              = df_m5,
+            df_m1              = df_m1,
+            news_confirmed_dir = news_dir,
+        )
+
+        account = trader.get_account()
+        equity  = account.get("equity", account.get("balance", 0))
+        self._execute_trade_action(action, pos, tm_pos_dir, equity)
 
     def run(self) -> None:
         tf_secs      = _TF_SECONDS.get(self._tf_str, 3600)
@@ -578,8 +833,12 @@ class TradingEngine(Component):
                 logger.info("[%s] bar=%s signal=%+d pos=%+d",
                             self.name, bar_dt.strftime("%Y-%m-%d %H:%M UTC"), desired, current)
 
-                # Trail stop management — runs on every new bar regardless of signal
-                self._manage_trail_stop()
+                # Position management — T1 partial, trail, time stop
+                self._block_entry = False
+                self._manage_open_position()
+
+                if self._block_entry:
+                    continue
 
                 if desired == current:
                     continue
@@ -603,10 +862,7 @@ class TradingEngine(Component):
                                 self._ftmo_tracker.record_trade_day(equity)
                             if self._journal is not None:
                                 self._journal.close_trade(self._symbol, close_px, equity)
-                            self._open_entry_price = None
-                            self._open_sl          = None
-                            self._open_tp          = None
-                            self._open_score        = 0
+                            self._reset_position_state()
 
                 # Open new position — gate through soft halt, RiskAgent, FTMOTracker
                 if desired != 0:
@@ -633,6 +889,25 @@ class TradingEngine(Component):
                     # Score-based sizing: psychology_mult * score_mult * concentration_mult
                     _sc          = getattr(self._strategy, "_scores", None)
                     signal_score = int(_sc.iloc[-1]) if _sc is not None else 0
+
+                    # News gate: price-confirmed direction preferred; consensus as fallback
+                    # Amplifier only — never penalises
+                    if self._news_gate is not None:
+                        news_ctx      = self._news_gate.get_context()
+                        confirmed_dir = self._price_confirmed_event_direction(news_ctx)
+                        if confirmed_dir != 0:
+                            if confirmed_dir == desired:
+                                logger.info("[%s] Post-event price confirms signal: score +1 | events=%s",
+                                            self.name, [e.name for e in news_ctx.fired_high])
+                                signal_score += 1
+                        else:
+                            news_mod = news_ctx.score_modifier(self._symbol, desired)
+                            if news_mod > 0:
+                                logger.info("[%s] Macro consensus amplifies signal: +%d | %s",
+                                            self.name, news_mod,
+                                            news_ctx.fired_summary(self._symbol))
+                                signal_score += news_mod
+
                     score_mult   = _size_mult_from_score(signal_score) if signal_score > 0 else 1.0
                     # Concentration mult: fewer concurrent positions = more size per trade
                     # 0-1 open → 2x  |  2-3 open → 1.5x  |  4+ open → 1x
@@ -641,6 +916,29 @@ class TradingEngine(Component):
                     combined_mult = size_mult * score_mult * concentration_mult
                     sl, tp, lots = self._size_order(desired, account["balance"], combined_mult)
                     direction_str = "BUY" if desired == 1 else "SELL"
+
+                    # ── Council gate: Telegram approval before order fires ──
+                    require_approval = self._trade_cfg.get("require_approval", False)
+                    if require_approval and not self._dry_run:
+                        tick_now  = mt5.symbol_info_tick(self._symbol)
+                        entry_est = tick_now.ask if desired == 1 else tick_now.bid
+                        approved  = tg.request_approval(
+                            symbol        = self._symbol,
+                            direction     = desired,
+                            score         = signal_score,
+                            entry         = entry_est,
+                            sl            = sl or 0.0,
+                            tp            = tp,
+                            lots          = lots,
+                            equity        = equity,
+                            council_notes = reason,
+                            timeout_sec   = self._trade_cfg.get("approval_timeout_sec", 90),
+                            auto_approve_score = self._trade_cfg.get("auto_approve_score", 6),
+                        )
+                        if not approved:
+                            logger.info("[%s] Trade vetoed via Telegram", self.name)
+                            continue
+
                     if self._dry_run:
                         logger.info("[%s] DRY RUN: %s %.2f lots SL=%s TP=%s | score=%d x%.2f | %s",
                                     self.name, direction_str, lots, sl, tp,
@@ -649,10 +947,12 @@ class TradingEngine(Component):
                         ok = trader.place_order(self._symbol, desired, lots, sl=sl, tp=tp)
                         if ok:
                             tick = mt5.symbol_info_tick(self._symbol)
-                            self._open_entry_price = tick.ask if desired == 1 else tick.bid
-                            self._open_sl   = sl
-                            self._open_tp   = tp
-                            self._open_score = signal_score
+                            self._open_entry_price  = tick.ask if desired == 1 else tick.bid
+                            self._open_sl           = sl
+                            self._open_tp           = tp
+                            self._open_score        = signal_score
+                            self._t1_hit            = False
+                            self._bars_since_entry  = 0
                             if self._journal is not None:
                                 import numpy as np
                                 _atr_series = getattr(self._strategy, "_atr_cache", None)
@@ -734,6 +1034,9 @@ class Orchestrator:
             tg.notify_council_flag("01 Principal", "MT5 connection FAILED on startup. Bot aborted.")
             sys.exit(1)
 
+        self._news_gate = ng.NewsGate()
+        self._news_gate.start()
+
         # Log FTMO challenge status before anything trades
         try:
             account = mt5.account_info()
@@ -757,7 +1060,7 @@ class Orchestrator:
         ]
 
         for symbol in self._symbols:
-            components.append(TradingEngine(
+            engine = TradingEngine(
                 self.registry,
                 self.kill_switch,
                 symbol,
@@ -769,7 +1072,9 @@ class Orchestrator:
                 soft_halt_event=self.soft_halt,
                 dry_run=self.dry_run,
                 journal=self._journal,
-            ))
+            )
+            engine._news_gate = self._news_gate
+            components.append(engine)
 
         self._components = components
 
@@ -877,6 +1182,8 @@ class Orchestrator:
             comp.stop()
         for t in self._threads:
             t.join(timeout=15)
+        if hasattr(self, "_news_gate"):
+            self._news_gate.stop()
         disconnect()
         self._journal.push_to_github()
         account = mt5.account_info()

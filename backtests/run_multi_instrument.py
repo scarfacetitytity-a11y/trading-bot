@@ -64,10 +64,10 @@ INSTRUMENTS = {
     "XAGUSD":      dict(session_start=7,  session_end=21),   # silver: London + NY
 }
 
-# Instruments that trade BOTH long and short (bidirectional H4 bias gate).
-# US indices have a structural upward bias — shorts drag performance.
-# Metals can trend sharply in either direction — bidirectional edge confirmed.
-BIDIRECTIONAL = {"XAUUSD", "XAGUSD"}
+# All instruments are bidirectional — AiDEN trades both long and short based on
+# market structure (H4 bias + M15 confluence). Win rate maintained because the
+# confluence gate quality applies identically in either direction.
+BIDIRECTIONAL = set(INSTRUMENTS.keys())
 
 # M15 params — NOTE: htf_lookback and h4_swing_lookback are in H4 BARS (post-resample)
 # so they stay the same as H1. Only input-TF bar counts scale ×4.
@@ -110,10 +110,22 @@ def _size_mult_from_score(score: int) -> float:
 
 
 # ── Per-instrument trailing stop config ──────────────────────────────────────────
-# XAUUSD only — gold trends cleanly, trailing stop captured +55pp more return in A/B test.
-# All other instruments: trail_to_be=False (run to full SL/TP — guards against whipsaw re-entry).
+# Adaptive trail: SL moves to BE at trail_be_r, locks to +1R profit at trail_lock_r.
+# Volatile trend instruments (metals, JP225) use tighter be_r for faster protection.
+# Indices use slightly wider be_r (more chop before they commit to a move).
 TRAIL_CONFIGS: dict[str, dict] = {
-    "XAUUSD": dict(trail_to_be=True, trail_be_r=1.0, trail_lock_r=2.0),
+    # Gold: confirmed +55pp A/B improvement — tight trail (be_r=1.0)
+    "XAUUSD":      dict(trail_to_be=True, trail_be_r=1.0, trail_lock_r=2.0),
+    # Silver: choppy — wider trail needed to avoid whipsaw re-entry (no trail until validated)
+    # "XAGUSD":    dict(trail_to_be=True, trail_be_r=2.0, trail_lock_r=3.5),
+    # JP225: trends cleanly in Asian session — same as gold
+    "JP225.cash":  dict(trail_to_be=True, trail_be_r=1.0, trail_lock_r=2.0),
+    # Indices: long-only, trend strongly — slightly wider be_r avoids choppy early exit
+    "UK100.cash":  dict(trail_to_be=True, trail_be_r=1.2, trail_lock_r=2.5),
+    "US100.cash":  dict(trail_to_be=True, trail_be_r=1.2, trail_lock_r=2.5),
+    "US30.cash":   dict(trail_to_be=True, trail_be_r=1.2, trail_lock_r=2.5),
+    "US500.cash":  dict(trail_to_be=True, trail_be_r=1.2, trail_lock_r=2.5),
+    "US2000.cash": dict(trail_to_be=True, trail_be_r=1.2, trail_lock_r=2.5),
 }
 
 # ── Per-instrument sweep-optimised params (populated after sweep_m15_instruments) ─
@@ -124,7 +136,8 @@ TRAIL_CONFIGS: dict[str, dict] = {
 # Per-instrument configs from sweep_m15_instruments.py (2026-07-13)
 OPTIMISED_PARAMS: dict[str, dict] = {
     # Sweep best — all EMA bias, M15
-    "US2000.cash": dict(min_score=5, rr_target=3.5, min_fvg_atr=0.10,
+    # score=6 cap until M5 data is pulled — MaxDD was -20% at score=5 without M5 TM exits
+    "US2000.cash": dict(min_score=6, rr_target=3.5, min_fvg_atr=0.10,
                         atr_stop_buffer=0.3, h4_bias_method="ema",
                         session_start=12, session_end=21),
     "UK100.cash":  dict(min_score=4, rr_target=3.0, min_fvg_atr=0.15,
@@ -201,6 +214,9 @@ def _generate_returns(
         trail_to_be=False,
         trail_be_r=1.0,
         trail_lock_r=2.0,
+        t1_r=0.0,
+        t1_partial_pct=0.5,
+        time_stop_bars=0,
         use_prime_bonus=use_prime_bonus,
         use_vol_spike=False,
         vol_spike_mult=1.5,

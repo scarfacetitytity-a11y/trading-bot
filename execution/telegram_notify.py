@@ -11,6 +11,7 @@ import io
 import json
 import logging
 import os
+import time
 import urllib.request
 import urllib.parse
 from datetime import datetime, timezone
@@ -276,3 +277,159 @@ def notify_council_flag(member: str, message: str) -> None:
         f"⚠️ <b>Council #{member}</b>\n\n"
         f"{message}"
     )
+
+
+# ── Telegram approval flow ────────────────────────────────────────────────────
+# Sends a trade proposal with APPROVE / VETO inline buttons.
+# Polls getUpdates for up to timeout_sec. Auto-decides on timeout based on score.
+
+_last_update_id: int = 0
+
+
+def _send_with_keyboard(html: str, reply_markup: str) -> Optional[int]:
+    """Send message with inline keyboard. Returns message_id or None."""
+    if not _TOKEN or not _CHAT_ID:
+        return None
+    try:
+        url     = f"https://api.telegram.org/bot{_TOKEN}/sendMessage"
+        payload = json.dumps({
+            "chat_id":      _CHAT_ID,
+            "text":         html,
+            "parse_mode":   "HTML",
+            "reply_markup": json.loads(reply_markup),
+            "disable_web_page_preview": True,
+        }).encode()
+        req  = urllib.request.Request(url, data=payload,
+                                      headers={"Content-Type": "application/json"})
+        resp = urllib.request.urlopen(req, timeout=8)
+        data = json.loads(resp.read())
+        return data["result"]["message_id"] if data.get("ok") else None
+    except Exception as exc:
+        logger.warning("[Telegram] send_with_keyboard failed: %s", exc)
+        return None
+
+
+def _get_updates(offset: int, timeout: int = 5) -> list:
+    if not _TOKEN:
+        return []
+    try:
+        url  = (f"https://api.telegram.org/bot{_TOKEN}/getUpdates"
+                f"?offset={offset}&timeout={max(1, timeout)}&allowed_updates=callback_query")
+        req  = urllib.request.Request(url)
+        resp = urllib.request.urlopen(req, timeout=timeout + 3)
+        data = json.loads(resp.read())
+        return data.get("result", []) if data.get("ok") else []
+    except Exception:
+        return []
+
+
+def _answer_callback(callback_id: str) -> None:
+    if not _TOKEN:
+        return
+    try:
+        url     = f"https://api.telegram.org/bot{_TOKEN}/answerCallbackQuery"
+        payload = json.dumps({"callback_query_id": callback_id}).encode()
+        req     = urllib.request.Request(url, data=payload,
+                                         headers={"Content-Type": "application/json"})
+        urllib.request.urlopen(req, timeout=5)
+    except Exception:
+        pass
+
+
+def _edit_message(msg_id: int, html: str) -> None:
+    if not _TOKEN or not _CHAT_ID or not msg_id:
+        return
+    try:
+        url     = f"https://api.telegram.org/bot{_TOKEN}/editMessageText"
+        payload = json.dumps({
+            "chat_id":    _CHAT_ID,
+            "message_id": msg_id,
+            "text":       html,
+            "parse_mode": "HTML",
+            "disable_web_page_preview": True,
+        }).encode()
+        req = urllib.request.Request(url, data=payload,
+                                     headers={"Content-Type": "application/json"})
+        urllib.request.urlopen(req, timeout=8)
+    except Exception:
+        pass
+
+
+def request_approval(
+    symbol: str,
+    direction: int,
+    score: int,
+    entry: float,
+    sl: float,
+    tp: Optional[float],
+    lots: float,
+    equity: float,
+    council_notes: str = "",
+    timeout_sec: int   = 90,
+    auto_approve_score: int = 6,
+) -> bool:
+    """Send trade proposal with APPROVE/VETO buttons. Returns True = go ahead.
+
+    If no Telegram configured, always returns True (non-blocking).
+    On timeout: auto-approves if score >= auto_approve_score, else auto-vetoes.
+    """
+    global _last_update_id
+
+    if not _TOKEN or not _CHAT_ID:
+        return True
+
+    dir_str  = "LONG 📈" if direction == 1 else "SHORT 📉"
+    dir_icon = "🟢" if direction == 1 else "🔴"
+    rr_str   = ""
+    if tp and sl:
+        dist_sl = abs(entry - sl)
+        dist_tp = abs(tp - entry)
+        rr_str  = f"1:{dist_tp/dist_sl:.1f}" if dist_sl > 0 else "—"
+
+    auto_action = "AUTO-APPROVE" if score >= auto_approve_score else "AUTO-VETO"
+    base_text = (
+        f"{dir_icon} <b>TRADE SIGNAL — {symbol}</b>\n\n"
+        f"<b>Direction:</b>  {dir_str}\n"
+        f"<b>Entry:</b>     <code>{entry:.5g}</code>\n"
+        f"<b>SL:</b>        <code>{sl:.5g}</code>\n"
+        f"<b>TP:</b>        <code>{f'{tp:.5g}' if tp else '—'}</code>\n"
+        f"<b>RR:</b>        {rr_str}\n"
+        f"<b>Lots:</b>      {lots:.2f}  |  <b>Equity:</b> ${equity:,.0f}\n\n"
+        f"📊 <b>Score:</b> {score}/10  <code>{_score_bar(score)}</code>  {_score_label(score)}\n"
+    )
+    if council_notes:
+        base_text += f"\n🏛 <b>Council:</b> {council_notes}\n"
+    base_text += f"\n⏳ <i>{auto_action} in {timeout_sec}s if no response</i>"
+
+    approval_id  = f"{symbol.replace('.','_')}_{int(time.time())}"
+    reply_markup = json.dumps({"inline_keyboard": [[
+        {"text": "✅  APPROVE", "callback_data": f"approve_{approval_id}"},
+        {"text": "❌  VETO",    "callback_data": f"veto_{approval_id}"},
+    ]]})
+
+    msg_id = _send_with_keyboard(base_text, reply_markup)
+
+    deadline = time.time() + timeout_sec
+    while time.time() < deadline:
+        poll_timeout = min(5, max(1, int(deadline - time.time())))
+        updates = _get_updates(_last_update_id + 1, timeout=poll_timeout)
+
+        for update in updates:
+            uid = update.get("update_id", 0)
+            if uid > _last_update_id:
+                _last_update_id = uid
+
+            cb = update.get("callback_query")
+            if cb and approval_id in cb.get("data", ""):
+                _answer_callback(cb["id"])
+                approved   = cb["data"].startswith("approve_")
+                result_str = "✅ APPROVED" if approved else "❌ VETOED"
+                _edit_message(msg_id, base_text + f"\n\n<b>{result_str}</b>")
+                logger.info("[Telegram] Trade %s %s by user", symbol, result_str)
+                return approved
+
+    auto  = score >= auto_approve_score
+    label = "✅ AUTO-APPROVED (timeout)" if auto else "❌ AUTO-VETOED (timeout)"
+    _edit_message(msg_id, base_text + f"\n\n<b>{label}</b>")
+    logger.info("[Telegram] Trade %s %s", symbol, label)
+    return auto

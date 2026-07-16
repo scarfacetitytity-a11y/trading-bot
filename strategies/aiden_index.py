@@ -205,6 +205,12 @@ class AiDENIndexStrategy(Strategy):
         trail_to_be: bool        = False,
         trail_be_r: float        = 1.0,   # R-multiple at which SL moves to entry (BE)
         trail_lock_r: float      = 2.0,   # R-multiple at which SL trails to +1R locked
+        # T1 partial close — close t1_partial_pct of position at t1_r, then move SL to BE
+        # Default disabled (t1_r=0.0). trail_to_be lock still fires at trail_lock_r.
+        t1_r: float              = 0.0,   # R at which T1 fires; 0 = disabled
+        t1_partial_pct: float    = 0.5,   # fraction to exit at T1 (0.5 = 50%)
+        # Time stop — exit if no TP progress after N bars; 0 = disabled
+        time_stop_bars: int      = 0,
     ):
         self.min_score            = min_score
         self.htf_lookback         = htf_lookback
@@ -243,6 +249,10 @@ class AiDENIndexStrategy(Strategy):
         self.trail_to_be          = trail_to_be
         self.trail_be_r           = trail_be_r
         self.trail_lock_r         = trail_lock_r
+        self.t1_r                 = t1_r
+        self.t1_partial_pct       = t1_partial_pct
+        self.time_stop_bars       = time_stop_bars
+        self._last_h4_bias:       int = 0   # updated on each generate_signals call
 
     @property
     def name(self) -> str:
@@ -254,6 +264,19 @@ class AiDENIndexStrategy(Strategy):
             f",rr={self.rr_target}+dyn"
             f",sess={self.session_start}-{self.session_end})"
         )
+
+    def current_h4_bias(self, df: pd.DataFrame) -> int:
+        """Return the current H4 bias (+1/-1/0) from the latest bars.
+        Lightweight — just resamples and reads last value. No full loop."""
+        h4 = _resample_h4(df)
+        if len(h4) < 5:
+            return 0
+        fast_n = max(self.htf_lookback // 2, 5)
+        if self.h4_bias_method == "ema":
+            h4_bias, _ = _compute_h4_bias_ema(h4, fast_n, self.htf_lookback)
+        else:
+            h4_bias, _ = _compute_h4_bias_swing(h4, self.h4_swing_lookback)
+        return int(h4_bias.iloc[-1])
 
     def _dynamic_rr(self, is_model3: bool, trend_strength: float) -> float:
         rr = self.rr_target
@@ -317,14 +340,18 @@ class AiDENIndexStrategy(Strategy):
             w = h4.iloc[idx - self.h4_swing_lookback:idx]
             return float(w["high"].max()), float(w["low"].min())
 
-        signals      = pd.Series(0, index=df.index)
+        signals      = pd.Series(0.0, index=df.index)
         self._stops  = pd.Series(float("nan"), index=df.index)
         self._scores = pd.Series(0, index=df.index)
 
-        position    = 0
-        stop_loss   = None
-        take_profit = None
-        entry_price = None
+        position         = 0
+        position_size    = 0.0
+        stop_loss        = None
+        initial_sl       = None   # SL at entry — never modified; used for R calculations
+        take_profit      = None
+        entry_price      = None
+        t1_hit           = False
+        bars_since_entry = 0
         active_fvgs: list[dict] = []
 
         warmup = max(self.atr_period + 3, self.ob_lookback, self.liq_lookback,
@@ -339,43 +366,75 @@ class AiDENIndexStrategy(Strategy):
             hour     = int(hours.iloc[i])
 
             if np.isnan(atr_val):
-                signals.iloc[i]     = position
+                signals.iloc[i]     = position * position_size
                 self._stops.iloc[i] = stop_loss if stop_loss is not None else float("nan")
                 continue
 
             # ── 1. Manage open position ───────────────────────────────────
             if position == 1:
-                # Trailing stop — advance SL toward entry / into profit
-                if self.trail_to_be and stop_loss is not None and entry_price is not None:
-                    risk_dist = entry_price - stop_loss
-                    if risk_dist > 0:
-                        if cv >= entry_price + self.trail_lock_r * risk_dist:
-                            # Price reached +trail_lock_r — lock in +1R profit
-                            locked_sl = entry_price + risk_dist
-                            stop_loss = max(stop_loss, locked_sl)
-                        elif cv >= entry_price + self.trail_be_r * risk_dist:
-                            # Price reached +trail_be_r — move SL to breakeven
+                bars_since_entry += 1
+
+                # Trail — reference initial_sl so trail survives T1 BE move
+                if self.trail_to_be and initial_sl is not None and entry_price is not None:
+                    init_risk = entry_price - initial_sl
+                    if init_risk > 0:
+                        if cv >= entry_price + self.trail_lock_r * init_risk:
+                            stop_loss = max(stop_loss, entry_price + init_risk)
+                        elif cv >= entry_price + self.trail_be_r * init_risk and not t1_hit:
                             stop_loss = max(stop_loss, entry_price)
 
-                if stop_loss is not None and lv <= stop_loss:
-                    position = 0; stop_loss = take_profit = entry_price = None
+                # T1 partial — fires once at t1_r; moves SL to BE for runner
+                if self.t1_r > 0 and not t1_hit and initial_sl is not None:
+                    init_risk = entry_price - initial_sl
+                    if init_risk > 0 and cv >= entry_price + self.t1_r * init_risk:
+                        t1_hit = True
+                        position_size = 1.0 - self.t1_partial_pct
+                        stop_loss = entry_price
+
+                # Time stop — exit if no progress after N bars
+                if self.time_stop_bars > 0 and bars_since_entry >= self.time_stop_bars:
+                    position = 0; position_size = 0.0; t1_hit = False
+                    stop_loss = take_profit = entry_price = initial_sl = None
+                    bars_since_entry = 0
+                elif stop_loss is not None and lv <= stop_loss:
+                    position = 0; position_size = 0.0; t1_hit = False
+                    stop_loss = take_profit = entry_price = initial_sl = None
+                    bars_since_entry = 0
                 elif take_profit is not None and hv >= take_profit:
-                    position = 0; stop_loss = take_profit = entry_price = None
+                    position = 0; position_size = 0.0; t1_hit = False
+                    stop_loss = take_profit = entry_price = initial_sl = None
+                    bars_since_entry = 0
 
             elif position == -1:
-                if self.trail_to_be and stop_loss is not None and entry_price is not None:
-                    risk_dist = stop_loss - entry_price
-                    if risk_dist > 0:
-                        if cv <= entry_price - self.trail_lock_r * risk_dist:
-                            locked_sl = entry_price - risk_dist
-                            stop_loss = min(stop_loss, locked_sl)
-                        elif cv <= entry_price - self.trail_be_r * risk_dist:
+                bars_since_entry += 1
+
+                if self.trail_to_be and initial_sl is not None and entry_price is not None:
+                    init_risk = initial_sl - entry_price
+                    if init_risk > 0:
+                        if cv <= entry_price - self.trail_lock_r * init_risk:
+                            stop_loss = min(stop_loss, entry_price - init_risk)
+                        elif cv <= entry_price - self.trail_be_r * init_risk and not t1_hit:
                             stop_loss = min(stop_loss, entry_price)
 
-                if stop_loss is not None and hv >= stop_loss:
-                    position = 0; stop_loss = take_profit = entry_price = None
+                if self.t1_r > 0 and not t1_hit and initial_sl is not None:
+                    init_risk = initial_sl - entry_price
+                    if init_risk > 0 and cv <= entry_price - self.t1_r * init_risk:
+                        t1_hit = True
+                        position_size = 1.0 - self.t1_partial_pct
+                        stop_loss = entry_price
+
+                if self.time_stop_bars > 0 and bars_since_entry >= self.time_stop_bars:
+                    position = 0; position_size = 0.0; t1_hit = False
+                    stop_loss = take_profit = entry_price = initial_sl = None
+                    bars_since_entry = 0
+                elif stop_loss is not None and hv >= stop_loss:
+                    position = 0; position_size = 0.0; t1_hit = False
+                    stop_loss = take_profit = entry_price = initial_sl = None
+                    bars_since_entry = 0
                 elif take_profit is not None and lv <= take_profit:
-                    position = 0; stop_loss = take_profit = entry_price = None
+                    position = 0; position_size = 0.0; t1_hit = False
+                    stop_loss = take_profit = entry_price = initial_sl = None
+                    bars_since_entry = 0
 
             if position == 0 and i >= warmup + 2:
                 htf_bias, trend_strength = _h4_at(bar_time)
@@ -388,7 +447,7 @@ class AiDENIndexStrategy(Strategy):
                 # Remove invalidated FVGs
                 if htf_bias == 0:
                     self._expire_fvgs_neutral(active_fvgs, cv)
-                    signals.iloc[i]     = position
+                    signals.iloc[i]     = position * position_size
                     self._stops.iloc[i] = float("nan")
                     continue
 
@@ -451,6 +510,7 @@ class AiDENIndexStrategy(Strategy):
                                 "model3":   is_model3,
                                 "trend_s":  trend_strength,
                             })
+
 
                 # SHORT setup — bearish FVG
                 if htf_bias == -1 and not self.long_only:
@@ -536,11 +596,15 @@ class AiDENIndexStrategy(Strategy):
                                 sl   = stop_anchor - self.atr_stop_buffer * atr_val
                                 dist = cv - sl
                                 if dist > 0:
-                                    rr          = self._dynamic_rr(fvg["model3"], fvg["trend_s"])
-                                    position    = 1
-                                    stop_loss   = sl
-                                    take_profit = cv + rr * dist
-                                    entry_price = cv
+                                    rr               = self._dynamic_rr(fvg["model3"], fvg["trend_s"])
+                                    position         = 1
+                                    position_size    = 1.0
+                                    stop_loss        = sl
+                                    initial_sl       = sl
+                                    take_profit      = cv + rr * dist
+                                    entry_price      = cv
+                                    t1_hit           = False
+                                    bars_since_entry = 0
                                     self._scores.iloc[i] = fvg["score"]
                                 to_remove.append(fvg)
 
@@ -558,11 +622,15 @@ class AiDENIndexStrategy(Strategy):
                                 sl   = stop_anchor + self.atr_stop_buffer * atr_val
                                 dist = sl - cv
                                 if dist > 0:
-                                    rr          = self._dynamic_rr(fvg["model3"], fvg["trend_s"])
-                                    position    = -1
-                                    stop_loss   = sl
-                                    take_profit = cv - rr * dist
-                                    entry_price = cv
+                                    rr               = self._dynamic_rr(fvg["model3"], fvg["trend_s"])
+                                    position         = -1
+                                    position_size    = 1.0
+                                    stop_loss        = sl
+                                    initial_sl       = sl
+                                    take_profit      = cv - rr * dist
+                                    entry_price      = cv
+                                    t1_hit           = False
+                                    bars_since_entry = 0
                                     self._scores.iloc[i] = fvg["score"]
                                 to_remove.append(fvg)
 
@@ -570,9 +638,8 @@ class AiDENIndexStrategy(Strategy):
                     if fvg in active_fvgs:
                         active_fvgs.remove(fvg)
 
-            signals.iloc[i]     = position
+            signals.iloc[i]     = position * position_size
             self._stops.iloc[i] = stop_loss if stop_loss is not None else float("nan")
-            # Carry entry score forward while in a position so orchestrator reads it correctly
             if position != 0 and i > 0 and self._scores.iloc[i] == 0:
                 self._scores.iloc[i] = self._scores.iloc[i - 1]
 
