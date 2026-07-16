@@ -530,25 +530,12 @@ class TradingEngine(Component):
             # Compute entry from live tick
             tick = mt5.symbol_info_tick(self._symbol)
             entry = tick.ask if direction == 1 else tick.bid
-            dist = abs(entry - sl)
-
-            # Size lots so that SL hit = risk_pct of balance
-            risk_pct = float(self._trade_cfg.get("risk_pct", 1.0)) / 100
             info = mt5.symbol_info(self._symbol)
-            if info and info.trade_tick_size > 0 and dist > 0:
-                point_value_per_lot = (
-                    info.trade_tick_value / info.trade_tick_size * info.point
-                )
-                sl_points = dist / info.point
-                sl_value_per_lot = sl_points * point_value_per_lot
-                raw_lots = (balance * risk_pct) / sl_value_per_lot if sl_value_per_lot > 0 else 0.01
-            else:
-                raw_lots = float(self._trade_cfg.get("lot_size", 0.01))
 
-            # ── Liquidity-based target (replaces blind rr_target * dist) ──
-            # Every trade is liquidity-based: the TP is a real draw price is pulled
-            # toward, not arithmetic off the stop. Grade C (no clean draw in reach)
-            # -> min size, so a no-target trade is shrunk to nothing not placed full.
+            # ── Structural stop + liquidity target (replaces ATR stop & arithmetic TP) ──
+            # Every trade gets its own stop AND target from real structure — swing
+            # levels, sweep wicks, liquidity pools — not an ATR distance and not
+            # entry +/- rr*stop. The strategy's ATR stop is only a fallback reference.
             rr_fb   = getattr(self._strategy, "rr_target", 2.0)
             atr_ser = getattr(self._strategy, "_atr_cache", None)
             atr_val = 0.0
@@ -564,12 +551,27 @@ class TradingEngine(Component):
                 df_m15=df_m15_a, df_m5=df_m5_a, direction=direction,
                 entry=entry, stop=sl, atr=atr_val, h4_bias=h4b, rr_fallback=rr_fb,
             )
+            sl = plan.stop          # structural stop replaces the ATR stop
             tp = plan.tp
-            raw_lots *= plan.size_mult
             self._last_plan = plan
-            logger.info("[%s] PLAN grade=%s type=%s size=%.2fx RR=%.2f | %s",
+            logger.info("[%s] PLAN grade=%s type=%s size=%.2fx RR=%.2f stop@%s | %s",
                         self.name, plan.grade, plan.trade_type, plan.size_mult,
-                        plan.rr, plan.thesis)
+                        plan.rr, plan.stop_src, plan.thesis)
+
+            # Size lots so that the STRUCTURAL SL hit = risk_pct of balance
+            dist = abs(entry - sl)
+            risk_pct = float(self._trade_cfg.get("risk_pct", 1.0)) / 100
+            if info and info.trade_tick_size > 0 and dist > 0:
+                point_value_per_lot = (
+                    info.trade_tick_value / info.trade_tick_size * info.point
+                )
+                sl_points = dist / info.point
+                sl_value_per_lot = sl_points * point_value_per_lot
+                raw_lots = (balance * risk_pct) / sl_value_per_lot if sl_value_per_lot > 0 else 0.01
+            else:
+                raw_lots = float(self._trade_cfg.get("lot_size", 0.01))
+            raw_lots *= plan.size_mult
+
             if info:
                 tp = round(tp, info.digits)
                 sl = round(sl, info.digits)

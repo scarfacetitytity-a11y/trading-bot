@@ -41,15 +41,22 @@ SWING_ORDER        = 3
 LOOKBACK_BARS      = 60
 
 
+MAX_STOP_ATR       = 6.0    # a structural stop beyond this is too wide — invalid setup
+MIN_STOP_ATR       = 0.5    # a structural stop nearer than this sits inside the noise
+STOP_BUFFER_ATR    = 0.12   # padding beyond the structural level for slippage
+
+
 @dataclass
 class TradePlan:
     tradeable:   bool
     tp:          float
-    rr:          float                 # real RR: (target - entry) / risk_distance
+    stop:        float                 # STRUCTURAL stop (not ATR distance)
+    rr:          float                 # real RR: (target - entry) / (entry - stop)
     trade_type:  str                   # continuation | sweep_reversal | breakout | range
     grade:       str                   # A | B | C
     size_mult:   float                 # multiply base risk by this
     target_src:  str                   # equal_highs | equal_lows | swing | atr_fallback
+    stop_src:    str                   # sweep | swing_low/high | order_block | atr_fallback
     thesis:      str                   # human-readable WHY
     n_touches:   int = 0               # liquidity-pool touch count (higher = stronger draw)
 
@@ -105,42 +112,124 @@ def _find_target(
     return float(best_level), src, int(best_touches)
 
 
+def _find_structural_stop(
+    df: pd.DataFrame, direction: int, entry: float, atr: float,
+    trade_type: str, swept: bool,
+) -> tuple[Optional[float], str]:
+    """Return (stop_price, source) placed at real structure that invalidates the
+    trade — NOT an ATR distance. The level differs by trade type:
+
+      sweep_reversal : beyond the swept wick (the stop-hunt extreme) — if it trades
+                       back through, the sweep failed.
+      continuation   : beyond the last swing that must hold (higher-low / lower-high).
+      breakout       : beyond the broken level (now flipped support/resistance).
+
+    ATR is used only as a small slippage buffer, never as the stop distance itself.
+    """
+    if df is None or len(df) < LOOKBACK_BARS or atr <= 0:
+        return None, "none"
+
+    window = df.tail(LOOKBACK_BARS)
+    buf    = atr * STOP_BUFFER_ATR
+    max_d  = atr * MAX_STOP_ATR
+    min_d  = atr * MIN_STOP_ATR
+
+    if direction == 1:
+        # candidate structural lows below entry
+        sl_mask = _swing_lows(window["low"], order=SWING_ORDER)
+        lows    = window["low"][sl_mask].values
+        if swept:
+            # deepest recent low (the wick that grabbed liquidity)
+            cand = float(window["low"].tail(SWING_ORDER * 2 + 2).min())
+            src  = "sweep_low"
+        else:
+            # nearest swing low that is far enough to sit outside the noise
+            below = [l for l in lows if l < entry - min_d]
+            if not below:
+                return None, "none"
+            cand = float(max(below))     # nearest qualifying swing low that must hold
+            src  = "swing_low"
+        stop = cand - buf
+        if stop >= entry:
+            return None, "none"
+        if entry - stop > max_d:
+            return None, "too_wide"
+        if entry - stop < min_d:          # too tight even after picking structure
+            stop = entry - min_d
+            src  = src + "+floor"
+        return stop, src
+    else:
+        sh_mask = _swing_highs(window["high"], order=SWING_ORDER)
+        highs   = window["high"][sh_mask].values
+        if swept:
+            cand = float(window["high"].tail(SWING_ORDER * 2 + 2).max())
+            src  = "sweep_high"
+        else:
+            above = [h for h in highs if h > entry + min_d]
+            if not above:
+                return None, "none"
+            cand = float(min(above))
+            src  = "swing_high"
+        stop = cand + buf
+        if stop <= entry:
+            return None, "none"
+        if stop - entry > max_d:
+            return None, "too_wide"
+        if stop - entry < min_d:
+            stop = entry + min_d
+            src  = src + "+floor"
+        return stop, src
+
+
 def analyze_entry(
     df_m15:    pd.DataFrame,
     df_m5:     Optional[pd.DataFrame],
     direction: int,
     entry:     float,
-    stop:      float,
+    stop:      float,                  # reference/fallback stop only (e.g. strategy ATR)
     atr:       float,
     h4_bias:   int = 0,
     rr_fallback: float = 2.0,
     swept:     bool = False,
 ) -> TradePlan:
-    """Produce a liquidity-based trade plan. `swept` = a recent sweep/stop-hunt was
-    detected at entry (marks a reversal thesis)."""
-    dist = abs(entry - stop)
-    if dist <= 1e-9:
-        return TradePlan(False, entry, 0.0, "range", "C", 0.0, "atr_fallback",
-                         "invalid stop distance", 0)
+    """Produce a fully structural trade plan — stop AND target from levels, not
+    arithmetic. `stop` is a fallback reference only. `swept` = a recent sweep/
+    stop-hunt was detected at entry (marks a reversal thesis)."""
+    ref_dist = abs(entry - stop)
 
-    # Prefer M5 for a precise near-term draw, fall back to M15 structure.
-    tgt, src, touches = _find_target(df_m5, direction, entry, atr)
-    if tgt is None:
-        tgt, src, touches = _find_target(df_m15, direction, entry, atr)
-
-    if tgt is not None:
-        rr = abs(tgt - entry) / dist
-    else:
-        rr  = 0.0
-
-    # ── Classify trade type ──
+    # ── Classify trade type first (drives stop placement) ──
     if swept:
         trade_type = "sweep_reversal"        # entered on a stop-hunt reversal
     elif h4_bias == direction:
         trade_type = "continuation"          # riding the HTF draw
-    elif tgt is not None and touches >= 2:
-        trade_type = "breakout"              # aiming at a clean liquidity pool
     else:
+        trade_type = "breakout"
+
+    # ── Structural stop (M5 precise, then M15) — replaces the ATR stop ──
+    s_stop, stop_src = _find_structural_stop(df_m5, direction, entry, atr, trade_type, swept)
+    if s_stop is None:
+        s_stop, stop_src = _find_structural_stop(df_m15, direction, entry, atr, trade_type, swept)
+    if s_stop is None:
+        # No valid structure to anchor the stop — fall back to the reference stop,
+        # but that means we can't justify the risk -> lower grade downstream.
+        s_stop, stop_src = stop, "atr_fallback"
+
+    dist = abs(entry - s_stop)
+    if dist <= 1e-9:
+        return TradePlan(False, entry, s_stop, 0.0, "range", "C", 0.0,
+                         "atr_fallback", stop_src, "invalid stop distance", 0)
+
+    # ── Liquidity target: prefer M5 precise draw, fall back to M15 structure ──
+    tgt, src, touches = _find_target(df_m5, direction, entry, atr)
+    if tgt is None:
+        tgt, src, touches = _find_target(df_m15, direction, entry, atr)
+
+    rr = abs(tgt - entry) / dist if tgt is not None else 0.0
+
+    # refine type: aiming at a clean pool with no HTF alignment = breakout
+    if not swept and h4_bias != direction and tgt is not None and touches >= 2:
+        trade_type = "breakout"
+    elif not swept and h4_bias != direction and tgt is None:
         trade_type = "range"
 
     # ── Grade & size ──
@@ -152,28 +241,32 @@ def analyze_entry(
         thesis = (f"NO clean liquidity draw within {MAX_REACH_ATR:.0f}xATR "
                   f"(best RR {rr:.2f}) — low-conviction, min size")
         return TradePlan(
-            tradeable=False, tp=round(tp, 6), rr=capped_rr, trade_type=trade_type,
-            grade="C", size_mult=0.25, target_src="atr_fallback",
+            tradeable=False, tp=round(tp, 6), stop=round(s_stop, 6), rr=capped_rr,
+            trade_type=trade_type, grade="C", size_mult=0.25,
+            target_src="atr_fallback", stop_src=stop_src,
             thesis=thesis, n_touches=touches,
         )
 
-    # Real target found. Grade on draw strength + RR + HTF alignment.
-    aligned = (h4_bias == direction) or swept
-    if touches >= 2 and rr >= 2.0 and aligned:
+    # Real target found. Grade on draw strength + RR + HTF alignment + stop quality.
+    aligned    = (h4_bias == direction) or swept
+    struct_stop = stop_src != "atr_fallback"     # stop anchored to real structure?
+    if touches >= 2 and rr >= 2.0 and aligned and struct_stop:
         grade, size_mult = "A", 1.25
-    elif rr >= 1.5 and (touches >= 2 or aligned):
+    elif rr >= 1.5 and (touches >= 2 or aligned) and struct_stop:
         grade, size_mult = "B", 1.0
-    else:
+    elif struct_stop:
         grade, size_mult = "B", 0.75
+    else:
+        grade, size_mult = "C", 0.5           # target ok but stop not structural
 
     pool = f"{touches}-touch {src}" if touches >= 2 else "swing level"
-    thesis = (f"{trade_type}: draw to {pool} @ {tgt:.5f} "
+    thesis = (f"{trade_type}: stop@{stop_src} {s_stop:.5f} -> draw to {pool} @ {tgt:.5f} "
               f"(RR {rr:.2f}, H4 {'aligned' if aligned else 'neutral'})")
 
     return TradePlan(
-        tradeable=True, tp=round(tgt, 6), rr=round(rr, 2), trade_type=trade_type,
-        grade=grade, size_mult=size_mult, target_src=src,
-        thesis=thesis, n_touches=touches,
+        tradeable=(grade != "C"), tp=round(tgt, 6), stop=round(s_stop, 6),
+        rr=round(rr, 2), trade_type=trade_type, grade=grade, size_mult=size_mult,
+        target_src=src, stop_src=stop_src, thesis=thesis, n_touches=touches,
     )
 
 
