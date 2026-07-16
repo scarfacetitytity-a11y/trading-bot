@@ -181,6 +181,70 @@ def _find_structural_stop(
         return stop, src
 
 
+def _find_order_block(
+    df: pd.DataFrame, direction: int, entry: float, atr: float,
+) -> tuple[Optional[float], str]:
+    """Order block = the last opposite-colour candle before the move. It's a
+    stronger stop anchor than a bare swing: if price trades back through the OB
+    that launched the move, the thesis is dead.
+
+    LONG  : last bearish candle (close<open) below entry -> stop below its low.
+    SHORT : last bullish candle (close>open) above entry -> stop above its high.
+    """
+    if df is None or len(df) < 10 or atr <= 0:
+        return None, "none"
+    window = df.tail(LOOKBACK_BARS)
+    o = window["open"].values; c = window["close"].values
+    h = window["high"].values; l = window["low"].values
+    min_d = atr * MIN_STOP_ATR
+    max_d = atr * MAX_STOP_ATR
+
+    if direction == 1:
+        for i in range(len(window) - 2, -1, -1):        # scan backward
+            if c[i] < o[i] and l[i] < entry - min_d:     # bearish candle below entry
+                dist = entry - l[i]
+                if dist <= max_d:
+                    return float(l[i]), "order_block"
+                return None, "too_wide"
+    else:
+        for i in range(len(window) - 2, -1, -1):
+            if c[i] > o[i] and h[i] > entry + min_d:     # bullish candle above entry
+                dist = h[i] - entry
+                if dist <= max_d:
+                    return float(h[i]), "order_block"
+                return None, "too_wide"
+    return None, "none"
+
+
+def _find_fvg_target(
+    df: pd.DataFrame, direction: int, entry: float, atr: float,
+) -> Optional[float]:
+    """Nearest unfilled Fair Value Gap in the trade direction beyond entry — an
+    imbalance price is drawn to fill (a target candidate alongside liquidity pools).
+
+    LONG  : bullish FVG (bar[-3].high < bar[-1].low) with the gap above entry.
+    SHORT : bearish FVG (bar[-3].low  > bar[-1].high) with the gap below entry.
+    """
+    if df is None or len(df) < 5 or atr <= 0:
+        return None
+    h = df["high"].values; l = df["low"].values
+    best = None
+    for i in range(2, len(df)):
+        if direction == 1:
+            if h[i - 2] < l[i]:                          # bullish gap
+                edge = l[i]                              # near edge of the gap
+                if edge > entry + atr * MIN_BEYOND_ATR:
+                    if best is None or edge < best:      # nearest above
+                        best = edge
+        else:
+            if l[i - 2] > h[i]:                          # bearish gap
+                edge = h[i]
+                if edge < entry - atr * MIN_BEYOND_ATR:
+                    if best is None or edge > best:      # nearest below
+                        best = edge
+    return float(best) if best is not None else None
+
+
 def analyze_entry(
     df_m15:    pd.DataFrame,
     df_m5:     Optional[pd.DataFrame],
@@ -205,10 +269,19 @@ def analyze_entry(
     else:
         trade_type = "breakout"
 
-    # ── Structural stop (M5 precise, then M15) — replaces the ATR stop ──
-    s_stop, stop_src = _find_structural_stop(df_m5, direction, entry, atr, trade_type, swept)
+    # ── Structural stop: order block (strongest) > swing > reference ──
+    # Prefer the order block that launched the move; fall back to swing structure.
+    def _stop_from(df):
+        # Order block is the launch level — highest-conviction anchor. Use it when
+        # valid; otherwise fall back to swing structure.
+        ob, ob_src = _find_order_block(df, direction, entry, atr)
+        if ob is not None:
+            return ob - atr * STOP_BUFFER_ATR if direction == 1 else ob + atr * STOP_BUFFER_ATR, ob_src
+        return _find_structural_stop(df, direction, entry, atr, trade_type, swept)
+
+    s_stop, stop_src = _stop_from(df_m5)
     if s_stop is None:
-        s_stop, stop_src = _find_structural_stop(df_m15, direction, entry, atr, trade_type, swept)
+        s_stop, stop_src = _stop_from(df_m15)
     if s_stop is None:
         # No valid structure to anchor the stop — fall back to the reference stop,
         # but that means we can't justify the risk -> lower grade downstream.
@@ -219,10 +292,24 @@ def analyze_entry(
         return TradePlan(False, entry, s_stop, 0.0, "range", "C", 0.0,
                          "atr_fallback", stop_src, "invalid stop distance", 0)
 
-    # ── Liquidity target: prefer M5 precise draw, fall back to M15 structure ──
+    # ── Target: liquidity pool (equal highs/lows) or unfilled FVG to fill ──
+    # Prefer M5 precise draw, fall back to M15. Between a liquidity pool and an
+    # FVG, take whichever is a valid draw that clears the min-RR bar; prefer the
+    # pool (resting orders) when both qualify.
     tgt, src, touches = _find_target(df_m5, direction, entry, atr)
     if tgt is None:
         tgt, src, touches = _find_target(df_m15, direction, entry, atr)
+
+    fvg = _find_fvg_target(df_m5, direction, entry, atr)
+    if fvg is None:
+        fvg = _find_fvg_target(df_m15, direction, entry, atr)
+
+    # If no liquidity pool, or the FVG is a nearer valid draw, use the FVG.
+    if fvg is not None:
+        fvg_rr = abs(fvg - entry) / dist
+        pool_ok = tgt is not None and (abs(tgt - entry) / dist) >= MIN_RR_TRADEABLE
+        if not pool_ok and fvg_rr >= MIN_RR_TRADEABLE:
+            tgt, src, touches = fvg, "fvg_fill", 0
 
     rr = abs(tgt - entry) / dist if tgt is not None else 0.0
 
