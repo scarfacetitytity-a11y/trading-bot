@@ -21,6 +21,7 @@ from pathlib import Path
 from typing import Optional
 
 from execution import telegram_notify as tg
+from execution.trade_analyzer import analyze_exit
 
 logger = logging.getLogger(__name__)
 
@@ -52,6 +53,21 @@ class TradeRecord:
     pnl_usd:      Optional[float] = None
     r_multiple:   Optional[float] = None   # PnL / (entry - SL) in price terms
     outcome:      Optional[str] = None     # "win" | "loss" | "breakeven"
+    # ── Trade plan (from TradeAnalyzer at entry) ──
+    trade_type:   Optional[str] = None     # continuation | sweep_reversal | breakout | range
+    grade:        Optional[str] = None     # A | B | C
+    target_price: Optional[float] = None   # liquidity target (structural TP)
+    thesis:       Optional[str] = None
+    # ── Path tracking (MFE/MAE while open) ──
+    path_high:    Optional[float] = None
+    path_low:     Optional[float] = None
+    # ── Post-trade review (from analyze_exit at close) ──
+    hit_target:   Optional[bool] = None
+    mfe_r:        Optional[float] = None
+    mae_r:        Optional[float] = None
+    thesis_valid: Optional[bool] = None
+    lesson:       Optional[str] = None
+    review_notes: Optional[list] = None
 
 
 class TradeJournal:
@@ -75,6 +91,10 @@ class TradeJournal:
         equity: float,
         atr: Optional[float] = None,
         df=None,
+        trade_type: Optional[str] = None,
+        grade: Optional[str] = None,
+        target_price: Optional[float] = None,
+        thesis: Optional[str] = None,
     ) -> None:
         now = datetime.now(tz=timezone.utc)
         self._open[symbol] = TradeRecord(
@@ -88,6 +108,12 @@ class TradeJournal:
             lots=lots,
             equity_at_entry=equity,
             open_time=now.isoformat(),
+            trade_type=trade_type,
+            grade=grade,
+            target_price=target_price,
+            thesis=thesis,
+            path_high=entry_price,
+            path_low=entry_price,
         )
         logger.info("[Journal] OPEN %s dir=%+d score=%d entry=%.5f SL=%.5f TP=%s",
                     symbol, direction, score, entry_price, sl_price, tp_price)
@@ -96,6 +122,16 @@ class TradeJournal:
             entry=entry_price, sl=sl_price, tp=tp_price,
             lots=lots, equity=equity, atr=atr, df=df,
         )
+
+    def update_path(self, symbol: str, high: float, low: float) -> None:
+        """Track max favourable/adverse excursion while a trade is open."""
+        rec = self._open.get(symbol)
+        if rec is None:
+            return
+        if rec.path_high is None or high > rec.path_high:
+            rec.path_high = float(high)
+        if rec.path_low is None or low < rec.path_low:
+            rec.path_low = float(low)
 
     def close_trade(self, symbol: str, close_price: float, equity_after: float) -> None:
         rec = self._open.pop(symbol, None)
@@ -120,6 +156,9 @@ class TradeJournal:
         else:
             rec.outcome = "breakeven"
 
+        # ── Post-trade review — learn from every close ──
+        self._review(rec, close_price)
+
         self._append(rec)
         self._council_review(rec)
         session_pnl = sum(
@@ -134,6 +173,38 @@ class TradeJournal:
             pnl_usd=rec.pnl_usd or 0.0,
             equity=equity_after,
             session_pnl=session_pnl,
+        )
+
+    # ── Post-trade review ─────────────────────────────────────────────────────
+
+    def _review(self, rec: TradeRecord, close_price: float) -> None:
+        """Run analyze_exit and store the verdict + lesson on the record."""
+        target = rec.target_price if rec.target_price is not None else rec.tp_price
+        if target is None:
+            return
+        reason = (rec.outcome or "").upper()
+        path_high = rec.path_high if rec.path_high is not None else close_price
+        path_low  = rec.path_low  if rec.path_low  is not None else close_price
+        try:
+            review = analyze_exit(
+                direction=rec.direction, entry=rec.entry_price, stop=rec.sl_price,
+                target=target, exit_px=close_price,
+                path_high=path_high, path_low=path_low, reason=reason,
+            )
+        except Exception as exc:
+            logger.warning("[Journal] review failed for %s: %s", rec.symbol, exc)
+            return
+        rec.hit_target   = review.hit_target
+        rec.mfe_r        = review.mfe_r
+        rec.mae_r        = review.mae_r
+        rec.thesis_valid = review.thesis_valid
+        rec.lesson       = review.lesson
+        rec.review_notes = review.notes
+        logger.info(
+            "[Journal] REVIEW %s [%s/%s] hitTP=%s MFE=%.1fR MAE=%.1fR | %s%s",
+            rec.symbol, rec.trade_type or "?", rec.grade or "?",
+            review.hit_target, review.mfe_r, review.mae_r, review.lesson,
+            (" | " + "; ".join(review.notes)) if review.notes else "",
         )
 
     # ── Rolling stats ─────────────────────────────────────────────────────────

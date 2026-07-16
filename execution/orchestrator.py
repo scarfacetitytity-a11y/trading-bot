@@ -819,6 +819,10 @@ class TradingEngine(Component):
         mid_price  = (tick.bid + tick.ask) / 2.0
         current_sl = pos.sl
 
+        # Track MFE/MAE for the post-trade review
+        if self._journal is not None:
+            self._journal.update_path(self._symbol, tick.ask, tick.bid)
+
         t1_r   = getattr(self._strategy, "t1_r", 0.0)
         t1_pct = getattr(self._strategy, "t1_partial_pct", 0.5)
         ts_bars = getattr(self._strategy, "time_stop_bars", 0)
@@ -1252,6 +1256,7 @@ class TradingEngine(Component):
                                 import numpy as np
                                 _atr_series = getattr(self._strategy, "_atr_cache", None)
                                 _atr_val = float(_atr_series.iloc[-1]) if _atr_series is not None and not np.isnan(float(_atr_series.iloc[-1])) else None
+                                _p = self._last_plan
                                 self._journal.open_trade(
                                     symbol=self._symbol,
                                     direction=desired,
@@ -1263,6 +1268,10 @@ class TradingEngine(Component):
                                     equity=equity,
                                     atr=_atr_val,
                                     df=df,
+                                    trade_type=_p.trade_type if _p else None,
+                                    grade=_p.grade if _p else None,
+                                    target_price=_p.tp if _p else None,
+                                    thesis=_p.thesis if _p else None,
                                 )
 
             except Exception as exc:
