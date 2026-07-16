@@ -49,6 +49,9 @@ from backtests.data_loader import TIMEFRAME_MAP
 from execution import trader, risk
 from execution import news_gate as ng
 from execution.trade_manager import TradeManager, PositionState, ActionType
+from execution.signal_detectors import (
+    detect_m5_entry_trigger, detect_accumulation, detect_liquidity_draw,
+)
 from strategies.sniper import SniperStrategy
 from strategies.london_breakout import LondonBreakoutStrategy
 from strategies.fvg_ob import FVGOrderBlockStrategy
@@ -77,6 +80,14 @@ _TF_SECONDS = {
     "M1": 60, "M5": 300, "M15": 900, "M30": 1800,
     "H1": 3600, "H4": 14400, "D1": 86400,
 }
+
+# Instruments that move together — used for divergence gate.
+# If any member has an active position in OPPOSITE direction, block new entry.
+_CORR_GROUPS: list[set] = [
+    {"US30.cash", "US100.cash", "US500.cash", "US2000.cash"},  # US indices
+    {"UK100.cash", "GER40.cash"},                               # EU indices
+    {"XAUUSD", "XAGUSD"},                                       # metals
+]
 
 STRATEGY_MAP = {
     "sniper":          SniperStrategy,
@@ -439,6 +450,9 @@ class TradingEngine(Component):
         self._bars_since_entry: int  = 0
         self._block_entry:      bool = False
         self._scaled_in:        bool = False
+        self._pending_signal:   int  = 0    # M15 setup waiting for M5 trigger
+        self._pending_bars:     int  = 0    # bars elapsed since pending set
+        self._ltf_trigger_bars: int  = 3    # max M15 bars to wait for M5 trigger
         self._state_file       = Path("logs") / f"pos_state_{symbol.replace('.','_')}.json"
         self._load_position_state()
 
@@ -549,6 +563,8 @@ class TradingEngine(Component):
         self._t1_hit            = False
         self._bars_since_entry  = 0
         self._scaled_in         = False
+        self._pending_signal    = 0
+        self._pending_bars      = 0
         self._state_file.unlink(missing_ok=True)
 
     def _detect_post_event_direction(
@@ -669,6 +685,32 @@ class TradingEngine(Component):
                                     new_sl=action.new_sl, new_tp=pos.tp)
                 logger.info("[%s] HOLD_RUNNER: SL tightened to structure -> %.5f",
                             self.name, action.new_sl)
+
+    def _correlation_divergence(self, signal_dir: int) -> bool:
+        """Return True if entering signal_dir contradicts the dominant group direction.
+
+        Checks all instruments in the same correlation group. If any group member
+        has an active position in the OPPOSITE direction, this entry is divergent
+        against the correlated move — block it.
+        """
+        group = next((g for g in _CORR_GROUPS if self._symbol in g), None)
+        if group is None:
+            return False
+        for peer in group:
+            if peer == self._symbol:
+                continue
+            peer_positions = mt5.positions_get(symbol=peer)
+            if not peer_positions:
+                continue
+            for pos in peer_positions:
+                peer_dir = 1 if pos.type == mt5.ORDER_TYPE_BUY else -1
+                if peer_dir != signal_dir:
+                    logger.info(
+                        "[%s] CORR DIVERGENCE: %s is %s but signal=%+d — blocked",
+                        self.name, peer, "LONG" if peer_dir == 1 else "SHORT", signal_dir,
+                    )
+                    return True
+        return False
 
     def _portfolio_pnl_r(self) -> float:
         """Return total portfolio floating P&L in R units (risk_pct of equity per trade)."""
@@ -917,7 +959,38 @@ class TradingEngine(Component):
                 self._manage_open_position()
 
                 if self._block_entry:
+                    self._pending_signal = 0
                     continue
+
+                # ── Pending M5 trigger: age out expired setups ────────────────
+                if self._pending_signal != 0 and current == 0:
+                    self._pending_bars += 1
+                    df_m5_check = self._fetch_ltf_bars("M5", count=40)
+                    atr_check   = 0.0
+                    if df_m5_check is not None and len(df_m5_check) > 14:
+                        atr_check = float(
+                            (df_m5_check["high"] - df_m5_check["low"])
+                            .rolling(14).mean().iloc[-1]
+                        )
+                    triggered = detect_m5_entry_trigger(
+                        df_m5_check, self._pending_signal, atr=atr_check
+                    ) if df_m5_check is not None else False
+
+                    if triggered:
+                        logger.info("[%s] M5 trigger CONFIRMED for pending signal=%+d (bar %d)",
+                                    self.name, self._pending_signal, self._pending_bars)
+                        desired = self._pending_signal
+                        self._pending_signal = 0
+                        self._pending_bars   = 0
+                        # fall through to entry logic below
+                    elif self._pending_bars >= self._ltf_trigger_bars:
+                        logger.info("[%s] M5 trigger EXPIRED (signal=%+d, %d bars)",
+                                    self.name, self._pending_signal, self._pending_bars)
+                        self._pending_signal = 0
+                        self._pending_bars   = 0
+                        continue
+                    else:
+                        continue  # still waiting
 
                 # Scale-in: when signal confirms a profitable position, add a unit
                 if desired == current and current != 0 and not getattr(self, "_scaled_in", False):
@@ -975,6 +1048,47 @@ class TradingEngine(Component):
                     # Soft halt check (2% daily or 7% cumulative DD)
                     if self._soft_halt is not None and self._soft_halt.is_set():
                         logger.warning("[%s] SOFT HALT active — blocking new entry", self.name)
+                        continue
+
+                    # ── M5 entry trigger gate ─────────────────────────────────
+                    df_m5_entry = self._fetch_ltf_bars("M5", count=40)
+                    atr_entry   = 0.0
+                    if df_m5_entry is not None and len(df_m5_entry) > 14:
+                        atr_entry = float(
+                            (df_m5_entry["high"] - df_m5_entry["low"])
+                            .rolling(14).mean().iloc[-1]
+                        )
+                    if not detect_m5_entry_trigger(df_m5_entry, desired, atr=atr_entry):
+                        # M5 hasn't broken structure yet — set pending, wait
+                        if self._pending_signal != desired:
+                            logger.info("[%s] M5 not confirmed — pending signal=%+d",
+                                        self.name, desired)
+                            self._pending_signal = desired
+                            self._pending_bars   = 0
+                        continue
+
+                    # ── Accumulation / distribution gate ─────────────────────
+                    accum_risk = detect_accumulation(
+                        df_m5_entry, desired, atr=atr_entry
+                    )
+                    if accum_risk >= 0.66:
+                        logger.warning(
+                            "[%s] ACCUM GATE: %.0f%% risk of opposing accumulation — blocked signal=%+d",
+                            self.name, accum_risk * 100, desired,
+                        )
+                        continue
+
+                    # ── Liquidity draw gate ───────────────────────────────────
+                    liq = detect_liquidity_draw(df_m5_entry, desired, atr=atr_entry)
+                    if liq["block_entry"]:
+                        logger.warning(
+                            "[%s] LIQUIDITY GATE: opposing pool %.1f ATR away vs aligned %.1f ATR — blocked",
+                            self.name, liq["opposing_pool"], liq["aligned_pool"],
+                        )
+                        continue
+
+                    # ── Correlation divergence gate ───────────────────────────
+                    if self._correlation_divergence(desired):
                         continue
 
                     open_count = len(mt5.positions_get() or [])
