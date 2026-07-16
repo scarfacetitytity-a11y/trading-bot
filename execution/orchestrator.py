@@ -53,6 +53,7 @@ from execution.signal_detectors import (
     detect_m5_entry_trigger, detect_accumulation, detect_liquidity_draw,
 )
 from execution.trade_analyzer import analyze_entry, manage_trade as analyze_manage
+from execution.trade_agent import TradeAgent
 from strategies.sniper import SniperStrategy
 from strategies.london_breakout import LondonBreakoutStrategy
 from strategies.fvg_ob import FVGOrderBlockStrategy
@@ -453,6 +454,7 @@ class TradingEngine(Component):
         self._open_sl:          Optional[float] = None   # initial SL at entry — never moved
         self._open_tp:          Optional[float] = None
         self._last_plan               = None    # last TradePlan from analyze_entry
+        self._agent            = TradeAgent()   # per-trade adjudication + tickets
         self._open_score:       int = 0
         self._t1_hit:           bool = False
         self._bars_since_entry: int  = 0
@@ -772,6 +774,25 @@ class TradingEngine(Component):
             )
             return True
         return False
+
+    def _dd_room(self, equity: float) -> tuple[float, float]:
+        """Return (daily_room_pct, total_room_pct) — how much DD budget is left before
+        the Council/FTMO limits. Used by the per-trade agent's Compliance voice."""
+        try:
+            acct = trader.get_account()
+            bal  = acct.get("balance", equity) or equity
+            # daily: room to the -2% soft halt from today's start (approx via balance)
+            start = getattr(self, "_day_start_equity", bal) or bal
+            daily_loss = max(0.0, (start - equity) / start * 100) if start else 0.0
+            daily_room = MAX_DAILY_LOSS_PCT - daily_loss
+            # total: room to the soft DD halt from peak
+            peak = max(getattr(self, "_peak_equity", bal) or bal, equity)
+            self._peak_equity = peak
+            total_loss = max(0.0, (peak - equity) / peak * 100) if peak else 0.0
+            total_room = SOFT_DD_HALT_PCT - total_loss
+            return daily_room, total_room
+        except Exception:
+            return MAX_DAILY_LOSS_PCT, SOFT_DD_HALT_PCT
 
     def _portfolio_pnl_r(self) -> float:
         """Return total portfolio floating P&L in R units (risk_pct of equity per trade)."""
@@ -1248,6 +1269,23 @@ class TradingEngine(Component):
                         logger.info("[%s] NO-DRAW skip: %s (grade %s) — %s",
                                     self.name, direction_str,
                                     self._last_plan.grade, self._last_plan.thesis)
+                        continue
+
+                    # ── Per-trade agent: Council adjudication + durable ticket ──
+                    # Uses the plan already computed in _size_order (no recompute).
+                    tick_e    = mt5.symbol_info_tick(self._symbol)
+                    entry_px  = (tick_e.ask if desired == 1 else tick_e.bid) if tick_e else 0.0
+                    dd_daily_room, dd_total_room = self._dd_room(equity)
+                    ticket = self._agent.evaluate(
+                        symbol=self._symbol, direction=desired,
+                        df_m15=None, df_m5=None, entry=entry_px, ref_stop=sl or 0.0,
+                        atr=0.0, h4_bias=0, plan=self._last_plan,
+                        gates={"m5_trigger": True},   # gates already passed above
+                        dd_room_daily=dd_daily_room, dd_room_total=dd_total_room,
+                    )
+                    if ticket.verdict != "GO":
+                        logger.info("[%s] AGENT NO_GO: %s | dissent: %s",
+                                    self.name, direction_str, "; ".join(ticket.dissent))
                         continue
 
                     # ── Council gate: Telegram approval before order fires ──
