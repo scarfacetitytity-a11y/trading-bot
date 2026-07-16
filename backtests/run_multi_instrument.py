@@ -114,18 +114,30 @@ def _size_mult_from_score(score: int) -> float:
 # Volatile trend instruments (metals, JP225) use tighter be_r for faster protection.
 # Indices use slightly wider be_r (more chop before they commit to a move).
 TRAIL_CONFIGS: dict[str, dict] = {
-    # Gold: confirmed +55pp A/B improvement — tight trail (be_r=1.0)
-    "XAUUSD":      dict(trail_to_be=True, trail_be_r=1.0, trail_lock_r=2.0),
-    # Silver: choppy — wider trail needed to avoid whipsaw re-entry (no trail until validated)
-    # "XAGUSD":    dict(trail_to_be=True, trail_be_r=2.0, trail_lock_r=3.5),
-    # JP225: trends cleanly in Asian session — same as gold
-    "JP225.cash":  dict(trail_to_be=True, trail_be_r=1.0, trail_lock_r=2.0),
-    # Indices: long-only, trend strongly — slightly wider be_r avoids choppy early exit
-    "UK100.cash":  dict(trail_to_be=True, trail_be_r=1.2, trail_lock_r=2.5),
-    "US100.cash":  dict(trail_to_be=True, trail_be_r=1.2, trail_lock_r=2.5),
-    "US30.cash":   dict(trail_to_be=True, trail_be_r=1.2, trail_lock_r=2.5),
-    "US500.cash":  dict(trail_to_be=True, trail_be_r=1.2, trail_lock_r=2.5),
-    "US2000.cash": dict(trail_to_be=True, trail_be_r=1.2, trail_lock_r=2.5),
+    # Jab + sucker punch on every instrument:
+    #   t1_r=1.0  → at 1R profit, close 50% (jab locked), move SL to BE
+    #   runner 50% uses HOLD_RUNNER (sucker punch) — rides structure until TM exits
+    #
+    # Gold: tight trail — sweeps fast, trail protects runner
+    "XAUUSD":      dict(trail_to_be=True, trail_be_r=1.0, trail_lock_r=2.0,
+                        t1_r=1.0, t1_partial_pct=0.50),
+    # Silver: same as gold
+    "XAGUSD":      dict(trail_to_be=True, trail_be_r=1.0, trail_lock_r=2.0,
+                        t1_r=1.0, t1_partial_pct=0.50),
+    # JP225: trends cleanly in Asian session
+    "JP225.cash":  dict(trail_to_be=True, trail_be_r=1.0, trail_lock_r=2.0,
+                        t1_r=1.0, t1_partial_pct=0.50),
+    # Indices: slightly wider trail (more chop), same jab at 1R
+    "UK100.cash":  dict(trail_to_be=True, trail_be_r=1.2, trail_lock_r=2.5,
+                        t1_r=1.0, t1_partial_pct=0.50),
+    "US100.cash":  dict(trail_to_be=True, trail_be_r=1.2, trail_lock_r=2.5,
+                        t1_r=1.0, t1_partial_pct=0.50),
+    "US30.cash":   dict(trail_to_be=True, trail_be_r=1.2, trail_lock_r=2.5,
+                        t1_r=1.0, t1_partial_pct=0.50),
+    "US500.cash":  dict(trail_to_be=True, trail_be_r=1.2, trail_lock_r=2.5,
+                        t1_r=1.0, t1_partial_pct=0.50),
+    "US2000.cash": dict(trail_to_be=True, trail_be_r=1.2, trail_lock_r=2.5,
+                        t1_r=1.0, t1_partial_pct=0.50),
 }
 
 # ── Per-instrument sweep-optimised params (populated after sweep_m15_instruments) ─

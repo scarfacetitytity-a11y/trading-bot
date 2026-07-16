@@ -26,6 +26,7 @@ Usage:
     python -m execution.orchestrator --symbol XAUUSD --dry-run
 """
 import argparse
+import json
 import logging
 import math
 import sys
@@ -35,6 +36,7 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from enum import Enum
+from pathlib import Path
 from typing import Dict, Optional
 
 import MetaTrader5 as mt5
@@ -436,6 +438,48 @@ class TradingEngine(Component):
         self._t1_hit:           bool = False
         self._bars_since_entry: int  = 0
         self._block_entry:      bool = False
+        self._state_file       = Path("logs") / f"pos_state_{symbol.replace('.','_')}.json"
+        self._load_position_state()
+
+    def _save_position_state(self) -> None:
+        try:
+            self._state_file.parent.mkdir(parents=True, exist_ok=True)
+            with open(self._state_file, "w") as f:
+                json.dump({
+                    "entry_price": self._open_entry_price,
+                    "initial_sl":  self._open_sl,
+                    "tp":          self._open_tp,
+                    "score":       self._open_score,
+                    "t1_hit":      self._t1_hit,
+                    "bars":        self._bars_since_entry,
+                }, f)
+        except Exception:
+            pass
+
+    def _load_position_state(self) -> None:
+        try:
+            if not self._state_file.exists():
+                return
+            with open(self._state_file) as f:
+                d = json.load(f)
+            # Only restore if MT5 actually has an open position for this symbol
+            positions = mt5.positions_get(symbol=self._symbol)
+            if not positions:
+                self._state_file.unlink(missing_ok=True)
+                return
+            self._open_entry_price = d.get("entry_price")
+            self._open_sl          = d.get("initial_sl")
+            self._open_tp          = d.get("tp")
+            self._open_score       = d.get("score", 0)
+            self._t1_hit           = d.get("t1_hit", False)
+            self._bars_since_entry = d.get("bars", 0)
+            logger.info("[%s] Restored position state: entry=%.5f sl=%.5f t1_hit=%s",
+                        self.name,
+                        self._open_entry_price or 0,
+                        self._open_sl or 0,
+                        self._t1_hit)
+        except Exception:
+            pass
 
     def _size_order(
         self,
@@ -503,6 +547,7 @@ class TradingEngine(Component):
         self._open_score        = 0
         self._t1_hit            = False
         self._bars_since_entry  = 0
+        self._state_file.unlink(missing_ok=True)
 
     def _detect_post_event_direction(
         self, event_time: datetime, window_min: float = 15.0, threshold_pct: float = 0.10
@@ -953,6 +998,7 @@ class TradingEngine(Component):
                             self._open_score        = signal_score
                             self._t1_hit            = False
                             self._bars_since_entry  = 0
+                            self._save_position_state()
                             if self._journal is not None:
                                 import numpy as np
                                 _atr_series = getattr(self._strategy, "_atr_cache", None)

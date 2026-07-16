@@ -44,8 +44,9 @@ class RiskConfig:
     wr_scale_threshold: float     = 0.35    # WR below this → half size
     wr_halt_threshold: float      = 0.20    # WR below this → pause
 
-    # Max open trades at once (across all strategies)
-    max_concurrent_trades: int    = 4
+    # Max open trades at once — risk is governed by risk_pct per trade, not a count cap.
+    # Set high so valid setups never get blocked by position count alone.
+    max_concurrent_trades: int    = 20
 
 
 @dataclass
