@@ -52,7 +52,7 @@ from execution.trade_manager import TradeManager, PositionState, ActionType
 from execution.signal_detectors import (
     detect_m5_entry_trigger, detect_accumulation, detect_liquidity_draw,
 )
-from execution.trade_analyzer import analyze_entry
+from execution.trade_analyzer import analyze_entry, manage_trade as analyze_manage
 from strategies.sniper import SniperStrategy
 from strategies.london_breakout import LondonBreakoutStrategy
 from strategies.fvg_ob import FVGOrderBlockStrategy
@@ -869,6 +869,41 @@ class TradingEngine(Component):
                     if not self._dry_run:
                         trader.modify_sl_tp(self._symbol, pos.ticket, new_sl=new_sl, new_tp=pos.tp)
                     logger.info("[%s] Trail SL: %.5f -> %.5f (short)", self.name, current_sl, new_sl)
+
+        # ── Adaptive structural management (per trade type) ──
+        # Ratchet the stop to new structure and extend the target to the next draw
+        # as the trade develops. Tighten-only on SL; only extends TP.
+        try:
+            pos_dir = 1 if pos.type == mt5.ORDER_TYPE_BUY else -1
+            cur_r   = ((mid_price - entry) if pos_dir == 1 else (entry - mid_price)) / risk_dist
+            ttype   = self._last_plan.trade_type if self._last_plan else "continuation"
+            df_mgmt = self._fetch_ltf_bars("M5", count=120)
+            atr_m   = 0.0
+            if df_mgmt is not None and len(df_mgmt) > 14:
+                atr_m = float((df_mgmt["high"] - df_mgmt["low"]).rolling(14).mean().iloc[-1])
+            live_sl = pos.sl if pos.sl > 0 else current_sl
+            live_tp = pos.tp if pos.tp > 0 else (self._open_tp or 0.0)
+            mdec = analyze_manage(
+                df=df_mgmt, direction=pos_dir, entry=entry, initial_sl=init_sl,
+                current_sl=live_sl, current_tp=live_tp, price=mid_price,
+                atr=atr_m, trade_type=ttype, cur_r=cur_r,
+            )
+            apply_sl = mdec.new_sl if (mdec.new_sl is not None and (
+                (pos_dir == 1 and mdec.new_sl > live_sl + 1e-8) or
+                (pos_dir == -1 and mdec.new_sl < live_sl - 1e-8))) else None
+            apply_tp = mdec.new_tp if (mdec.new_tp is not None and (
+                (pos_dir == 1 and mdec.new_tp > live_tp) or
+                (pos_dir == -1 and mdec.new_tp < live_tp))) else None
+            if (apply_sl is not None or apply_tp is not None) and not self._dry_run:
+                trader.modify_sl_tp(self._symbol, pos.ticket,
+                                    new_sl=apply_sl if apply_sl is not None else live_sl,
+                                    new_tp=apply_tp if apply_tp is not None else live_tp)
+                if apply_tp is not None:
+                    self._open_tp = apply_tp
+                logger.info("[%s] ADAPTIVE(%s) sl=%s tp=%s | %s",
+                            self.name, ttype, apply_sl, apply_tp, mdec.reason)
+        except Exception as exc:
+            logger.debug("[%s] adaptive mgmt skipped: %s", self.name, exc)
 
         # Time stop — close if no exit after N bars
         if ts_bars > 0:

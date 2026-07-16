@@ -357,6 +357,82 @@ def analyze_entry(
     )
 
 
+# ── Adaptive live management ──────────────────────────────────────────────────
+
+@dataclass
+class ManageDecision:
+    new_sl:  Optional[float] = None    # tighten-only structural trail
+    new_tp:  Optional[float] = None    # extend target to next draw
+    reason:  str = ""
+
+
+def manage_trade(
+    df:         pd.DataFrame,
+    direction:  int,
+    entry:      float,
+    initial_sl: float,
+    current_sl: float,
+    current_tp: float,
+    price:      float,
+    atr:        float,
+    trade_type: str,
+    cur_r:      float,
+) -> ManageDecision:
+    """Adaptive per-type management. Moves the stop to new structure as the trade
+    develops (tighten-only) and extends the target to the next draw when price
+    approaches it. Different behaviour per trade type:
+
+      sweep_reversal : work-fast — BE by +0.5R, then trail tight behind structure.
+      continuation   : ride — BE by +1R, trail behind each new higher-low/OB,
+                       extend TP to the next liquidity pool.
+      breakout       : BE by +1R, trail behind the reclaimed level.
+    """
+    if df is None or len(df) < 20 or atr <= 0 or abs(entry - initial_sl) < 1e-9:
+        return ManageDecision()
+
+    rdist = abs(entry - initial_sl)
+    dec   = ManageDecision()
+
+    # ── 1. Breakeven ratchet (type-specific trigger) ──
+    be_trigger = 0.5 if trade_type == "sweep_reversal" else 1.0
+    if cur_r >= be_trigger:
+        be = entry
+        if direction == 1 and be > current_sl:
+            dec.new_sl, dec.reason = be, f"BE@{be_trigger}R"
+        elif direction == -1 and be < current_sl:
+            dec.new_sl, dec.reason = be, f"BE@{be_trigger}R"
+
+    # ── 2. Structural trail behind the latest swing that must hold ──
+    if cur_r >= 1.0:
+        s_stop, s_src = _find_structural_stop(df, direction, price, atr, trade_type, False)
+        if s_stop is not None:
+            better = ((direction == 1 and s_stop > (dec.new_sl or current_sl)) or
+                      (direction == -1 and s_stop < (dec.new_sl or current_sl)))
+            # never trail past price
+            valid = (direction == 1 and s_stop < price) or (direction == -1 and s_stop > price)
+            if better and valid:
+                dec.new_sl = s_stop
+                dec.reason = f"trail@{s_src}"
+
+    # ── 3. Target extension — let it run to the next draw ──
+    # If price is within 0.3R of TP and a further pool/FVG exists, push TP out.
+    near_tp = abs(price - current_tp) <= 0.3 * rdist
+    beyond_target = (direction == 1 and price >= current_tp - 0.3 * rdist) or \
+                    (direction == -1 and price <= current_tp + 0.3 * rdist)
+    if near_tp or beyond_target:
+        nxt, src, _ = _find_target(df, direction, price, atr)
+        if nxt is None:
+            fvg = _find_fvg_target(df, direction, price, atr)
+            nxt, src = (fvg, "fvg_fill") if fvg is not None else (None, "")
+        if nxt is not None:
+            extends = (direction == 1 and nxt > current_tp) or (direction == -1 and nxt < current_tp)
+            if extends:
+                dec.new_tp = round(nxt, 6)
+                dec.reason = (dec.reason + " | " if dec.reason else "") + f"extend_tp@{src}"
+
+    return dec
+
+
 # ── Post-trade review ─────────────────────────────────────────────────────────
 
 def analyze_exit(
