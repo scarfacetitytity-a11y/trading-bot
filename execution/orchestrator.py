@@ -438,6 +438,7 @@ class TradingEngine(Component):
         self._t1_hit:           bool = False
         self._bars_since_entry: int  = 0
         self._block_entry:      bool = False
+        self._scaled_in:        bool = False
         self._state_file       = Path("logs") / f"pos_state_{symbol.replace('.','_')}.json"
         self._load_position_state()
 
@@ -547,6 +548,7 @@ class TradingEngine(Component):
         self._open_score        = 0
         self._t1_hit            = False
         self._bars_since_entry  = 0
+        self._scaled_in         = False
         self._state_file.unlink(missing_ok=True)
 
     def _detect_post_event_direction(
@@ -668,13 +670,40 @@ class TradingEngine(Component):
                 logger.info("[%s] HOLD_RUNNER: SL tightened to structure -> %.5f",
                             self.name, action.new_sl)
 
+    def _portfolio_pnl_r(self) -> float:
+        """Return total portfolio floating P&L in R units (risk_pct of equity per trade)."""
+        try:
+            all_pos = mt5.positions_get() or []
+            total_pnl = sum(p.profit for p in all_pos)
+            account   = trader.get_account()
+            equity    = account.get("equity", account.get("balance", 0))
+            risk_pct  = float(self._trade_cfg.get("risk_pct", 0.5)) / 100
+            risk_per_trade = equity * risk_pct
+            return total_pnl / risk_per_trade if risk_per_trade > 0 else 0.0
+        except Exception:
+            return 0.0
+
     def _manage_open_position(self) -> None:
         """Bar-by-bar T1 partial, trail stop, and time stop for open positions."""
         positions = trader.get_positions(self._symbol)
-        if not positions or self._open_entry_price is None or self._open_sl is None:
+        if not positions:
             return
 
-        pos       = positions[0]
+        pos = positions[0]
+
+        # Recover entry state from MT5 position data if internal state was lost (e.g. restart)
+        if self._open_entry_price is None:
+            self._open_entry_price = pos.price_open
+            self._open_sl          = pos.sl if pos.sl > 0 else None
+            self._open_tp          = pos.tp if pos.tp > 0 else None
+            if self._open_sl is not None:
+                logger.info("[%s] Position state recovered from MT5: entry=%.5f sl=%.5f",
+                            self.name, self._open_entry_price, self._open_sl)
+                self._save_position_state()
+
+        if self._open_sl is None:
+            return
+
         entry     = self._open_entry_price
         init_sl   = self._open_sl        # never changed — used for all R calculations
         risk_dist = abs(entry - init_sl)
@@ -821,12 +850,17 @@ class TradingEngine(Component):
             h4_bias       = h4_bias,
         )
 
+        # Portfolio P&L in R units: sum of all open positions' floating P&L
+        # divided by the per-trade risk. Protects gains by tightening losers.
+        portfolio_pnl_r = self._portfolio_pnl_r()
+
         action = self._trade_manager.evaluate(
             position           = pos_state,
             df_m15             = df_m15_struct,
             df_m5              = df_m5,
             df_m1              = df_m1,
             news_confirmed_dir = news_dir,
+            portfolio_pnl_r    = portfolio_pnl_r,
         )
 
         account = trader.get_account()
@@ -883,6 +917,33 @@ class TradingEngine(Component):
                 self._manage_open_position()
 
                 if self._block_entry:
+                    continue
+
+                # Scale-in: when signal confirms a profitable position, add a unit
+                if desired == current and current != 0 and not getattr(self, "_scaled_in", False):
+                    if self._open_entry_price is not None and self._open_sl is not None:
+                        risk_dist = abs(self._open_entry_price - self._open_sl)
+                        tick_now  = mt5.symbol_info_tick(self._symbol)
+                        cur_price = (tick_now.bid + tick_now.ask) / 2.0 if tick_now else 0.0
+                        if risk_dist > 0 and cur_price > 0:
+                            cur_r = (
+                                (self._open_entry_price - cur_price) / risk_dist if current == -1
+                                else (cur_price - self._open_entry_price) / risk_dist
+                            )
+                            if cur_r >= 0.5:  # position at 0.5R+ profit — add to winner
+                                account = trader.get_account()
+                                equity  = account["equity"] if "equity" in account else account["balance"]
+                                _, _, lots = self._size_order(current, equity, 0.5)  # 50% size add-on
+                                sl_add = self._open_sl   # same SL as original
+                                if not self._dry_run:
+                                    ok = trader.place_order(self._symbol, current, lots, sl=sl_add)
+                                    if ok:
+                                        self._scaled_in = True
+                                        logger.info("[%s] SCALE-IN: +%.2f lots at %.5f (cur_r=%.2f)",
+                                                    self.name, lots, cur_price, cur_r)
+                                else:
+                                    logger.info("[%s] DRY RUN SCALE-IN: %.2f lots (cur_r=%.2f)",
+                                                self.name, lots, cur_r)
                     continue
 
                 if desired == current:

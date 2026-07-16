@@ -149,6 +149,7 @@ class TradeManager:
         df_m5:              Optional[pd.DataFrame] = None,
         df_m1:              Optional[pd.DataFrame] = None,
         news_confirmed_dir: int = 0,
+        portfolio_pnl_r:    float = 0.0,
     ) -> TradeAction:
         """Evaluate all signals and return a single concrete action for this bar."""
         counter      = 0.0
@@ -239,6 +240,19 @@ class TradeManager:
         sweep_risk = 0.0
         if df_m5 is not None and len(df_m5) >= 15:
             sweep_risk = detect_sweep_recovery(df_m5, pos_dir, atr=atr_m5)
+
+        # ── Portfolio P&L gate ────────────────────────────────────────────────
+        # When the portfolio is winning overall and this position is losing,
+        # exit sooner to protect accumulated gains.
+        cur_r = position.current_r
+        if portfolio_pnl_r >= 1.0 and cur_r < -0.3:
+            # Portfolio up 1R+, this trade losing — cut it now, don't wait for counter
+            c = max(c, self._exit_thresh)
+            reasons.append(f"portfolio_gate(pnl={portfolio_pnl_r:.1f}R pos={cur_r:.1f}R):force_exit")
+        elif portfolio_pnl_r >= 0.5 and cur_r < -0.2:
+            # Portfolio up 0.5R+, this trade losing — tighten exit threshold
+            reasons.append(f"portfolio_gate(pnl={portfolio_pnl_r:.1f}R):exit_thresh-2")
+            c = max(c, self._exit_thresh - 2)
 
         reason_str = " | ".join(reasons) if reasons else "no_signals"
         return self._select_action(
