@@ -89,6 +89,12 @@ _CORR_GROUPS: list[set] = [
     {"XAUUSD", "XAGUSD"},                                       # metals
 ]
 
+# Max concurrent SAME-direction positions within a correlation group.
+# Monte Carlo autopsy: correlated same-dir clustering is the #1 blow-up cause
+# (worst day: 17 stacked losers = -17R). Cap of 3 strips clustered losers while
+# keeping winners — lowers blow rate AND slightly raises pass rate.
+MAX_SAME_DIR_CLUSTER = 3
+
 STRATEGY_MAP = {
     "sniper":          SniperStrategy,
     "london_breakout": LondonBreakoutStrategy,
@@ -712,6 +718,35 @@ class TradingEngine(Component):
                     return True
         return False
 
+    def _correlation_cluster_cap(self, signal_dir: int) -> bool:
+        """Return True if the correlation group already holds the max SAME-direction
+        concurrent positions — block this entry to prevent loser clustering.
+
+        Monte Carlo autopsy: the #1 blow-up cause is correlated same-direction
+        trades losing together on one day (worst historical day: 17 stacked losers
+        = -17R). Capping concurrent same-dir positions per group attacks that
+        directly without giving up edge (it strips clustered losers, keeps winners).
+        """
+        group = next((g for g in _CORR_GROUPS if self._symbol in g), None)
+        if group is None:
+            return False
+        same_dir = 0
+        for peer in group:
+            if peer == self._symbol:
+                continue
+            for pos in (mt5.positions_get(symbol=peer) or []):
+                peer_dir = 1 if pos.type == mt5.ORDER_TYPE_BUY else -1
+                if peer_dir == signal_dir:
+                    same_dir += 1
+        if same_dir >= MAX_SAME_DIR_CLUSTER:
+            logger.info(
+                "[%s] CORR CLUSTER CAP: %d peers already %s in group (max %d) — blocked",
+                self.name, same_dir, "LONG" if signal_dir == 1 else "SHORT",
+                MAX_SAME_DIR_CLUSTER,
+            )
+            return True
+        return False
+
     def _portfolio_pnl_r(self) -> float:
         """Return total portfolio floating P&L in R units (risk_pct of equity per trade)."""
         try:
@@ -1089,6 +1124,10 @@ class TradingEngine(Component):
 
                     # ── Correlation divergence gate ───────────────────────────
                     if self._correlation_divergence(desired):
+                        continue
+
+                    # ── Correlation cluster cap (same-direction) ──────────────
+                    if self._correlation_cluster_cap(desired):
                         continue
 
                     open_count = len(mt5.positions_get() or [])
