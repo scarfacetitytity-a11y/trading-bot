@@ -356,10 +356,10 @@ class TestTradingEngineGates:
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def _deal(pid, entry, profit=0.0, *, symbol="XAUUSD", price=2000.0, t=1000,
-          magic=234001, swap=0.0, commission=0.0):
+          magic=234001, swap=0.0, commission=0.0, comment=""):
     return types.SimpleNamespace(
         position_id=pid, entry=entry, profit=profit, symbol=symbol, price=price,
-        time=t, magic=magic, swap=swap, commission=commission,
+        time=t, magic=magic, swap=swap, commission=commission, comment=comment,
     )
 
 
@@ -420,6 +420,51 @@ class TestTradeReconciler:
             assert ra.record_trade.call_count == 1
 
         # reset shared stub so later tests aren't affected
+        _mt5_stub.positions_get.return_value = []
+        _mt5_stub.history_deals_get.return_value = []
+
+    def test_scalein_folds_into_one_trade(self, tmp_path):
+        reg = HeartbeatRegistry()
+        kill = threading.Event()
+        ra, ft, jr = MagicMock(), MagicMock(), MagicMock()
+
+        with patch.object(TradeReconciler, "STATE_FILE", tmp_path / "rec.json"):
+            rec = TradeReconciler(
+                reg, kill, risk_agent=ra, ftmo_tracker=ft, journal=jr,
+                magic=234001, risk_pct=1.0, initial_equity=10_000,
+            )
+            acct = MagicMock(); acct.equity = 10_000
+            _mt5_stub.account_info.return_value = acct
+            _mt5_stub.positions_get.return_value = []
+            _mt5_stub.history_deals_get.return_value = []
+            rec._reconcile()  # seed (empty)
+
+            # Child 201 (opened with comment si:200) still OPEN → parent not recorded.
+            _mt5_stub.positions_get.return_value = [_pos(201)]
+            _mt5_stub.history_deals_get.return_value = [
+                _deal(200, _mt5_stub.DEAL_ENTRY_IN),
+                _deal(200, _mt5_stub.DEAL_ENTRY_OUT, 100.0),
+                _deal(201, _mt5_stub.DEAL_ENTRY_IN, comment="si:200"),
+            ]
+            rec._reconcile()
+            ra.record_trade.assert_not_called()   # group not fully flat yet
+
+            # Now the child closes too → ONE record, R = (100+50)/100 = +1.5R.
+            _mt5_stub.positions_get.return_value = []
+            _mt5_stub.history_deals_get.return_value = [
+                _deal(200, _mt5_stub.DEAL_ENTRY_IN),
+                _deal(200, _mt5_stub.DEAL_ENTRY_OUT, 100.0),
+                _deal(201, _mt5_stub.DEAL_ENTRY_IN, comment="si:200"),
+                _deal(201, _mt5_stub.DEAL_ENTRY_OUT, 50.0),
+            ]
+            rec._reconcile()
+            assert ra.record_trade.call_count == 1
+            assert ra.record_trade.call_args[0][0] == pytest.approx(1.5)
+
+            # Rescan → child 201 already marked, no double-count.
+            rec._reconcile()
+            assert ra.record_trade.call_count == 1
+
         _mt5_stub.positions_get.return_value = []
         _mt5_stub.history_deals_get.return_value = []
 

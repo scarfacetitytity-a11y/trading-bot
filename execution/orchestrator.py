@@ -521,6 +521,8 @@ class TradeReconciler(Component):
         self._risk_pct       = float(risk_pct) / 100
         self._initial_equity = float(initial_equity)
         self._recorded: set  = set()
+        self._child_to_parent: dict = {}   # scale-in child pos_id → parent pos_id
+        self._lock           = threading.Lock()
         self._seeded         = self.STATE_FILE.exists()
         self._load_state()
 
@@ -540,8 +542,27 @@ class TradeReconciler(Component):
         except Exception:
             pass
 
+    @staticmethod
+    def _scalein_parent(deal) -> Optional[int]:
+        """If this is a scale-in add-on's opening deal, return its parent pos_id.
+
+        Scale-in orders are tagged with comment 'si:<parent_position_id>' so a
+        logical trade that was added to records as ONE trade, not two."""
+        if deal.entry != mt5.DEAL_ENTRY_IN:
+            return None
+        c = (getattr(deal, "comment", "") or "")
+        if c.startswith("si:"):
+            try:
+                return int(c[3:])
+            except ValueError:
+                return None
+        return None
+
     def _closed_position_deals(self) -> dict:
-        """Return {position_id: [deals]} for fully-closed bot positions."""
+        """Return {parent_position_id: [deals]} for fully-closed logical trades.
+
+        Scale-in add-ons are folded into their parent so one idea = one record.
+        A group is 'closed' only when the parent AND every child is flat."""
         now   = datetime.now()
         # Upper bound is generous: MT5 filters on SERVER time, which can lead the
         # local clock (FTMO is EET). A tight bound would exclude a just-closed
@@ -550,32 +571,58 @@ class TradeReconciler(Component):
         deals = mt5.history_deals_get(now - timedelta(days=3), now + timedelta(days=1))
         if not deals:
             return {}
+        bot_deals = [d for d in deals if d.magic == self._magic]
+
+        # Build scale-in child → parent map from IN-deal comments.
+        self._child_to_parent = {}
+        for d in bot_deals:
+            parent = self._scalein_parent(d)
+            if parent is not None:
+                self._child_to_parent[d.position_id] = parent
+
         live = {p.identifier for p in (mt5.positions_get() or []) if p.magic == self._magic}
+
+        # Group deals under the parent (children fold in).
         by_pos: dict = {}
-        for d in deals:
-            if d.magic != self._magic:
-                continue
-            by_pos.setdefault(d.position_id, []).append(d)
-        # Keep only positions that have an OUT deal and are no longer open
+        for d in bot_deals:
+            pid = self._child_to_parent.get(d.position_id, d.position_id)
+            by_pos.setdefault(pid, []).append(d)
+
+        def group_live(parent_pid: int) -> bool:
+            if parent_pid in live:
+                return True
+            return any(c in live for c, p in self._child_to_parent.items() if p == parent_pid)
+
         return {
             pid: dl for pid, dl in by_pos.items()
-            if pid not in live
+            if not group_live(pid)
             and any(d.entry in (mt5.DEAL_ENTRY_OUT, mt5.DEAL_ENTRY_OUT_BY) for d in dl)
         }
 
+    def _mark_recorded(self, parent_pid: int) -> None:
+        """Record the parent and all its scale-in children as done."""
+        self._recorded.add(parent_pid)
+        for child, parent in self._child_to_parent.items():
+            if parent == parent_pid:
+                self._recorded.add(child)
+
     def _reconcile(self) -> None:
         closed = self._closed_position_deals()
-        if not closed:
-            return
 
-        # First run with no prior state: baseline existing closes without
-        # recording them, so only closes AFTER startup are counted.
+        # First run with no prior state: baseline whatever is already closed
+        # (possibly nothing) so only closes AFTER startup are counted. This must
+        # run even when `closed` is empty — otherwise the first real close on a
+        # fresh deploy would be seeded (suppressed) instead of recorded.
         if not self._seeded:
-            self._recorded.update(closed.keys())
+            for pid in closed:
+                self._mark_recorded(pid)
             self._seeded = True
             self._save_state()
             logger.info("[TradeReconciler] Seeded %d pre-existing closed positions (baseline)",
                         len(self._recorded))
+            return
+
+        if not closed:
             return
 
         info        = mt5.account_info()
@@ -603,22 +650,35 @@ class TradeReconciler(Component):
                 except Exception:
                     logger.exception("[TradeReconciler] journal close failed for %s", symbol)
 
-            self._recorded.add(pos_id)
+            self._mark_recorded(pos_id)
             new = True
-            logger.info("[TradeReconciler] Recorded close pos=%s %s R=%.2f pnl=%.2f",
-                        pos_id, symbol, r_mult, realized)
+            n_children = sum(1 for p in self._child_to_parent.values() if p == pos_id)
+            logger.info("[TradeReconciler] Recorded close pos=%s %s R=%.2f pnl=%.2f%s",
+                        pos_id, symbol, r_mult, realized,
+                        f" (+{n_children} scale-in)" if n_children else "")
 
         if new:
             self._save_state()
 
-    def run(self) -> None:
-        while not self._stop.is_set() and not self.kill_switch.is_set():
+    def reconcile_now(self) -> None:
+        """Record any just-closed positions synchronously (called from the
+        execution loop on close, so a following opposite entry sees the result).
+        Deduped by position_id, so the background loop never re-records."""
+        with self._lock:
             try:
                 self._reconcile()
-                self.beat(f"tracked={len(self._recorded)}")
-            except Exception as exc:
-                self.registry.fail(self.name, str(exc))
-                logger.exception("[TradeReconciler] Error: %s", exc)
+            except Exception:
+                logger.exception("[TradeReconciler] reconcile_now failed")
+
+    def run(self) -> None:
+        while not self._stop.is_set() and not self.kill_switch.is_set():
+            with self._lock:
+                try:
+                    self._reconcile()
+                    self.beat(f"tracked={len(self._recorded)}")
+                except Exception as exc:
+                    self.registry.fail(self.name, str(exc))
+                    logger.exception("[TradeReconciler] Error: %s", exc)
             time.sleep(self.CHECK_INTERVAL)
 
 
@@ -640,6 +700,8 @@ class TradingEngine(Component):
         soft_halt_event: Optional[threading.Event] = None,
         dry_run: bool = False,
         journal: Optional["TradeJournal"] = None,
+        reconciler: Optional["TradeReconciler"] = None,
+        risk_guard: Optional["RiskGuard"] = None,
     ):
         name = f"TradingEngine[{symbol}]"
         tf_secs = _TF_SECONDS.get(tf_str, 3600)
@@ -654,6 +716,8 @@ class TradingEngine(Component):
         self._soft_halt        = soft_halt_event
         self._dry_run          = dry_run
         self._journal          = journal
+        self._reconciler       = reconciler
+        self._risk_guard       = risk_guard
         self._lookback         = trade_cfg.get("lookback_bars", 500)
         self._news_gate:        Optional[ng.NewsGate] = None
         self._event_dir_cache: dict[str, int] = {}
@@ -787,6 +851,12 @@ class TradingEngine(Component):
         self._pending_bars      = 0
         self._state_file.unlink(missing_ok=True)
 
+    def _record_close_now(self) -> None:
+        """Record a just-closed position immediately via the reconciler so a
+        following opposite entry's risk gate sees the outcome (no 30s lag)."""
+        if self._reconciler is not None and not self._dry_run:
+            self._reconciler.reconcile_now()
+
     def _detect_post_event_direction(
         self, event_time: datetime, window_min: float = 15.0, threshold_pct: float = 0.10
     ) -> int:
@@ -865,8 +935,7 @@ class TradingEngine(Component):
         if action.action == ActionType.EXIT:
             if not self._dry_run:
                 trader.close_all(self._symbol)
-                # Outcome accounting is handled centrally by TradeReconciler
-                # (deal-history based), not here.
+                self._record_close_now()   # prompt, deduped accounting
             self._reset_position_state()
             self._block_entry = True
 
@@ -1068,6 +1137,7 @@ class TradingEngine(Component):
                 logger.warning("[%s] Time stop: %d bars elapsed — closing", self.name, ts_bars)
                 if not self._dry_run:
                     trader.close_all(self._symbol)
+                    self._record_close_now()   # prompt, deduped accounting
                 self._reset_position_state()
                 self._block_entry = True   # skip new entry on this bar
                 return
@@ -1090,7 +1160,7 @@ class TradingEngine(Component):
                     )
                     if not self._dry_run:
                         trader.close_all(self._symbol)
-                        # Outcome accounting is handled centrally by TradeReconciler.
+                        self._record_close_now()   # prompt, deduped accounting
                     self._reset_position_state()
                     self._block_entry = True
                 else:
@@ -1265,8 +1335,14 @@ class TradingEngine(Component):
                                     continue
                                 _, _, lots = self._size_order(current, equity, 0.5)  # 50% size add-on
                                 sl_add = self._open_sl   # same SL as original
+                                # Tag with parent position id so the reconciler folds
+                                # this add-on into the original trade (one idea = one
+                                # recorded trade, not two).
+                                parent_positions = trader.get_positions(self._symbol)
+                                parent_pid = parent_positions[0].identifier if parent_positions else 0
                                 if not self._dry_run:
-                                    ok = trader.place_order(self._symbol, current, lots, sl=sl_add)
+                                    ok = trader.place_order(self._symbol, current, lots,
+                                                            sl=sl_add, comment=f"si:{parent_pid}")
                                     if ok:
                                         self._scaled_in = True
                                         logger.info("[%s] SCALE-IN: +%.2f lots at %.5f (cur_r=%.2f)",
@@ -1289,8 +1365,9 @@ class TradingEngine(Component):
                                     "LONG" if current == 1 else "SHORT")
                     else:
                         trader.close_all(self._symbol)
-                        # Outcome accounting (R, FTMO trade-day, journal close) is
-                        # handled centrally by TradeReconciler from deal history.
+                        # Record the close NOW (deduped) so the opposite entry below
+                        # sees the outcome in its risk gate — no async lag.
+                        self._record_close_now()
                         self._reset_position_state()
 
                 # Open new position — gate through soft halt, RiskAgent, FTMOTracker
@@ -1355,10 +1432,11 @@ class TradingEngine(Component):
                         if ftmo_status["total_dd_pct"] >= ftmo_status["total_dd_limit"]:
                             logger.critical("[%s] FTMO total DD limit — blocking entry", self.name)
                             continue
-                        # Daily DD: measured from the persisted day-start equity so it
-                        # survives restarts, checked against the FTMO daily limit.
-                        day_start = getattr(self._risk_agent.state, "daily_start_equity", 0.0)
-                        if day_start > 0:
+                        # Daily DD: measured from RiskGuard's SERVER-day baseline —
+                        # the single source of truth for the daily reference, so this
+                        # gate and the RiskGuard breaker never disagree at rollover.
+                        day_start = getattr(self._risk_guard, "_day_start_equity", None) if self._risk_guard else None
+                        if day_start:
                             daily_dd = (day_start - equity) / day_start * 100
                             if daily_dd >= ftmo_status["daily_dd_limit"]:
                                 logger.critical("[%s] FTMO daily DD %.2f%% >= %.1f%% — blocking entry",
@@ -1552,24 +1630,33 @@ class Orchestrator:
         account = mt5.account_info()
         tg.notify_startup(self._symbols, self.dry_run, account.equity if account else 0.0)
 
+        # Build the shared risk components first so the engines can reference them:
+        #  - RiskGuard owns the single server-day daily baseline (engines read it)
+        #  - TradeReconciler is the single outcome recorder (engines trigger it
+        #    synchronously on close)
+        risk_guard = RiskGuard(
+            self.registry, self.kill_switch,
+            soft_halt_event=self.soft_halt,
+            initial_equity=self._ftmo_tracker.state.initial_equity,
+            symbols=self._symbols,
+        )
+        reconciler = TradeReconciler(
+            self.registry, self.kill_switch,
+            risk_agent=self._risk_agent,
+            ftmo_tracker=self._ftmo_tracker,
+            journal=self._journal,
+            magic=self._trade_cfg.get("magic", 234001),
+            risk_pct=self._trade_cfg.get("risk_pct", 1.0),
+            initial_equity=self._ftmo_tracker.state.initial_equity,
+        )
+        self._risk_guard = risk_guard
+        self._reconciler = reconciler
+
         components: list[Component] = [
             MT5Monitor(self.registry, self.kill_switch, self._terminal_path),
             DataWatcher(self.registry, self.kill_switch, self._symbols, self._tf_str),
-            RiskGuard(
-                self.registry, self.kill_switch,
-                soft_halt_event=self.soft_halt,
-                initial_equity=self._ftmo_tracker.state.initial_equity,
-                symbols=self._symbols,
-            ),
-            TradeReconciler(
-                self.registry, self.kill_switch,
-                risk_agent=self._risk_agent,
-                ftmo_tracker=self._ftmo_tracker,
-                journal=self._journal,
-                magic=self._trade_cfg.get("magic", 234001),
-                risk_pct=self._trade_cfg.get("risk_pct", 1.0),
-                initial_equity=self._ftmo_tracker.state.initial_equity,
-            ),
+            risk_guard,
+            reconciler,
         ]
 
         for symbol in self._symbols:
@@ -1585,6 +1672,8 @@ class Orchestrator:
                 soft_halt_event=self.soft_halt,
                 dry_run=self.dry_run,
                 journal=self._journal,
+                reconciler=reconciler,
+                risk_guard=risk_guard,
             )
             engine._news_gate = self._news_gate
             components.append(engine)
