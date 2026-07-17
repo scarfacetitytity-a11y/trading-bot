@@ -1306,17 +1306,24 @@ class TradingEngine(Component):
                 atr_m = float((df_mgmt["high"] - df_mgmt["low"]).rolling(14).mean().iloc[-1])
             live_sl = pos.sl if pos.sl > 0 else current_sl
             live_tp = pos.tp if pos.tp > 0 else (self._open_tp or 0.0)
+            bank_r = float(self._trade_cfg.get("bank_tp_r", 0.0)) if self._adaptive_port else 0.0
             mdec = analyze_manage(
                 df=df_mgmt, direction=pos_dir, entry=entry, initial_sl=init_sl,
                 current_sl=live_sl, current_tp=live_tp, price=mid_price,
-                atr=atr_m, trade_type=ttype, cur_r=cur_r,
+                atr=atr_m, trade_type=ttype, cur_r=cur_r, bank_min_r=bank_r,
             )
             apply_sl = mdec.new_sl if (mdec.new_sl is not None and (
                 (pos_dir == 1 and mdec.new_sl > live_sl + 1e-8) or
                 (pos_dir == -1 and mdec.new_sl < live_sl - 1e-8))) else None
-            apply_tp = mdec.new_tp if (mdec.new_tp is not None and (
+            # Extend-out always allowed; bank-IN allowed only when gated and the
+            # nearer TP still sits in profit beyond current price (never a loss).
+            _extend_ok = mdec.new_tp is not None and (
                 (pos_dir == 1 and mdec.new_tp > live_tp) or
-                (pos_dir == -1 and mdec.new_tp < live_tp))) else None
+                (pos_dir == -1 and mdec.new_tp < live_tp))
+            _bank_ok = mdec.new_tp is not None and "bank_tp" in (mdec.reason or "") and (
+                (pos_dir == 1 and mid_price < mdec.new_tp) or
+                (pos_dir == -1 and mid_price > mdec.new_tp))
+            apply_tp = mdec.new_tp if (_extend_ok or _bank_ok) else None
             if (apply_sl is not None or apply_tp is not None) and not self._dry_run:
                 trader.modify_sl_tp(self._symbol, pos.ticket,
                                     new_sl=apply_sl if apply_sl is not None else live_sl,

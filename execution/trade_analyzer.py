@@ -377,6 +377,7 @@ def manage_trade(
     atr:        float,
     trade_type: str,
     cur_r:      float,
+    bank_min_r: float = 0.0,
 ) -> ManageDecision:
     """Adaptive per-type management. Moves the stop to new structure as the trade
     develops (tighten-only) and extends the target to the next draw when price
@@ -429,6 +430,23 @@ def manage_trade(
             if extends:
                 dec.new_tp = round(nxt, 6)
                 dec.reason = (dec.reason + " | " if dec.reason else "") + f"extend_tp@{src}"
+
+    # ── 4. Bank-in (behaviour 4) — pull TP to a NEARER draw when deep in profit ──
+    # Opt-in (bank_min_r>0) and guarded: only when well in profit and a real pool
+    # sits ahead but closer than the current far target, so we bank at liquidity
+    # instead of risking a full round-trip. Cuts a winner short by design — the
+    # bank_min_r threshold is UNVALIDATED; tune it against the bar-level sim
+    # before enabling live (edge-sensitive; see backtest-reality-gap).
+    if bank_min_r > 0 and cur_r >= bank_min_r and dec.new_tp is None:
+        nxt, src, _ = _find_target(df, direction, price, atr)
+        if nxt is not None:
+            ahead  = (direction == 1 and nxt > price + 0.1 * rdist) or \
+                     (direction == -1 and nxt < price - 0.1 * rdist)
+            nearer = (direction == 1 and nxt < current_tp) or \
+                     (direction == -1 and nxt > current_tp)
+            if ahead and nearer:
+                dec.new_tp = round(nxt, 6)
+                dec.reason = (dec.reason + " | " if dec.reason else "") + f"bank_tp@{src}"
 
     return dec
 
