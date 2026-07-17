@@ -36,6 +36,9 @@ class _FTMOState:
     peak_equity:      float
     trade_days:       list = field(default_factory=list)   # ISO dates with at least 1 trade
     daily_pnl:        dict = field(default_factory=dict)   # date → pnl (for Best Day Rule)
+    day_start_equity: float = 0.0                          # equity at start of current day
+    day_start_date:   str   = ""                           # date the above was anchored
+    last_equity:      float = 0.0                          # most recent recorded close
 
     @classmethod
     def new(cls, equity: float, profit_target_pct: float) -> "_FTMOState":
@@ -84,9 +87,15 @@ class FTMOTracker:
         s = self.state
         if today not in s.trade_days:
             s.trade_days.append(today)
-        if equity_close is not None and s.daily_pnl.get(today) is None:
-            prev_equity = s.initial_equity if len(s.trade_days) <= 1 else s.peak_equity
-            s.daily_pnl[today] = equity_close - prev_equity
+        if equity_close is not None:
+            # Anchor today's baseline to the equity carried from the previous
+            # recorded day (its close), NOT to peak equity — peak overstates the
+            # daily loss and corrupts the 1-Step Best Day Rule.
+            if s.day_start_date != today:
+                s.day_start_equity = s.last_equity if s.last_equity else s.initial_equity
+                s.day_start_date   = today
+            s.daily_pnl[today] = equity_close - s.day_start_equity
+            s.last_equity      = equity_close
         self._save()
 
     def check(self, current_equity: float) -> dict:

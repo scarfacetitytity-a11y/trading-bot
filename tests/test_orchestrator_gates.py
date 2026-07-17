@@ -41,11 +41,16 @@ _mt5_stub.TIMEFRAME_H4  = 240
 _mt5_stub.TIMEFRAME_D1  = 1440
 _mt5_stub.TIMEFRAME_W1  = 10080
 _mt5_stub.TIMEFRAME_MN1 = 43200
+_mt5_stub.DEAL_ENTRY_IN     = 0
+_mt5_stub.DEAL_ENTRY_OUT    = 1
+_mt5_stub.DEAL_ENTRY_INOUT  = 2
+_mt5_stub.DEAL_ENTRY_OUT_BY = 3
 _mt5_stub.account_info    = MagicMock()
 _mt5_stub.symbol_info     = MagicMock()
 _mt5_stub.symbol_info_tick = MagicMock()
 _mt5_stub.copy_rates_from_pos = MagicMock()
 _mt5_stub.positions_get   = MagicMock(return_value=[])
+_mt5_stub.history_deals_get = MagicMock(return_value=[])
 sys.modules.setdefault("MetaTrader5", _mt5_stub)
 
 # Stub config and other optional imports so tests don't need them on disk
@@ -68,7 +73,7 @@ for _mod in ("config.settings", "config.logging_setup",
         sys.modules[_mod] = _stub
 
 from execution.orchestrator import (
-    HeartbeatRegistry, RiskGuard, TradingEngine, Status,
+    HeartbeatRegistry, RiskGuard, TradingEngine, TradeReconciler, Status,
     MAX_DAILY_LOSS_PCT, SOFT_DD_HALT_PCT, MAX_TOTAL_LOSS_PCT,
 )
 from execution.risk_agent import RiskAgent, RiskConfig
@@ -244,18 +249,19 @@ class TestRiskGuardTiers:
         registry    = HeartbeatRegistry()
         kill_switch = threading.Event()
         soft_halt   = threading.Event()
-        guard = RiskGuard(registry, kill_switch, soft_halt)
-        guard._day_start_equity    = 10_000.0
-        guard._session_start_equity = 10_000.0
-        guard._today               = 99          # prevent date-reset branch
+        guard = RiskGuard(registry, kill_switch, soft_halt,
+                          initial_equity=10_000.0, symbols=["XAUUSD"])
+        guard._day_start_equity = 10_000.0
+        guard._server_day       = "2026-01-01"   # prevent new-day reset branch
         return guard, kill_switch, soft_halt
 
     def _run_once(self, guard, equity):
         """Simulate one iteration of the guard's check logic (extracted)."""
         kill_switch = guard.kill_switch
         soft_halt   = guard._soft_halt
-        daily_pct   = (equity - guard._day_start_equity)   / guard._day_start_equity * 100
-        total_pct   = (equity - guard._session_start_equity) / guard._session_start_equity * 100
+        daily_pct   = (equity - guard._day_start_equity) / guard._day_start_equity * 100
+        # Total loss is measured from the STATIC initial balance (restart-safe).
+        total_pct   = (equity - guard._initial_equity) / guard._initial_equity * 100
 
         if daily_pct <= -MAX_DAILY_LOSS_PCT:
             soft_halt.set()
@@ -343,6 +349,155 @@ class TestTradingEngineGates:
         _run_one_bar(engine, kill, signal=0)  # flat signal
 
         trader_mod.place_order.assert_not_called()
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# TradeReconciler — deal-history accounting (C4)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _deal(pid, entry, profit=0.0, *, symbol="XAUUSD", price=2000.0, t=1000,
+          magic=234001, swap=0.0, commission=0.0, comment=""):
+    return types.SimpleNamespace(
+        position_id=pid, entry=entry, profit=profit, symbol=symbol, price=price,
+        time=t, magic=magic, swap=swap, commission=commission, comment=comment,
+    )
+
+
+def _pos(pid, magic=234001):
+    return types.SimpleNamespace(identifier=pid, magic=magic)
+
+
+class TestTradeReconciler:
+    """Deal-history is the single source of truth: seed, record-once, dedup, partials."""
+
+    def test_seed_record_dedup_and_partial(self, tmp_path):
+        reg = HeartbeatRegistry()
+        kill = threading.Event()
+        ra, ft, jr = MagicMock(), MagicMock(), MagicMock()
+
+        with patch.object(TradeReconciler, "STATE_FILE", tmp_path / "rec.json"):
+            rec = TradeReconciler(
+                reg, kill, risk_agent=ra, ftmo_tracker=ft, journal=jr,
+                magic=234001, risk_pct=1.0, initial_equity=10_000,
+            )
+            acct = MagicMock(); acct.equity = 10_000
+            _mt5_stub.account_info.return_value = acct
+            _mt5_stub.positions_get.return_value = []
+
+            # Batch 1 — a pre-existing closed position: seeding must suppress it.
+            _mt5_stub.history_deals_get.return_value = [
+                _deal(100, _mt5_stub.DEAL_ENTRY_IN),
+                _deal(100, _mt5_stub.DEAL_ENTRY_OUT, -50.0),
+            ]
+            rec._reconcile()
+            ra.record_trade.assert_not_called()
+
+            # Batch 2 — a newly closed position 101: recorded exactly once, with
+            # R = net profit / (initial × risk_pct) = 200 / 100 = +2.0R.
+            _mt5_stub.history_deals_get.return_value = [
+                _deal(100, _mt5_stub.DEAL_ENTRY_IN),
+                _deal(100, _mt5_stub.DEAL_ENTRY_OUT, -50.0),
+                _deal(101, _mt5_stub.DEAL_ENTRY_IN),
+                _deal(101, _mt5_stub.DEAL_ENTRY_OUT, 200.0, price=2010.0),
+            ]
+            rec._reconcile()
+            assert ra.record_trade.call_count == 1
+            assert ra.record_trade.call_args[0][0] == pytest.approx(2.0)
+            ft.record_trade_day.assert_called_once()
+            jr.close_trade.assert_called_once()
+
+            # Batch 3 — rescan with no new closes: no double-count.
+            rec._reconcile()
+            assert ra.record_trade.call_count == 1
+
+            # Batch 4 — position 102 still open (partial close): must NOT record.
+            _mt5_stub.positions_get.return_value = [_pos(102)]
+            _mt5_stub.history_deals_get.return_value = [
+                _deal(102, _mt5_stub.DEAL_ENTRY_IN),
+                _deal(102, _mt5_stub.DEAL_ENTRY_OUT, 30.0),
+            ]
+            rec._reconcile()
+            assert ra.record_trade.call_count == 1
+
+        # reset shared stub so later tests aren't affected
+        _mt5_stub.positions_get.return_value = []
+        _mt5_stub.history_deals_get.return_value = []
+
+    def test_scalein_folds_into_one_trade(self, tmp_path):
+        reg = HeartbeatRegistry()
+        kill = threading.Event()
+        ra, ft, jr = MagicMock(), MagicMock(), MagicMock()
+
+        with patch.object(TradeReconciler, "STATE_FILE", tmp_path / "rec.json"):
+            rec = TradeReconciler(
+                reg, kill, risk_agent=ra, ftmo_tracker=ft, journal=jr,
+                magic=234001, risk_pct=1.0, initial_equity=10_000,
+            )
+            acct = MagicMock(); acct.equity = 10_000
+            _mt5_stub.account_info.return_value = acct
+            _mt5_stub.positions_get.return_value = []
+            _mt5_stub.history_deals_get.return_value = []
+            rec._reconcile()  # seed (empty)
+
+            # Child 201 (opened with comment si:200) still OPEN → parent not recorded.
+            _mt5_stub.positions_get.return_value = [_pos(201)]
+            _mt5_stub.history_deals_get.return_value = [
+                _deal(200, _mt5_stub.DEAL_ENTRY_IN),
+                _deal(200, _mt5_stub.DEAL_ENTRY_OUT, 100.0),
+                _deal(201, _mt5_stub.DEAL_ENTRY_IN, comment="si:200"),
+            ]
+            rec._reconcile()
+            ra.record_trade.assert_not_called()   # group not fully flat yet
+
+            # Now the child closes too → ONE record, R = (100+50)/100 = +1.5R.
+            _mt5_stub.positions_get.return_value = []
+            _mt5_stub.history_deals_get.return_value = [
+                _deal(200, _mt5_stub.DEAL_ENTRY_IN),
+                _deal(200, _mt5_stub.DEAL_ENTRY_OUT, 100.0),
+                _deal(201, _mt5_stub.DEAL_ENTRY_IN, comment="si:200"),
+                _deal(201, _mt5_stub.DEAL_ENTRY_OUT, 50.0),
+            ]
+            rec._reconcile()
+            assert ra.record_trade.call_count == 1
+            assert ra.record_trade.call_args[0][0] == pytest.approx(1.5)
+
+            # Rescan → child 201 already marked, no double-count.
+            rec._reconcile()
+            assert ra.record_trade.call_count == 1
+
+        _mt5_stub.positions_get.return_value = []
+        _mt5_stub.history_deals_get.return_value = []
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Safety check — real-account block (M3 regression)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestSafetyCheck:
+    """The real-account guard must fire unless allow_real_account is explicitly set."""
+
+    def _orch(self, allow_real):
+        from execution.orchestrator import Orchestrator
+        o = object.__new__(Orchestrator)          # bypass heavy __init__
+        o.cfg = {"trading": {"allow_real_account": allow_real}}
+        return o
+
+    def _account(self, trade_mode):
+        acct = MagicMock()
+        acct.trade_mode = trade_mode
+        _mt5_stub.account_info.return_value = acct
+
+    def test_real_account_blocked_by_default(self):
+        self._account(_mt5_stub.ACCOUNT_TRADE_MODE_REAL)
+        assert self._orch(allow_real=False)._safety_check() is False
+
+    def test_real_account_allowed_when_flag_set(self):
+        self._account(_mt5_stub.ACCOUNT_TRADE_MODE_REAL)
+        assert self._orch(allow_real=True)._safety_check() is True
+
+    def test_demo_account_allowed(self):
+        self._account(_mt5_stub.ACCOUNT_TRADE_MODE_DEMO)
+        assert self._orch(allow_real=False)._safety_check() is True
 
 
 # ═══════════════════════════════════════════════════════════════════════════════

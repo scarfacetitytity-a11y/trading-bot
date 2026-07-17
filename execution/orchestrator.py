@@ -345,16 +345,71 @@ class DataWatcher(Component):
 # ── Risk Guard ───────────────────────────────────────────────────────────────
 
 class RiskGuard(Component):
-    """Enforces Council limits: 2% daily halt, 7% soft halt, 9.5% hard kill."""
+    """Enforces Council limits: 2% daily halt, 7% soft halt, 9.5% hard kill.
+
+    Drawdown references are FTMO-correct and restart-safe:
+      - TOTAL loss is measured from a STATIC initial balance (persisted), never
+        from session-start equity. A restart mid-drawdown cannot move the floor,
+        so the hard kill always fires at the true FTMO distance.
+      - DAILY loss is measured from the equity at the start of the current
+        broker-SERVER trading day (FTMO resets at server midnight, not local
+        midnight), persisted so a restart reloads the baseline rather than
+        re-anchoring it to a mid-day, possibly already-drawn-down equity.
+
+    A daily-only halt is cleared at the next server day; a cumulative halt is
+    sticky until the cumulative drawdown recovers above the soft threshold.
+    """
 
     CHECK_INTERVAL = 60
+    STATE_FILE = Path("logs") / "risk_guard_state.json"
 
-    def __init__(self, registry, kill_switch, soft_halt_event: threading.Event):
+    def __init__(
+        self,
+        registry,
+        kill_switch,
+        soft_halt_event: threading.Event,
+        initial_equity: float,
+        symbols: list,
+    ):
         super().__init__("RiskGuard", registry, kill_switch, beat_timeout=180)
-        self._soft_halt       = soft_halt_event
+        self._soft_halt        = soft_halt_event
+        self._initial_equity   = float(initial_equity)   # STATIC FTMO floor reference
+        self._symbols          = symbols
         self._day_start_equity: Optional[float] = None
-        self._session_start_equity: Optional[float] = None
-        self._today: Optional[int] = None
+        self._server_day:       Optional[str]   = None
+        self._halt_cause:       Optional[str]   = None   # "daily" | "cumulative"
+        self._load_state()
+
+    def _load_state(self) -> None:
+        try:
+            if self.STATE_FILE.exists():
+                d = json.loads(self.STATE_FILE.read_text())
+                self._day_start_equity = d.get("day_start_equity")
+                self._server_day       = d.get("server_day")
+                self._halt_cause       = d.get("halt_cause")
+        except Exception:
+            pass
+
+    def _save_state(self) -> None:
+        try:
+            self.STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+            self.STATE_FILE.write_text(json.dumps({
+                "day_start_equity": self._day_start_equity,
+                "server_day":       self._server_day,
+                "halt_cause":       self._halt_cause,
+                "initial_equity":   self._initial_equity,
+            }))
+        except Exception:
+            pass
+
+    def _current_server_day(self) -> str:
+        """Broker-server calendar day. FTMO's daily loss resets at server midnight;
+        MT5 tick.time is server time expressed as a UTC epoch."""
+        for sym in self._symbols:
+            tick = mt5.symbol_info_tick(sym)
+            if tick is not None and tick.time:
+                return datetime.utcfromtimestamp(tick.time).strftime("%Y-%m-%d")
+        return datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
     def run(self) -> None:
         while not self._stop.is_set() and not self.kill_switch.is_set():
@@ -364,52 +419,274 @@ class RiskGuard(Component):
                 time.sleep(self.CHECK_INTERVAL)
                 continue
 
-            equity = info.equity
-            today  = datetime.now().day
+            equity     = info.equity
+            server_day = self._current_server_day()
 
-            if today != self._today:
-                self._today            = today
+            # Total loss from the STATIC initial balance — never trails, never resets.
+            total_pct = (
+                (equity - self._initial_equity) / self._initial_equity * 100
+                if self._initial_equity else 0.0
+            )
+
+            # New broker-server day → re-anchor the daily baseline. Clear a
+            # DAILY-only halt if cumulative drawdown is healthy; keep cumulative
+            # halts sticky.
+            if server_day != self._server_day:
+                self._server_day       = server_day
                 self._day_start_equity = equity
-                # Clear daily halt on new day — soft halt persists until manual reset
-                logger.info("[RiskGuard] New day — equity=%.2f", equity)
+                if (self._soft_halt.is_set() and self._halt_cause == "daily"
+                        and total_pct > -SOFT_DD_HALT_PCT):
+                    self._soft_halt.clear()
+                    self._halt_cause = None
+                    logger.info("[RiskGuard] New server day %s — daily halt cleared, baseline=%.2f",
+                                server_day, equity)
+                else:
+                    logger.info("[RiskGuard] New server day %s — daily baseline=%.2f",
+                                server_day, equity)
+                self._save_state()
 
-            if self._session_start_equity is None:
-                self._session_start_equity = equity
-                logger.info("[RiskGuard] Session start equity=%.2f", equity)
+            if self._day_start_equity is None:
+                self._day_start_equity = equity
+                self._save_state()
 
             daily_pct = (
                 (equity - self._day_start_equity) / self._day_start_equity * 100
                 if self._day_start_equity else 0.0
             )
-            total_pct = (
-                (equity - self._session_start_equity) / self._session_start_equity * 100
-                if self._session_start_equity else 0.0
-            )
 
             msg = (f"eq={equity:.2f} daily={daily_pct:+.2f}% total={total_pct:+.2f}%"
                    f"{' [SOFT-HALT]' if self._soft_halt.is_set() else ''}")
 
-            # Tier 1: daily circuit breaker — halt new entries for rest of day
-            if daily_pct <= -MAX_DAILY_LOSS_PCT:
-                if not self._soft_halt.is_set():
-                    logger.critical("[RiskGuard] DAILY CIRCUIT BREAKER: %.2f%% — no new entries today", daily_pct)
-                    self._soft_halt.set()
+            # Tier 1: daily circuit breaker — halt new entries for rest of server day
+            if daily_pct <= -MAX_DAILY_LOSS_PCT and not self._soft_halt.is_set():
+                logger.critical("[RiskGuard] DAILY CIRCUIT BREAKER: %.2f%% — no new entries today", daily_pct)
+                self._soft_halt.set()
+                self._halt_cause = "daily"
+                self._save_state()
 
-            # Tier 2: soft halt — cumulative 7%, halt new entries
+            # Tier 2: soft halt — cumulative 7% from initial, halt new entries
             if total_pct <= -SOFT_DD_HALT_PCT:
                 if not self._soft_halt.is_set():
-                    logger.critical("[RiskGuard] SOFT HALT: cumulative %.2f%% — no new entries until manual reset", total_pct)
+                    logger.critical("[RiskGuard] SOFT HALT: cumulative %.2f%% from initial — no new entries", total_pct)
                     self._soft_halt.set()
+                self._halt_cause = "cumulative"   # promote: survives the day boundary
+                self._save_state()
 
-            # Tier 3: hard kill — 9.5% cumulative, emergency stop
+            # Tier 3: hard kill — 9.5% cumulative from initial, emergency stop
             if total_pct <= -MAX_TOTAL_LOSS_PCT:
-                kill_msg = f"HARD KILL: cumulative {total_pct:.2f}% — FTMO breach imminent"
+                kill_msg = f"HARD KILL: cumulative {total_pct:.2f}% from initial — FTMO breach imminent"
                 logger.critical("[RiskGuard] %s", kill_msg)
                 self.registry.halt(self.name, kill_msg)
                 self.kill_switch.set()
                 return
 
             self.beat(msg)
+            time.sleep(self.CHECK_INTERVAL)
+
+
+# ── Trade Reconciler ─────────────────────────────────────────────────────────
+
+class TradeReconciler(Component):
+    """Single source of truth for trade-outcome accounting.
+
+    Polls MT5 deal history for CLOSED positions tagged with our magic — whether
+    closed by broker-side SL/TP, an engine close, or manually — and records each
+    exactly once into RiskAgent, FTMOTracker, and the TradeJournal.
+
+    This replaces the previous inline recording in the execution loop, which:
+      1. never saw broker-side SL/TP closes (the most common outcome), because
+         those close server-side and the signal loop only recorded on its own
+         close path; and
+      2. fed RiskAgent a bogus '(equity - balance) / balance' value that was
+         neither an R multiple nor sign-correct (other symbols' floating P&L
+         contaminated it).
+
+    Realized R is computed from the position's actual net profit (profit + swap
+    + commission across all its deals) divided by the intended per-trade risk
+    (initial_balance × risk_pct). Deduplicated by position_id and persisted so a
+    restart never double-counts.
+    """
+
+    CHECK_INTERVAL = 30
+    STATE_FILE = Path("logs") / "reconciler_state.json"
+
+    def __init__(
+        self,
+        registry,
+        kill_switch,
+        risk_agent: RiskAgent,
+        ftmo_tracker,
+        journal,
+        magic: int,
+        risk_pct: float,
+        initial_equity: float,
+    ):
+        super().__init__("TradeReconciler", registry, kill_switch, beat_timeout=120)
+        self._risk_agent     = risk_agent
+        self._ftmo           = ftmo_tracker
+        self._journal        = journal
+        self._magic          = int(magic)
+        self._risk_pct       = float(risk_pct) / 100
+        self._initial_equity = float(initial_equity)
+        self._recorded: set  = set()
+        self._child_to_parent: dict = {}   # scale-in child pos_id → parent pos_id
+        self._lock           = threading.Lock()
+        self._seeded         = self.STATE_FILE.exists()
+        self._load_state()
+
+    def _load_state(self) -> None:
+        try:
+            if self.STATE_FILE.exists():
+                self._recorded = set(json.loads(self.STATE_FILE.read_text()).get("recorded", []))
+        except Exception:
+            pass
+
+    def _save_state(self) -> None:
+        try:
+            self.STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+            keep = sorted(self._recorded)[-2000:]   # cap growth
+            self._recorded = set(keep)
+            self.STATE_FILE.write_text(json.dumps({"recorded": keep}))
+        except Exception:
+            pass
+
+    @staticmethod
+    def _scalein_parent(deal) -> Optional[int]:
+        """If this is a scale-in add-on's opening deal, return its parent pos_id.
+
+        Scale-in orders are tagged with comment 'si:<parent_position_id>' so a
+        logical trade that was added to records as ONE trade, not two."""
+        if deal.entry != mt5.DEAL_ENTRY_IN:
+            return None
+        c = (getattr(deal, "comment", "") or "")
+        if c.startswith("si:"):
+            try:
+                return int(c[3:])
+            except ValueError:
+                return None
+        return None
+
+    def _closed_position_deals(self) -> dict:
+        """Return {parent_position_id: [deals]} for fully-closed logical trades.
+
+        Scale-in add-ons are folded into their parent so one idea = one record.
+        A group is 'closed' only when the parent AND every child is flat."""
+        now   = datetime.now()
+        # Upper bound is generous: MT5 filters on SERVER time, which can lead the
+        # local clock (FTMO is EET). A tight bound would exclude a just-closed
+        # deal until the local clock caught up — a multi-hour delay that defeats
+        # prompt SL-hit reaction. Dedup by position_id makes the wide window safe.
+        deals = mt5.history_deals_get(now - timedelta(days=3), now + timedelta(days=1))
+        if not deals:
+            return {}
+        bot_deals = [d for d in deals if d.magic == self._magic]
+
+        # Build scale-in child → parent map from IN-deal comments.
+        self._child_to_parent = {}
+        for d in bot_deals:
+            parent = self._scalein_parent(d)
+            if parent is not None:
+                self._child_to_parent[d.position_id] = parent
+
+        live = {p.identifier for p in (mt5.positions_get() or []) if p.magic == self._magic}
+
+        # Group deals under the parent (children fold in).
+        by_pos: dict = {}
+        for d in bot_deals:
+            pid = self._child_to_parent.get(d.position_id, d.position_id)
+            by_pos.setdefault(pid, []).append(d)
+
+        def group_live(parent_pid: int) -> bool:
+            if parent_pid in live:
+                return True
+            return any(c in live for c, p in self._child_to_parent.items() if p == parent_pid)
+
+        return {
+            pid: dl for pid, dl in by_pos.items()
+            if not group_live(pid)
+            and any(d.entry in (mt5.DEAL_ENTRY_OUT, mt5.DEAL_ENTRY_OUT_BY) for d in dl)
+        }
+
+    def _mark_recorded(self, parent_pid: int) -> None:
+        """Record the parent and all its scale-in children as done."""
+        self._recorded.add(parent_pid)
+        for child, parent in self._child_to_parent.items():
+            if parent == parent_pid:
+                self._recorded.add(child)
+
+    def _reconcile(self) -> None:
+        closed = self._closed_position_deals()
+
+        # First run with no prior state: baseline whatever is already closed
+        # (possibly nothing) so only closes AFTER startup are counted. This must
+        # run even when `closed` is empty — otherwise the first real close on a
+        # fresh deploy would be seeded (suppressed) instead of recorded.
+        if not self._seeded:
+            for pid in closed:
+                self._mark_recorded(pid)
+            self._seeded = True
+            self._save_state()
+            logger.info("[TradeReconciler] Seeded %d pre-existing closed positions (baseline)",
+                        len(self._recorded))
+            return
+
+        if not closed:
+            return
+
+        info        = mt5.account_info()
+        equity      = info.equity if info else self._initial_equity
+        risk_amount = self._initial_equity * self._risk_pct
+        new = False
+
+        for pos_id, dlist in closed.items():
+            if pos_id in self._recorded:
+                continue
+            realized = sum(d.profit + d.swap + d.commission for d in dlist)
+            r_mult   = realized / risk_amount if risk_amount > 0 else 0.0
+            last_out = max(
+                (d for d in dlist if d.entry in (mt5.DEAL_ENTRY_OUT, mt5.DEAL_ENTRY_OUT_BY)),
+                key=lambda d: d.time,
+            )
+            symbol = last_out.symbol
+
+            self._risk_agent.record_trade(r_mult, equity)
+            if self._ftmo is not None:
+                self._ftmo.record_trade_day(equity)
+            if self._journal is not None:
+                try:
+                    self._journal.close_trade(symbol, last_out.price, equity)
+                except Exception:
+                    logger.exception("[TradeReconciler] journal close failed for %s", symbol)
+
+            self._mark_recorded(pos_id)
+            new = True
+            n_children = sum(1 for p in self._child_to_parent.values() if p == pos_id)
+            logger.info("[TradeReconciler] Recorded close pos=%s %s R=%.2f pnl=%.2f%s",
+                        pos_id, symbol, r_mult, realized,
+                        f" (+{n_children} scale-in)" if n_children else "")
+
+        if new:
+            self._save_state()
+
+    def reconcile_now(self) -> None:
+        """Record any just-closed positions synchronously (called from the
+        execution loop on close, so a following opposite entry sees the result).
+        Deduped by position_id, so the background loop never re-records."""
+        with self._lock:
+            try:
+                self._reconcile()
+            except Exception:
+                logger.exception("[TradeReconciler] reconcile_now failed")
+
+    def run(self) -> None:
+        while not self._stop.is_set() and not self.kill_switch.is_set():
+            with self._lock:
+                try:
+                    self._reconcile()
+                    self.beat(f"tracked={len(self._recorded)}")
+                except Exception as exc:
+                    self.registry.fail(self.name, str(exc))
+                    logger.exception("[TradeReconciler] Error: %s", exc)
             time.sleep(self.CHECK_INTERVAL)
 
 
@@ -431,6 +708,8 @@ class TradingEngine(Component):
         soft_halt_event: Optional[threading.Event] = None,
         dry_run: bool = False,
         journal: Optional["TradeJournal"] = None,
+        reconciler: Optional["TradeReconciler"] = None,
+        risk_guard: Optional["RiskGuard"] = None,
     ):
         name = f"TradingEngine[{symbol}]"
         tf_secs = _TF_SECONDS.get(tf_str, 3600)
@@ -445,6 +724,8 @@ class TradingEngine(Component):
         self._soft_halt        = soft_halt_event
         self._dry_run          = dry_run
         self._journal          = journal
+        self._reconciler       = reconciler
+        self._risk_guard       = risk_guard
         self._lookback         = trade_cfg.get("lookback_bars", 500)
         self._news_gate:        Optional[ng.NewsGate] = None
         self._event_dir_cache: dict[str, int] = {}
@@ -584,7 +865,10 @@ class TradingEngine(Component):
             sl, tp   = risk.calculate_sl_tp(self._symbol, direction, self._trade_cfg)
 
         lots = raw_lots if atr_sized else risk.calculate_lots(self._symbol, self._trade_cfg, balance)
-        lots = round(lots * size_mult, 2)
+        lots = lots * size_mult
+        # Clamp to broker min/max/step on BOTH paths (H2 — the ATR path previously
+        # bypassed this and could exceed volume_max or violate volume_step).
+        lots = risk._clamp_lots(self._symbol, lots)
         lots = max(lots, 0.01)
 
         return sl, tp, lots
@@ -600,6 +884,12 @@ class TradingEngine(Component):
         self._pending_signal    = 0
         self._pending_bars      = 0
         self._state_file.unlink(missing_ok=True)
+
+    def _record_close_now(self) -> None:
+        """Record a just-closed position immediately via the reconciler so a
+        following opposite entry's risk gate sees the outcome (no 30s lag)."""
+        if self._reconciler is not None and not self._dry_run:
+            self._reconciler.reconcile_now()
 
     def _detect_post_event_direction(
         self, event_time: datetime, window_min: float = 15.0, threshold_pct: float = 0.10
@@ -678,13 +968,8 @@ class TradingEngine(Component):
 
         if action.action == ActionType.EXIT:
             if not self._dry_run:
-                tick     = mt5.symbol_info_tick(self._symbol)
-                close_px = tick.bid if pos_dir == 1 else tick.ask
                 trader.close_all(self._symbol)
-                if self._ftmo_tracker is not None:
-                    self._ftmo_tracker.record_trade_day(equity)
-                if self._journal is not None:
-                    self._journal.close_trade(self._symbol, close_px, equity)
+                self._record_close_now()   # prompt, deduped accounting
             self._reset_position_state()
             self._block_entry = True
 
@@ -733,7 +1018,8 @@ class TradingEngine(Component):
         for peer in group:
             if peer == self._symbol:
                 continue
-            peer_positions = mt5.positions_get(symbol=peer)
+            peer_positions = [p for p in (mt5.positions_get(symbol=peer) or [])
+                              if p.magic == trader._MAGIC]
             if not peer_positions:
                 continue
             for pos in peer_positions:
@@ -797,7 +1083,7 @@ class TradingEngine(Component):
     def _portfolio_pnl_r(self) -> float:
         """Return total portfolio floating P&L in R units (risk_pct of equity per trade)."""
         try:
-            all_pos = mt5.positions_get() or []
+            all_pos = trader.get_all_positions()   # magic-filtered — bot positions only
             total_pnl = sum(p.profit for p in all_pos)
             account   = trader.get_account()
             equity    = account.get("equity", account.get("balance", 0))
@@ -806,6 +1092,47 @@ class TradingEngine(Component):
             return total_pnl / risk_per_trade if risk_per_trade > 0 else 0.0
         except Exception:
             return 0.0
+
+    def _open_portfolio_risk_pct(self, equity: float) -> float:
+        """Aggregate at-risk amount across all open bot positions, as % of equity.
+
+        Risk per position = distance to its current SL × point value × volume.
+        A position trailed to break-even or better contributes ~0. Positions with
+        no stop are charged the configured per-trade risk as a conservative proxy.
+        """
+        if equity <= 0:
+            return 0.0
+        fallback_risk = equity * (float(self._trade_cfg.get("risk_pct", 1.0)) / 100)
+        total_risk = 0.0
+        for p in trader.get_all_positions():
+            if not p.sl or p.sl <= 0:
+                total_risk += fallback_risk
+                continue
+            info = mt5.symbol_info(p.symbol)
+            if info is None or info.trade_tick_size <= 0 or info.point <= 0:
+                total_risk += fallback_risk
+                continue
+            point_value_per_lot = info.trade_tick_value / info.trade_tick_size * info.point
+            direction = 1 if p.type == mt5.ORDER_TYPE_BUY else -1
+            # Only the adverse distance counts; SL beyond entry (locked profit) = 0 risk
+            adverse = (p.price_open - p.sl) if direction == 1 else (p.sl - p.price_open)
+            if adverse <= 0:
+                continue
+            sl_points = adverse / info.point
+            total_risk += sl_points * point_value_per_lot * p.volume
+        return total_risk / equity * 100
+
+    def _tighten_all_sl(self, new_sl: float, direction: int) -> None:
+        """Move SL to new_sl on every bot position for this symbol, only where it
+        tightens (protects scaled-in add-ons that share this symbol — H4)."""
+        for p in trader.get_positions(self._symbol):
+            cur = p.sl
+            tighter = (
+                (direction == 1  and (cur <= 0 or new_sl > cur + 1e-8)) or
+                (direction == -1 and (cur <= 0 or new_sl < cur - 1e-8))
+            )
+            if tighter and not self._dry_run:
+                trader.modify_sl_tp(self._symbol, p.ticket, new_sl=new_sl, new_tp=p.tp)
 
     def _manage_open_position(self) -> None:
         """Bar-by-bar T1 partial, trail stop, and time stop for open positions."""
@@ -857,7 +1184,7 @@ class TradingEngine(Component):
                 logger.info("[%s] T1 hit @ %.5f — partial close %.0f%%", self.name, mid_price, t1_pct * 100)
                 if not self._dry_run:
                     trader.partial_close(pos, t1_pct)
-                    trader.modify_sl_tp(self._symbol, pos.ticket, new_sl=entry, new_tp=pos.tp)
+                    self._tighten_all_sl(entry, 1 if pos.type == mt5.ORDER_TYPE_BUY else -1)
                 self._t1_hit = True
                 current_sl   = entry  # reflect BE move for trail logic below
 
@@ -875,8 +1202,7 @@ class TradingEngine(Component):
                 else:
                     new_sl = current_sl
                 if new_sl > current_sl + 1e-8:
-                    if not self._dry_run:
-                        trader.modify_sl_tp(self._symbol, pos.ticket, new_sl=new_sl, new_tp=pos.tp)
+                    self._tighten_all_sl(new_sl, 1)   # protects scaled-in add-ons too
                     logger.info("[%s] Trail SL: %.5f -> %.5f (long)", self.name, current_sl, new_sl)
 
             elif pos.type == mt5.ORDER_TYPE_SELL:
@@ -887,8 +1213,7 @@ class TradingEngine(Component):
                 else:
                     new_sl = current_sl
                 if new_sl < current_sl - 1e-8:
-                    if not self._dry_run:
-                        trader.modify_sl_tp(self._symbol, pos.ticket, new_sl=new_sl, new_tp=pos.tp)
+                    self._tighten_all_sl(new_sl, -1)   # protects scaled-in add-ons too
                     logger.info("[%s] Trail SL: %.5f -> %.5f (short)", self.name, current_sl, new_sl)
 
         # ── Adaptive structural management (per trade type) ──
@@ -933,6 +1258,7 @@ class TradingEngine(Component):
                 logger.warning("[%s] Time stop: %d bars elapsed — closing", self.name, ts_bars)
                 if not self._dry_run:
                     trader.close_all(self._symbol)
+                    self._record_close_now()   # prompt, deduped accounting
                 self._reset_position_state()
                 self._block_entry = True   # skip new entry on this bar
                 return
@@ -954,15 +1280,8 @@ class TradingEngine(Component):
                         confirmed_dir, event_names,
                     )
                     if not self._dry_run:
-                        account  = trader.get_account()
-                        equity   = account.get("equity", account.get("balance", 0))
-                        tick     = mt5.symbol_info_tick(self._symbol)
-                        close_px = tick.bid if pos_dir == 1 else tick.ask
                         trader.close_all(self._symbol)
-                        if self._ftmo_tracker is not None:
-                            self._ftmo_tracker.record_trade_day(equity)
-                        if self._journal is not None:
-                            self._journal.close_trade(self._symbol, close_px, equity)
+                        self._record_close_now()   # prompt, deduped accounting
                     self._reset_position_state()
                     self._block_entry = True
                 else:
@@ -1127,10 +1446,24 @@ class TradingEngine(Component):
                             if cur_r >= 0.5:  # position at 0.5R+ profit — add to winner
                                 account = trader.get_account()
                                 equity  = account["equity"] if "equity" in account else account["balance"]
+                                # Gate scale-in on remaining portfolio risk budget (C3)
+                                max_port   = float(self._trade_cfg.get("max_portfolio_risk_pct", 4.0))
+                                open_risk  = self._open_portfolio_risk_pct(equity)
+                                add_risk   = float(self._trade_cfg.get("risk_pct", 1.0)) * 0.5
+                                if open_risk + add_risk > max_port:
+                                    logger.info("[%s] SCALE-IN skipped: portfolio risk %.2f%% + %.2f%% > cap %.2f%%",
+                                                self.name, open_risk, add_risk, max_port)
+                                    continue
                                 _, _, lots = self._size_order(current, equity, 0.5)  # 50% size add-on
                                 sl_add = self._open_sl   # same SL as original
+                                # Tag with parent position id so the reconciler folds
+                                # this add-on into the original trade (one idea = one
+                                # recorded trade, not two).
+                                parent_positions = trader.get_positions(self._symbol)
+                                parent_pid = parent_positions[0].identifier if parent_positions else 0
                                 if not self._dry_run:
-                                    ok = trader.place_order(self._symbol, current, lots, sl=sl_add)
+                                    ok = trader.place_order(self._symbol, current, lots,
+                                                            sl=sl_add, comment=f"si:{parent_pid}")
                                     if ok:
                                         self._scaled_in = True
                                         logger.info("[%s] SCALE-IN: +%.2f lots at %.5f (cur_r=%.2f)",
@@ -1152,17 +1485,11 @@ class TradingEngine(Component):
                         logger.info("[%s] DRY RUN: close %s", self.name,
                                     "LONG" if current == 1 else "SHORT")
                     else:
-                        tick = mt5.symbol_info_tick(self._symbol)
-                        close_px = tick.bid if current == 1 else tick.ask
                         trader.close_all(self._symbol)
-                        if self._open_entry_price is not None:
-                            r_mult = (equity - account["balance"]) / account["balance"]
-                            self._risk_agent.record_trade(r_mult, equity)
-                            if self._ftmo_tracker is not None:
-                                self._ftmo_tracker.record_trade_day(equity)
-                            if self._journal is not None:
-                                self._journal.close_trade(self._symbol, close_px, equity)
-                            self._reset_position_state()
+                        # Record the close NOW (deduped) so the opposite entry below
+                        # sees the outcome in its risk gate — no async lag.
+                        self._record_close_now()
+                        self._reset_position_state()
 
                 # Open new position — gate through soft halt, RiskAgent, FTMOTracker
                 if desired != 0:
@@ -1216,7 +1543,7 @@ class TradingEngine(Component):
                     if self._correlation_cluster_cap(desired):
                         continue
 
-                    open_count = len(mt5.positions_get() or [])
+                    open_count = len(trader.get_all_positions())   # magic-filtered (H3)
                     can_trade, size_mult, reason = self._risk_agent.pre_trade_check(
                         equity, open_count
                     )
@@ -1224,12 +1551,22 @@ class TradingEngine(Component):
                         logger.warning("[%s] RiskAgent blocked: %s", self.name, reason)
                         continue
 
-                    # FTMO daily DD check (Compliance #05 pre-trade gate)
+                    # FTMO compliance pre-trade gate (#05) — both total AND daily DD
                     if self._ftmo_tracker is not None:
                         ftmo_status = self._ftmo_tracker.check(equity)
                         if ftmo_status["total_dd_pct"] >= ftmo_status["total_dd_limit"]:
                             logger.critical("[%s] FTMO total DD limit — blocking entry", self.name)
                             continue
+                        # Daily DD: measured from RiskGuard's SERVER-day baseline —
+                        # the single source of truth for the daily reference, so this
+                        # gate and the RiskGuard breaker never disagree at rollover.
+                        day_start = getattr(self._risk_guard, "_day_start_equity", None) if self._risk_guard else None
+                        if day_start:
+                            daily_dd = (day_start - equity) / day_start * 100
+                            if daily_dd >= ftmo_status["daily_dd_limit"]:
+                                logger.critical("[%s] FTMO daily DD %.2f%% >= %.1f%% — blocking entry",
+                                                self.name, daily_dd, ftmo_status["daily_dd_limit"])
+                                continue
 
                     # Score-based sizing: psychology_mult * score_mult * concentration_mult
                     _sc          = getattr(self._strategy, "_scores", None)
@@ -1256,9 +1593,28 @@ class TradingEngine(Component):
                     score_mult   = _size_mult_from_score(signal_score) if signal_score > 0 else 1.0
                     # Concentration mult: fewer concurrent positions = more size per trade
                     # 0-1 open → 2x  |  2-3 open → 1.5x  |  4+ open → 1x
-                    n_open = len(mt5.positions_get() or [])
+                    n_open = len(trader.get_all_positions())   # magic-filtered (H3)
                     concentration_mult = 2.0 if n_open <= 1 else (1.5 if n_open <= 3 else 1.0)
                     combined_mult = size_mult * score_mult * concentration_mult
+
+                    # ── Portfolio aggregate risk cap (Council #03/#05) ─────────
+                    # Bound this entry so total open risk never exceeds the daily
+                    # budget. Sizing multipliers (score × concentration × scale-in)
+                    # stacked with no cap could otherwise put >5% at risk at once.
+                    max_port  = float(self._trade_cfg.get("max_portfolio_risk_pct", 4.0))
+                    open_risk = self._open_portfolio_risk_pct(equity)
+                    new_risk  = float(self._trade_cfg.get("risk_pct", 1.0)) * combined_mult
+                    room      = max_port - open_risk
+                    if room <= 0.1:
+                        logger.warning("[%s] PORTFOLIO RISK CAP: open=%.2f%% >= cap %.2f%% — entry blocked",
+                                       self.name, open_risk, max_port)
+                        continue
+                    if new_risk > room:
+                        scale = room / new_risk
+                        combined_mult *= scale
+                        logger.info("[%s] Portfolio cap: new-trade risk %.2f%% > room %.2f%% — scaled x%.3f",
+                                    self.name, new_risk, room, scale)
+
                     sl, tp, lots = self._size_order(desired, account["balance"], combined_mult)
 
                     # ── Liquidity thesis gate: no clean draw within reach = no trade ──
@@ -1430,10 +1786,33 @@ class Orchestrator:
         account = mt5.account_info()
         tg.notify_startup(self._symbols, self.dry_run, account.equity if account else 0.0)
 
+        # Build the shared risk components first so the engines can reference them:
+        #  - RiskGuard owns the single server-day daily baseline (engines read it)
+        #  - TradeReconciler is the single outcome recorder (engines trigger it
+        #    synchronously on close)
+        risk_guard = RiskGuard(
+            self.registry, self.kill_switch,
+            soft_halt_event=self.soft_halt,
+            initial_equity=self._ftmo_tracker.state.initial_equity,
+            symbols=self._symbols,
+        )
+        reconciler = TradeReconciler(
+            self.registry, self.kill_switch,
+            risk_agent=self._risk_agent,
+            ftmo_tracker=self._ftmo_tracker,
+            journal=self._journal,
+            magic=self._trade_cfg.get("magic", 234001),
+            risk_pct=self._trade_cfg.get("risk_pct", 1.0),
+            initial_equity=self._ftmo_tracker.state.initial_equity,
+        )
+        self._risk_guard = risk_guard
+        self._reconciler = reconciler
+
         components: list[Component] = [
             MT5Monitor(self.registry, self.kill_switch, self._terminal_path),
             DataWatcher(self.registry, self.kill_switch, self._symbols, self._tf_str),
-            RiskGuard(self.registry, self.kill_switch, soft_halt_event=self.soft_halt),
+            risk_guard,
+            reconciler,
         ]
 
         for symbol in self._symbols:
@@ -1449,6 +1828,8 @@ class Orchestrator:
                 soft_halt_event=self.soft_halt,
                 dry_run=self.dry_run,
                 journal=self._journal,
+                reconciler=reconciler,
+                risk_guard=risk_guard,
             )
             engine._news_gate = self._news_gate
             components.append(engine)
