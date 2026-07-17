@@ -1704,15 +1704,26 @@ class TradingEngine(Component):
                                             news_ctx.fired_summary(self._symbol))
                                 signal_score += news_mod
 
-                    # ── Quality bar (fix #4): high-conviction only, both directions ──
-                    # Bidirectional stays — but no more minimum-score chasing. A short
-                    # must be a HIGH-score short at a real level, or we pass.
-                    min_entry_score = int(self._trade_cfg.get(
-                        "min_entry_score", self._trade_cfg.get("score_funded", 5)))
-                    if signal_score < min_entry_score:
-                        logger.info("[%s] LOW CONVICTION skip: %s score=%d < min %d",
+                    # ── Trend-aware quality bar (fix #4) ──────────────────────
+                    # Bidirectional stays. The bar is NOT a flat score-6 on every
+                    # trade — that would miss too much. With-trend (aligned to the
+                    # H4 bias) clears a normal bar; a COUNTER-trend trade (e.g. an
+                    # index short into an up-bias) must be genuinely high-conviction.
+                    base_min    = int(self._trade_cfg.get("min_entry_score", 5))
+                    counter_min = int(self._trade_cfg.get("min_entry_score_counter", 6))
+                    try:
+                        h4_bias = (self._strategy.current_h4_bias(df)
+                                   if hasattr(self._strategy, "current_h4_bias")
+                                   else getattr(self._strategy, "_last_h4_bias", 0))
+                    except Exception:
+                        h4_bias = 0
+                    against_trend = (h4_bias != 0 and desired != h4_bias)
+                    needed = counter_min if against_trend else base_min
+                    if signal_score < needed:
+                        logger.info("[%s] LOW CONVICTION skip: %s score=%d < %d (%s)",
                                     self.name, "BUY" if desired == 1 else "SELL",
-                                    signal_score, min_entry_score)
+                                    signal_score, needed,
+                                    "counter-trend" if against_trend else "with-trend")
                         continue
 
                     score_mult   = _size_mult_from_score(signal_score) if signal_score > 0 else 1.0
