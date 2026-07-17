@@ -26,6 +26,11 @@ import random
 import sys
 from pathlib import Path
 
+try:
+    sys.stdout.reconfigure(encoding="utf-8")   # Windows cp1252 console safety
+except Exception:
+    pass
+
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from backtests.run_ftmo_sim import INSTRUMENTS
@@ -94,7 +99,7 @@ def main():
 
     # One-at-a-time sensitivity
     for param, values in GRID.items():
-        print(f"\n── {param} ──")
+        print(f"\n-- {param} --")
         for v in values:
             cfg = dict(BASELINE)
             cfg[param] = v
