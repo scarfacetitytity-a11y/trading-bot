@@ -409,7 +409,7 @@ class RiskGuard(Component):
         for sym in self._symbols:
             tick = mt5.symbol_info_tick(sym)
             if tick is not None and tick.time:
-                return datetime.utcfromtimestamp(tick.time).strftime("%Y-%m-%d")
+                return datetime.fromtimestamp(tick.time, timezone.utc).strftime("%Y-%m-%d")
         return datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
     def run(self) -> None:
