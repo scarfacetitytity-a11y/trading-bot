@@ -61,6 +61,7 @@ from strategies.aiden_index import AiDENIndexStrategy
 from execution.risk_agent import RiskAgent, RiskConfig
 from execution.ftmo_tracker import FTMOTracker
 from execution.trade_journal import TradeJournal
+from execution.portfolio_manager import PortfolioAllocator, PortfolioBook, OpenPos, Trim
 from execution import telegram_notify as tg
 from backtests.run_multi_instrument import (
     INSTRUMENTS, OPTIMISED_PARAMS, TRAIL_CONFIGS, BIDIRECTIONAL, M15_PARAMS,
@@ -710,6 +711,8 @@ class TradingEngine(Component):
         journal: Optional["TradeJournal"] = None,
         reconciler: Optional["TradeReconciler"] = None,
         risk_guard: Optional["RiskGuard"] = None,
+        allocator: Optional["PortfolioAllocator"] = None,
+        book: Optional["PortfolioBook"] = None,
     ):
         name = f"TradingEngine[{symbol}]"
         tf_secs = _TF_SECONDS.get(tf_str, 3600)
@@ -726,6 +729,9 @@ class TradingEngine(Component):
         self._journal          = journal
         self._reconciler       = reconciler
         self._risk_guard       = risk_guard
+        self._allocator        = allocator
+        self._book             = book
+        self._adaptive_port    = bool(trade_cfg.get("adaptive_portfolio", False))
         self._lookback         = trade_cfg.get("lookback_bars", 500)
         self._news_gate:        Optional[ng.NewsGate] = None
         self._event_dir_cache: dict[str, int] = {}
@@ -1122,6 +1128,77 @@ class TradingEngine(Component):
             total_risk += sl_points * point_value_per_lot * p.volume
         return total_risk / equity * 100
 
+    def _portfolio_snapshot(self, equity: float):
+        """Whole-book view for the allocator: (list[OpenPos], {ticket: (risk_pct, pos)}).
+
+        Per-position risk is distance-to-current-SL in % of equity (0 if at BE+);
+        pnl_r is floating P&L in R; score comes from the shared PortfolioBook."""
+        positions = trader.get_all_positions()
+        if self._book is not None:
+            self._book.prune([p.ticket for p in positions])
+        fallback_pct = float(self._trade_cfg.get("risk_pct", 1.0))
+        book_pos: list = []
+        risk_map: dict = {}
+        for p in positions:
+            direction = 1 if p.type == mt5.ORDER_TYPE_BUY else -1
+            info = mt5.symbol_info(p.symbol)
+            risk_amt = 0.0
+            if p.sl and p.sl > 0 and info and info.trade_tick_size > 0 and info.point > 0:
+                adverse = (p.price_open - p.sl) if direction == 1 else (p.sl - p.price_open)
+                if adverse > 0:
+                    pvpl = info.trade_tick_value / info.trade_tick_size * info.point
+                    risk_amt = (adverse / info.point) * pvpl * p.volume
+                risk_pct = risk_amt / equity * 100 if equity > 0 else 0.0
+            else:
+                risk_pct = fallback_pct
+                risk_amt = equity * fallback_pct / 100
+            pnl_r = (p.profit / risk_amt) if risk_amt > 0 else 0.0
+            score = self._book.score_for(p.ticket) if self._book is not None else 5
+            book_pos.append(OpenPos(symbol=p.symbol, score=score, risk_pct=risk_pct,
+                                    direction=direction, pnl_r=pnl_r, ticket=p.ticket))
+            risk_map[p.ticket] = (risk_pct, p)
+        return book_pos, risk_map
+
+    def _portfolio_daily_guard(self) -> None:
+        """Behaviour 3: actively trim the weakest exposure so open positions can
+        never run the book past the FTMO daily loss limit. Gated off by default."""
+        if not (self._adaptive_port and self._allocator is not None):
+            return
+        try:
+            account = trader.get_account()
+            equity  = account.get("equity", account.get("balance", 0))
+            day_start = getattr(self._risk_guard, "_day_start_equity", None) if self._risk_guard else None
+            if not day_start or equity <= 0:
+                return
+            day_loss_pct = max(0.0, (day_start - equity) / day_start * 100)
+            limit = float(self._trade_cfg.get("ftmo_daily_limit_pct", 5.0))
+            buf   = float(self._trade_cfg.get("daily_guard_buffer_pct", 1.0))
+            book, risk_map = self._portfolio_snapshot(equity)
+            trims = self._allocator.daily_guard(day_loss_pct, book, limit_pct=limit, buffer_pct=buf)
+            if trims:
+                logger.warning("[%s] DAILY GUARD: day loss %.2f%% — shedding %.2f%% open risk",
+                               self.name, day_loss_pct, sum(t.reduce_pct for t in trims))
+                self._execute_trims(trims, risk_map)
+        except Exception as exc:
+            logger.exception("[%s] daily guard error: %s", self.name, exc)
+
+    def _execute_trims(self, trims, risk_map) -> None:
+        """Reduce risk on the given tickets by partial-closing the matching lots."""
+        for t in trims:
+            entry = risk_map.get(t.ticket)
+            if entry is None:
+                continue
+            risk_pct, pos = entry
+            if risk_pct <= 0:
+                continue
+            frac = min(1.0, t.reduce_pct / risk_pct)   # portion of the position to shed
+            if frac <= 0:
+                continue
+            logger.info("[%s] REALLOCATE: trim %s ticket=%s by %.2f%% risk (%.0f%% of lots)",
+                        self.name, t.symbol, t.ticket, t.reduce_pct, frac * 100)
+            if not self._dry_run:
+                trader.partial_close(pos, frac)
+
     def _tighten_all_sl(self, new_sl: float, direction: int) -> None:
         """Move SL to new_sl on every bot position for this symbol, only where it
         tightens (protects scaled-in add-ons that share this symbol — H4)."""
@@ -1396,6 +1473,7 @@ class TradingEngine(Component):
 
                 # Position management — T1 partial, trail, time stop
                 self._block_entry = False
+                self._portfolio_daily_guard()
                 self._manage_open_position()
 
                 if self._block_entry:
@@ -1597,23 +1675,38 @@ class TradingEngine(Component):
                     concentration_mult = 2.0 if n_open <= 1 else (1.5 if n_open <= 3 else 1.0)
                     combined_mult = size_mult * score_mult * concentration_mult
 
-                    # ── Portfolio aggregate risk cap (Council #03/#05) ─────────
-                    # Bound this entry so total open risk never exceeds the daily
-                    # budget. Sizing multipliers (score × concentration × scale-in)
-                    # stacked with no cap could otherwise put >5% at risk at once.
+                    # ── Portfolio risk management (Council #03/#05) ────────────
+                    base_risk = float(self._trade_cfg.get("risk_pct", 1.0))
                     max_port  = float(self._trade_cfg.get("max_portfolio_risk_pct", 4.0))
-                    open_risk = self._open_portfolio_risk_pct(equity)
-                    new_risk  = float(self._trade_cfg.get("risk_pct", 1.0)) * combined_mult
-                    room      = max_port - open_risk
-                    if room <= 0.1:
-                        logger.warning("[%s] PORTFOLIO RISK CAP: open=%.2f%% >= cap %.2f%% — entry blocked",
-                                       self.name, open_risk, max_port)
-                        continue
-                    if new_risk > room:
-                        scale = room / new_risk
-                        combined_mult *= scale
-                        logger.info("[%s] Portfolio cap: new-trade risk %.2f%% > room %.2f%% — scaled x%.3f",
-                                    self.name, new_risk, room, scale)
+                    new_risk  = base_risk * combined_mult
+
+                    if self._adaptive_port and self._allocator is not None:
+                        # ACTIVE allocation (behaviours 1+2): size to remaining
+                        # budget AND quality; if a stronger setup is starved, trim
+                        # weaker/losing open trades to fund it rather than skip.
+                        book, risk_map = self._portfolio_snapshot(equity)
+                        alloc = self._allocator.allocate(signal_score, new_risk, book)
+                        if not alloc.taken:
+                            logger.warning("[%s] ALLOCATOR skip: %s", self.name, alloc.reason)
+                            continue
+                        if alloc.trims:
+                            self._execute_trims(alloc.trims, risk_map)
+                        logger.info("[%s] ALLOCATOR grant %.2f%% (intended %.2f%%) — %s",
+                                    self.name, alloc.granted_pct, new_risk, alloc.reason)
+                        combined_mult = alloc.granted_pct / base_risk if base_risk > 0 else combined_mult
+                    else:
+                        # PASSIVE cap (default): bound the entry to remaining budget.
+                        open_risk = self._open_portfolio_risk_pct(equity)
+                        room      = max_port - open_risk
+                        if room <= 0.1:
+                            logger.warning("[%s] PORTFOLIO RISK CAP: open=%.2f%% >= cap %.2f%% — entry blocked",
+                                           self.name, open_risk, max_port)
+                            continue
+                        if new_risk > room:
+                            scale = room / new_risk
+                            combined_mult *= scale
+                            logger.info("[%s] Portfolio cap: new-trade risk %.2f%% > room %.2f%% — scaled x%.3f",
+                                        self.name, new_risk, room, scale)
 
                     sl, tp, lots = self._size_order(desired, account["balance"], combined_mult)
 
@@ -1681,6 +1774,11 @@ class TradingEngine(Component):
                             self._t1_hit            = False
                             self._bars_since_entry  = 0
                             self._save_position_state()
+                            # Register this trade's quality in the shared book so
+                            # the allocator can weigh it against future setups.
+                            if self._book is not None:
+                                for _p in trader.get_positions(self._symbol):
+                                    self._book.register(_p.ticket, signal_score)
                             if self._journal is not None:
                                 import numpy as np
                                 _atr_series = getattr(self._strategy, "_atr_cache", None)
@@ -1808,6 +1906,15 @@ class Orchestrator:
         self._risk_guard = risk_guard
         self._reconciler = reconciler
 
+        # Shared adaptive allocator + cross-engine quality book (behaviours 1-3).
+        # Gated by trade_cfg['adaptive_portfolio'] inside each engine.
+        self._book  = PortfolioBook()
+        self._alloc = PortfolioAllocator(
+            daily_budget_pct=float(self._trade_cfg.get("max_portfolio_risk_pct", 4.0)),
+            score_edge=int(self._trade_cfg.get("realloc_score_edge", 1)),
+            min_trade_pct=float(self._trade_cfg.get("min_trade_risk_pct", 0.25)),
+        )
+
         components: list[Component] = [
             MT5Monitor(self.registry, self.kill_switch, self._terminal_path),
             DataWatcher(self.registry, self.kill_switch, self._symbols, self._tf_str),
@@ -1830,6 +1937,8 @@ class Orchestrator:
                 journal=self._journal,
                 reconciler=reconciler,
                 risk_guard=risk_guard,
+                allocator=self._alloc,
+                book=self._book,
             )
             engine._news_gate = self._news_gate
             components.append(engine)

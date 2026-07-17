@@ -22,6 +22,7 @@ path unconditionally.
 """
 from __future__ import annotations
 
+import threading
 from dataclasses import dataclass, field
 
 
@@ -54,6 +55,32 @@ class Allocation:
     @property
     def taken(self) -> bool:
         return self.granted_pct > 0
+
+
+class PortfolioBook:
+    """Thread-safe registry of open-trade quality, shared across the per-symbol
+    TradingEngines so the allocator can see the WHOLE book (each engine otherwise
+    only knows its own symbol). Keyed by MT5 position ticket. Self-prunes to the
+    set of live tickets on each read."""
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._by_ticket: dict = {}   # ticket -> score
+
+    def register(self, ticket: int, score: int) -> None:
+        with self._lock:
+            self._by_ticket[int(ticket)] = int(score)
+
+    def score_for(self, ticket: int, default: int = 5) -> int:
+        with self._lock:
+            return self._by_ticket.get(int(ticket), default)
+
+    def prune(self, live_tickets) -> None:
+        live = {int(t) for t in live_tickets}
+        with self._lock:
+            for t in list(self._by_ticket):
+                if t not in live:
+                    del self._by_ticket[t]
 
 
 class PortfolioAllocator:
