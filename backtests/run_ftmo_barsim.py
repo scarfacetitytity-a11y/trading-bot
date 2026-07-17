@@ -96,7 +96,8 @@ def _build_events(data: dict):
 
 # ── One fresh challenge, stepped bar by bar ───────────────────────────────────
 
-def _simulate(events, data, start, end, base_risk, cap, adaptive, alloc, start_idx=0):
+def _simulate(events, data, start, end, base_risk, cap, adaptive, alloc, start_idx=0,
+              guard_buffer=1.0):
     gate = _Gate()
     base = base_risk / 100.0
     open_pos: dict = {}          # symbol -> Pos
@@ -188,7 +189,7 @@ def _simulate(events, data, start, end, base_risk, cap, adaptive, alloc, start_i
             day_loss = max(0.0, (day_start_eq - eq) * 100)
             book = [OpenPos(s, q.score, q.risk_pct, q.dir, q.floating_r(data[s]["close"][last_idx[s]]))
                     for s, q in open_pos.items()]
-            for tr in alloc.daily_guard(day_loss, book, limit_pct=DAILY_DD*100, buffer_pct=1.0):
+            for tr in alloc.daily_guard(day_loss, book, limit_pct=DAILY_DD*100, buffer_pct=guard_buffer):
                 q = open_pos.get(tr.symbol)
                 if q is None:
                     continue
@@ -249,19 +250,21 @@ def _simulate(events, data, start, end, base_risk, cap, adaptive, alloc, start_i
 
 # ── Monte Carlo ───────────────────────────────────────────────────────────────
 
-def _run(events, data, base_risk, cap, adaptive, mc, rng):
+def _run(events, data, base_risk, cap, adaptive, mc, rng, guard_buffer=1.0,
+         score_edge=1, min_trade=0.25):
     import bisect
     times = [e[0] for e in events]
     first, last = times[0], times[-1]
     latest = last - pd.Timedelta(days=WINDOW_DAYS)
     span = max(1, (latest - first).days)
-    alloc = PortfolioAllocator(daily_budget_pct=cap)
+    alloc = PortfolioAllocator(daily_budget_pct=cap, score_edge=score_edge,
+                               min_trade_pct=min_trade)
     res, takes = [], []
     for _ in range(mc):
         start = first + pd.Timedelta(days=rng.randint(0, span))
         start_idx = bisect.bisect_left(times, start)      # skip the O(all events) scan
         r = _simulate(events, data, start, start + pd.Timedelta(days=WINDOW_DAYS),
-                      base_risk, cap, adaptive, alloc, start_idx=start_idx)
+                      base_risk, cap, adaptive, alloc, start_idx=start_idx, guard_buffer=guard_buffer)
         res.append(r); takes.append(r["taken"])
     n = len(res)
     passes = [r for r in res if r["result"] == "pass"]
@@ -282,6 +285,7 @@ def main():
     ap.add_argument("--risk",  type=float, default=1.0)
     ap.add_argument("--cap",   type=float, default=4.0)
     ap.add_argument("--mc",    type=int,   default=400)
+    ap.add_argument("--buffer", type=float, default=1.0, help="daily-guard buffer pct")
     ap.add_argument("--compare", action="store_true")
     a = ap.parse_args()
 
@@ -296,7 +300,7 @@ def main():
     events = _build_events(data)
     print(f"  {len(events)} total bar-events\n")
 
-    ad = _run(events, data, a.risk, a.cap, True, a.mc, random.Random(7))
+    ad = _run(events, data, a.risk, a.cap, True, a.mc, random.Random(7), guard_buffer=a.buffer)
     print(f"  ADAPTIVE  pass {ad['pass_pct']:.1f}%  BLOW {ad['blow_pct']:.2f}%  "
           f"daily {ad['daily_pct']:.1f}%  timeout {ad['timeout_pct']:.1f}%  "
           f"avg_trades {ad['avg_trades']:.1f}  (n={ad['n']})")
