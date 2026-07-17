@@ -543,7 +543,11 @@ class TradeReconciler(Component):
     def _closed_position_deals(self) -> dict:
         """Return {position_id: [deals]} for fully-closed bot positions."""
         now   = datetime.now()
-        deals = mt5.history_deals_get(now - timedelta(days=3), now + timedelta(minutes=1))
+        # Upper bound is generous: MT5 filters on SERVER time, which can lead the
+        # local clock (FTMO is EET). A tight bound would exclude a just-closed
+        # deal until the local clock caught up — a multi-hour delay that defeats
+        # prompt SL-hit reaction. Dedup by position_id makes the wide window safe.
+        deals = mt5.history_deals_get(now - timedelta(days=3), now + timedelta(days=1))
         if not deals:
             return {}
         live = {p.identifier for p in (mt5.positions_get() or []) if p.magic == self._magic}

@@ -41,11 +41,16 @@ _mt5_stub.TIMEFRAME_H4  = 240
 _mt5_stub.TIMEFRAME_D1  = 1440
 _mt5_stub.TIMEFRAME_W1  = 10080
 _mt5_stub.TIMEFRAME_MN1 = 43200
+_mt5_stub.DEAL_ENTRY_IN     = 0
+_mt5_stub.DEAL_ENTRY_OUT    = 1
+_mt5_stub.DEAL_ENTRY_INOUT  = 2
+_mt5_stub.DEAL_ENTRY_OUT_BY = 3
 _mt5_stub.account_info    = MagicMock()
 _mt5_stub.symbol_info     = MagicMock()
 _mt5_stub.symbol_info_tick = MagicMock()
 _mt5_stub.copy_rates_from_pos = MagicMock()
 _mt5_stub.positions_get   = MagicMock(return_value=[])
+_mt5_stub.history_deals_get = MagicMock(return_value=[])
 sys.modules.setdefault("MetaTrader5", _mt5_stub)
 
 # Stub config and other optional imports so tests don't need them on disk
@@ -68,7 +73,7 @@ for _mod in ("config.settings", "config.logging_setup",
         sys.modules[_mod] = _stub
 
 from execution.orchestrator import (
-    HeartbeatRegistry, RiskGuard, TradingEngine, Status,
+    HeartbeatRegistry, RiskGuard, TradingEngine, TradeReconciler, Status,
     MAX_DAILY_LOSS_PCT, SOFT_DD_HALT_PCT, MAX_TOTAL_LOSS_PCT,
 )
 from execution.risk_agent import RiskAgent, RiskConfig
@@ -344,6 +349,79 @@ class TestTradingEngineGates:
         _run_one_bar(engine, kill, signal=0)  # flat signal
 
         trader_mod.place_order.assert_not_called()
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# TradeReconciler — deal-history accounting (C4)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _deal(pid, entry, profit=0.0, *, symbol="XAUUSD", price=2000.0, t=1000,
+          magic=234001, swap=0.0, commission=0.0):
+    return types.SimpleNamespace(
+        position_id=pid, entry=entry, profit=profit, symbol=symbol, price=price,
+        time=t, magic=magic, swap=swap, commission=commission,
+    )
+
+
+def _pos(pid, magic=234001):
+    return types.SimpleNamespace(identifier=pid, magic=magic)
+
+
+class TestTradeReconciler:
+    """Deal-history is the single source of truth: seed, record-once, dedup, partials."""
+
+    def test_seed_record_dedup_and_partial(self, tmp_path):
+        reg = HeartbeatRegistry()
+        kill = threading.Event()
+        ra, ft, jr = MagicMock(), MagicMock(), MagicMock()
+
+        with patch.object(TradeReconciler, "STATE_FILE", tmp_path / "rec.json"):
+            rec = TradeReconciler(
+                reg, kill, risk_agent=ra, ftmo_tracker=ft, journal=jr,
+                magic=234001, risk_pct=1.0, initial_equity=10_000,
+            )
+            acct = MagicMock(); acct.equity = 10_000
+            _mt5_stub.account_info.return_value = acct
+            _mt5_stub.positions_get.return_value = []
+
+            # Batch 1 — a pre-existing closed position: seeding must suppress it.
+            _mt5_stub.history_deals_get.return_value = [
+                _deal(100, _mt5_stub.DEAL_ENTRY_IN),
+                _deal(100, _mt5_stub.DEAL_ENTRY_OUT, -50.0),
+            ]
+            rec._reconcile()
+            ra.record_trade.assert_not_called()
+
+            # Batch 2 — a newly closed position 101: recorded exactly once, with
+            # R = net profit / (initial × risk_pct) = 200 / 100 = +2.0R.
+            _mt5_stub.history_deals_get.return_value = [
+                _deal(100, _mt5_stub.DEAL_ENTRY_IN),
+                _deal(100, _mt5_stub.DEAL_ENTRY_OUT, -50.0),
+                _deal(101, _mt5_stub.DEAL_ENTRY_IN),
+                _deal(101, _mt5_stub.DEAL_ENTRY_OUT, 200.0, price=2010.0),
+            ]
+            rec._reconcile()
+            assert ra.record_trade.call_count == 1
+            assert ra.record_trade.call_args[0][0] == pytest.approx(2.0)
+            ft.record_trade_day.assert_called_once()
+            jr.close_trade.assert_called_once()
+
+            # Batch 3 — rescan with no new closes: no double-count.
+            rec._reconcile()
+            assert ra.record_trade.call_count == 1
+
+            # Batch 4 — position 102 still open (partial close): must NOT record.
+            _mt5_stub.positions_get.return_value = [_pos(102)]
+            _mt5_stub.history_deals_get.return_value = [
+                _deal(102, _mt5_stub.DEAL_ENTRY_IN),
+                _deal(102, _mt5_stub.DEAL_ENTRY_OUT, 30.0),
+            ]
+            rec._reconcile()
+            assert ra.record_trade.call_count == 1
+
+        # reset shared stub so later tests aren't affected
+        _mt5_stub.positions_get.return_value = []
+        _mt5_stub.history_deals_get.return_value = []
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
