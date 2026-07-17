@@ -161,6 +161,24 @@ def _score_label(score: int) -> str:
     return "Marginal"
 
 
+def _score_bar_blocks(score: int, max_score: int = 10) -> str:
+    filled = max(0, min(10, round(score / max_score * 10)))
+    return "▰" * filled + "▱" * (10 - filled)
+
+
+def _conviction(score: int) -> str:
+    if score >= 8: return "ELITE"
+    if score >= 6: return "HIGH CONVICTION"
+    if score == 5: return "QUALIFIED"
+    if score == 4: return "ESTIMATED"
+    return "SPECULATIVE"
+
+
+def _rr_fmt(rr: float) -> str:
+    """1:5 when clean, 1:6.3 otherwise — never a third number."""
+    return f"1:{rr:.1f}".rstrip("0").rstrip(".")
+
+
 # ── Public API ────────────────────────────────────────────────────────────────
 
 def notify_startup(symbols: list[str], dry_run: bool, equity: float) -> None:
@@ -201,39 +219,35 @@ def notify_trade_open(
     atr: Optional[float] = None,
     df: Optional[pd.DataFrame] = None,
 ) -> None:
-    dir_str  = "LONG  📈" if direction == 1 else "SHORT 📉"
     dir_icon = "🟢" if direction == 1 else "🔴"
+    dir_word = "LONG" if direction == 1 else "SHORT"
     risk_usd = equity * float(os.environ.get("RISK_PCT", "0.5")) / 100
 
-    # RR
-    if tp and sl:
-        dist_sl = abs(entry - sl)
-        dist_tp = abs(tp - entry)
-        rr = dist_tp / dist_sl if dist_sl > 0 else 0
-        rr_str = f"1:{rr:.1f}"
+    # R:R + potential profit (the money)
+    if tp and sl and abs(entry - sl) > 0:
+        rr = abs(tp - entry) / abs(entry - sl)
+        rr_str = _rr_fmt(rr)
+        profit_usd = rr * risk_usd
     else:
-        rr_str = "—"
+        rr, rr_str, profit_usd = 0.0, "—", 0.0
 
     # Est. hold time
     hold_str = ""
     if atr and tp and atr > 0:
-        bars = abs(tp - entry) / atr
-        mins = bars * 15
-        hold_str = f"~{int(mins)}min" if mins < 90 else f"~{mins/60:.1f}hrs"
+        mins = (abs(tp - entry) / atr) * 15
+        hold_str = f"~{int(mins)}min" if mins < 90 else f"~{mins/60:.1f}h"
 
+    tp_str = f"{tp:.5g}" if tp else "—"
     caption = (
-        f"{dir_icon} <b>TRADE OPEN — {symbol}</b>\n\n"
-        f"<b>Direction:</b> {dir_str}\n"
-        f"<b>Entry:</b> <code>{entry:.5g}</code>  |  <b>Lots:</b> <code>{lots:.2f}</code>\n\n"
-        f"🛡 <b>SL:</b> <code>{sl:.5g}</code>\n"
-        f"🎯 <b>TP:</b> <code>{f'{tp:.5g}' if tp else '—'}</code>\n"
-        f"⚖️ <b>RR:</b> {rr_str}\n"
-        f"💸 <b>Risk:</b> ~${risk_usd:,.0f}\n\n"
-        f"📊 <b>Score:</b> {score}/10  <code>{_score_bar(score)}</code>  {_score_label(score)}\n"
+        f"{dir_icon} <b>{dir_word}  {symbol}</b>\n\n"
+        f"💰 <b>+${profit_usd:,.0f}</b>   🛡 −${risk_usd:,.0f}   ⚖️ {rr_str}\n\n"
+        f"<b>Entry</b> <code>{entry:.5g}</code> · {lots:.2f} lots\n"
+        f"🎯 <code>{tp_str}</code>  ·  🛡 <code>{sl:.5g}</code>\n\n"
+        f"📊 {score}/10 {_score_bar_blocks(score)} <b>{_conviction(score)}</b>\n"
+        f"🕐 {datetime.now(tz=timezone.utc).strftime('%H:%M UTC')}"
     )
     if hold_str:
-        caption += f"⏱ <b>Est. hold:</b> {hold_str}\n"
-    caption += f"\n🕐 {datetime.now(tz=timezone.utc).strftime('%H:%M UTC')}"
+        caption += f" · {hold_str}"
 
     if df is not None and len(df) >= 10:
         try:
