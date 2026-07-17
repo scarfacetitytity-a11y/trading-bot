@@ -371,11 +371,19 @@ class RiskGuard(Component):
         soft_halt_event: threading.Event,
         initial_equity: float,
         symbols: list,
+        daily_halt_pct: float = MAX_DAILY_LOSS_PCT,
+        soft_dd_pct: float = SOFT_DD_HALT_PCT,
+        total_kill_pct: float = MAX_TOTAL_LOSS_PCT,
     ):
         super().__init__("RiskGuard", registry, kill_switch, beat_timeout=180)
         self._soft_halt        = soft_halt_event
         self._initial_equity   = float(initial_equity)   # STATIC FTMO floor reference
         self._symbols          = symbols
+        # Config-driven thresholds (were hardcoded — soft_dd_halt_pct in config
+        # was silently ignored). Defaults fall back to the module constants.
+        self._daily_halt_pct   = float(daily_halt_pct)
+        self._soft_dd_pct      = float(soft_dd_pct)
+        self._total_kill_pct   = float(total_kill_pct)
         self._day_start_equity: Optional[float] = None
         self._server_day:       Optional[str]   = None
         self._halt_cause:       Optional[str]   = None   # "daily" | "cumulative"
@@ -436,7 +444,7 @@ class RiskGuard(Component):
                 self._server_day       = server_day
                 self._day_start_equity = equity
                 if (self._soft_halt.is_set() and self._halt_cause == "daily"
-                        and total_pct > -SOFT_DD_HALT_PCT):
+                        and total_pct > -self._soft_dd_pct):
                     self._soft_halt.clear()
                     self._halt_cause = None
                     logger.info("[RiskGuard] New server day %s — daily halt cleared, baseline=%.2f",
@@ -459,22 +467,22 @@ class RiskGuard(Component):
                    f"{' [SOFT-HALT]' if self._soft_halt.is_set() else ''}")
 
             # Tier 1: daily circuit breaker — halt new entries for rest of server day
-            if daily_pct <= -MAX_DAILY_LOSS_PCT and not self._soft_halt.is_set():
+            if daily_pct <= -self._daily_halt_pct and not self._soft_halt.is_set():
                 logger.critical("[RiskGuard] DAILY CIRCUIT BREAKER: %.2f%% — no new entries today", daily_pct)
                 self._soft_halt.set()
                 self._halt_cause = "daily"
                 self._save_state()
 
-            # Tier 2: soft halt — cumulative 7% from initial, halt new entries
-            if total_pct <= -SOFT_DD_HALT_PCT:
+            # Tier 2: soft halt — cumulative soft_dd_pct from initial, halt new entries
+            if total_pct <= -self._soft_dd_pct:
                 if not self._soft_halt.is_set():
                     logger.critical("[RiskGuard] SOFT HALT: cumulative %.2f%% from initial — no new entries", total_pct)
                     self._soft_halt.set()
                 self._halt_cause = "cumulative"   # promote: survives the day boundary
                 self._save_state()
 
-            # Tier 3: hard kill — 9.5% cumulative from initial, emergency stop
-            if total_pct <= -MAX_TOTAL_LOSS_PCT:
+            # Tier 3: hard kill — total_kill_pct cumulative from initial, emergency stop
+            if total_pct <= -self._total_kill_pct:
                 kill_msg = f"HARD KILL: cumulative {total_pct:.2f}% from initial — FTMO breach imminent"
                 logger.critical("[RiskGuard] %s", kill_msg)
                 self.registry.halt(self.name, kill_msg)
@@ -1963,6 +1971,9 @@ class Orchestrator:
             soft_halt_event=self.soft_halt,
             initial_equity=self._ftmo_tracker.state.initial_equity,
             symbols=self._symbols,
+            daily_halt_pct=float(self._trade_cfg.get("daily_halt_pct", MAX_DAILY_LOSS_PCT)),
+            soft_dd_pct=float(self._trade_cfg.get("soft_dd_halt_pct", SOFT_DD_HALT_PCT)),
+            total_kill_pct=float(self._trade_cfg.get("total_kill_pct", MAX_TOTAL_LOSS_PCT)),
         )
         reconciler = TradeReconciler(
             self.registry, self.kill_switch,
