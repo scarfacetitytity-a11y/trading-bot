@@ -849,6 +849,19 @@ class TradingEngine(Component):
 
             # Size lots so that the STRUCTURAL SL hit = risk_pct of balance
             dist = abs(entry - sl)
+
+            # ── Minimum stop distance (fix #1) ────────────────────────────────
+            # A suicidally tight stop (e.g. 6pts on US500) gets noise-stopped in
+            # minutes AND makes the risk formula spit out a runaway position. The
+            # stop must clear a floor of both ATR and % of price, or we don't trade.
+            min_atr  = atr_val * float(self._trade_cfg.get("min_stop_atr_mult", 0.5))
+            min_pct  = entry * float(self._trade_cfg.get("min_stop_pct", 0.05)) / 100.0
+            min_dist = max(min_atr, min_pct)
+            if dist < min_dist:
+                logger.warning("[%s] STOP TOO TIGHT: dist=%.5f < floor=%.5f "
+                               "(atr=%.5f) — REJECTING entry", self.name, dist, min_dist, atr_val)
+                return sl, tp, 0.0
+
             risk_pct = float(self._trade_cfg.get("risk_pct", 1.0)) / 100
             if info and info.trade_tick_size > 0 and dist > 0:
                 point_value_per_lot = (
@@ -875,8 +888,24 @@ class TradingEngine(Component):
         # Clamp to broker min/max/step on BOTH paths (H2 — the ATR path previously
         # bypassed this and could exceed volume_max or violate volume_step).
         lots = risk._clamp_lots(self._symbol, lots)
-        lots = max(lots, 0.01)
 
+        # ── Max notional cap (fix #2) ─────────────────────────────────────────
+        # Backstop so a tight-ish stop can never produce an absurd position size.
+        # Big lots stay allowed on high-conviction trades — just not runaway.
+        tick_c = mt5.symbol_info_tick(self._symbol)
+        info_c = mt5.symbol_info(self._symbol)
+        px_c   = (tick_c.ask if direction == 1 else tick_c.bid) if tick_c else 0.0
+        if info_c is not None and px_c > 0 and lots > 0:
+            contract = getattr(info_c, "trade_contract_size", 1.0) or 1.0
+            notional = lots * contract * px_c
+            max_notional = balance * float(self._trade_cfg.get("max_notional_x", 30))
+            if max_notional > 0 and notional > max_notional:
+                capped = risk._clamp_lots(self._symbol, lots * max_notional / notional)
+                logger.warning("[%s] NOTIONAL CAP: %.2f -> %.2f lots (notional %.0f > cap %.0f)",
+                               self.name, lots, capped, notional, max_notional)
+                lots = capped
+
+        lots = max(lots, 0.01)
         return sl, tp, lots
 
     def _reset_position_state(self) -> None:
@@ -1675,6 +1704,17 @@ class TradingEngine(Component):
                                             news_ctx.fired_summary(self._symbol))
                                 signal_score += news_mod
 
+                    # ── Quality bar (fix #4): high-conviction only, both directions ──
+                    # Bidirectional stays — but no more minimum-score chasing. A short
+                    # must be a HIGH-score short at a real level, or we pass.
+                    min_entry_score = int(self._trade_cfg.get(
+                        "min_entry_score", self._trade_cfg.get("score_funded", 5)))
+                    if signal_score < min_entry_score:
+                        logger.info("[%s] LOW CONVICTION skip: %s score=%d < min %d",
+                                    self.name, "BUY" if desired == 1 else "SELL",
+                                    signal_score, min_entry_score)
+                        continue
+
                     score_mult   = _size_mult_from_score(signal_score) if signal_score > 0 else 1.0
                     # Concentration mult: fewer concurrent positions = more size per trade
                     # 0-1 open → 2x  |  2-3 open → 1.5x  |  4+ open → 1x
@@ -1716,6 +1756,15 @@ class TradingEngine(Component):
                                         self.name, new_risk, room, scale)
 
                     sl, tp, lots = self._size_order(desired, account["balance"], combined_mult)
+
+                    # ── Enforce a valid stop + honour size_order rejections (fix #1/#3) ──
+                    # lots==0 means the stop was too tight (rejected). And we NEVER
+                    # place an order without a real stop — no naked positions.
+                    if lots <= 0:
+                        continue   # already logged (stop too tight)
+                    if sl is None or sl <= 0:
+                        logger.warning("[%s] NO STOP — refusing to place a naked order", self.name)
+                        continue
 
                     # ── Liquidity thesis gate: no clean draw within reach = no trade ──
                     # A trade with no real liquidity target is not a trade — it's
