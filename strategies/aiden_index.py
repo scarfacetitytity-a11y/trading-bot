@@ -343,6 +343,7 @@ class AiDENIndexStrategy(Strategy):
         signals      = pd.Series(0.0, index=df.index)
         self._stops  = pd.Series(float("nan"), index=df.index)
         self._scores = pd.Series(0, index=df.index)
+        self._score_reasons = pd.Series([[] for _ in range(len(df))], index=df.index, dtype=object)
 
         position         = 0
         position_size    = 0.0
@@ -459,41 +460,41 @@ class AiDENIndexStrategy(Strategy):
                 if htf_bias == 1:
                     bull_gap = lv - h2
                     if bull_gap >= self.min_fvg_atr * atr_val:
-                        score = 2  # HTF bias +2
+                        score = 2; reasons = ["H4 bias +2"]  # HTF bias +2
 
                         if not np.isnan(swing_hi) and swing_hi > swing_lo:
                             mid = swing_lo + (swing_hi - swing_lo) * self.discount_pct
                             if cv < mid:
-                                score += 1  # discount zone
+                                score += 1; reasons.append("Discount zone")
 
                         if _liq_swept_low(low, i, self.liq_lookback):
-                            score += 1
+                            score += 1; reasons.append("Liquidity sweep")
 
                         ob_lo, ob_hi = _find_bullish_ob(open_, close, high, low, i - 2, self.ob_lookback)
                         if ob_lo is not None and min(ob_hi, lv) - max(ob_lo, h2) > 0:
-                            score += 2; is_model3 = True
+                            score += 2; is_model3 = True; reasons.append("Order block (M3) +2")
                         else:
-                            score += 1; is_model3 = False
+                            score += 1; is_model3 = False; reasons.append("Order block")
 
                         if in_session:
-                            score += 1
+                            score += 1; reasons.append("Session")
                         if in_prime and self.use_prime_bonus:
-                            score += 1
+                            score += 1; reasons.append("Prime window")
 
                         if self.use_rsi and not np.isnan(rsi_val):
                             if self.rsi_long_lo <= rsi_val <= self.rsi_long_hi:
-                                score += 1
+                                score += 1; reasons.append("RSI zone")
 
                         if strongly_trending:
-                            score += 1  # regime bonus
+                            score += 1; reasons.append("Trend regime")
 
                         if self.use_vol_spike and vol_mean is not None:
                             vm = float(vol_mean.iloc[i])
                             if vm > 0 and float(vol_s.iloc[i]) > self.vol_spike_mult * vm:
-                                score += 1
+                                score += 1; reasons.append("Volume spike")
 
                         if d1_bias_at is not None and d1_bias_at(bar_time) == 1:
-                            score += 1
+                            score += 1; reasons.append("D1 aligned")
 
                         if score >= self.min_score:
                             active_fvgs.append({
@@ -504,6 +505,7 @@ class AiDENIndexStrategy(Strategy):
                                 "ob_lo":    ob_lo,
                                 "ob_hi":    ob_hi,
                                 "score":    score,
+                                "reasons":  reasons,
                                 "formed":   i,
                                 "tested":   False,
                                 "test_bar": None,
@@ -516,41 +518,41 @@ class AiDENIndexStrategy(Strategy):
                 if htf_bias == -1 and not self.long_only:
                     bear_gap = l2 - hv
                     if bear_gap >= self.min_fvg_atr * atr_val:
-                        score = 2  # HTF bias +2
+                        score = 2; reasons = ["H4 bias +2"]  # HTF bias +2
 
                         if not np.isnan(swing_hi) and swing_hi > swing_lo:
                             mid = swing_lo + (swing_hi - swing_lo) * self.discount_pct
                             if cv > mid:
-                                score += 1  # premium zone for short
+                                score += 1; reasons.append("Premium zone")
 
                         if _liq_swept_high(high, i, self.liq_lookback):
-                            score += 1
+                            score += 1; reasons.append("Liquidity sweep")
 
                         ob_lo, ob_hi = _find_bearish_ob(open_, close, high, low, i - 2, self.ob_lookback)
                         if ob_lo is not None and min(ob_hi, l2) - max(ob_lo, hv) > 0:
-                            score += 2; is_model3 = True
+                            score += 2; is_model3 = True; reasons.append("Order block (M3) +2")
                         else:
-                            score += 1; is_model3 = False
+                            score += 1; is_model3 = False; reasons.append("Order block")
 
                         if in_session:
-                            score += 1
+                            score += 1; reasons.append("Session")
                         if in_prime and self.use_prime_bonus:
-                            score += 1
+                            score += 1; reasons.append("Prime window")
 
                         if self.use_rsi and not np.isnan(rsi_val):
                             if self.rsi_short_lo <= rsi_val <= self.rsi_short_hi:
-                                score += 1
+                                score += 1; reasons.append("RSI zone")
 
                         if strongly_trending:
-                            score += 1
+                            score += 1; reasons.append("Trend regime")
 
                         if self.use_vol_spike and vol_mean is not None:
                             vm = float(vol_mean.iloc[i])
                             if vm > 0 and float(vol_s.iloc[i]) > self.vol_spike_mult * vm:
-                                score += 1
+                                score += 1; reasons.append("Volume spike")
 
                         if d1_bias_at is not None and d1_bias_at(bar_time) == -1:
-                            score += 1
+                            score += 1; reasons.append("D1 aligned")
 
                         if score >= self.min_score:
                             active_fvgs.append({
@@ -561,6 +563,7 @@ class AiDENIndexStrategy(Strategy):
                                 "ob_lo":    ob_lo,
                                 "ob_hi":    ob_hi,
                                 "score":    score,
+                                "reasons":  reasons,
                                 "formed":   i,
                                 "tested":   False,
                                 "test_bar": None,
@@ -606,6 +609,7 @@ class AiDENIndexStrategy(Strategy):
                                     t1_hit           = False
                                     bars_since_entry = 0
                                     self._scores.iloc[i] = fvg["score"]
+                                    self._score_reasons.iloc[i] = fvg.get("reasons", [])
                                 to_remove.append(fvg)
 
                     else:  # bear
@@ -632,6 +636,7 @@ class AiDENIndexStrategy(Strategy):
                                     t1_hit           = False
                                     bars_since_entry = 0
                                     self._scores.iloc[i] = fvg["score"]
+                                    self._score_reasons.iloc[i] = fvg.get("reasons", [])
                                 to_remove.append(fvg)
 
                 for fvg in to_remove:
@@ -642,6 +647,7 @@ class AiDENIndexStrategy(Strategy):
             self._stops.iloc[i] = stop_loss if stop_loss is not None else float("nan")
             if position != 0 and i > 0 and self._scores.iloc[i] == 0:
                 self._scores.iloc[i] = self._scores.iloc[i - 1]
+                self._score_reasons.iloc[i] = self._score_reasons.iloc[i - 1]
 
         return signals
 

@@ -95,6 +95,7 @@ class TradeJournal:
         grade: Optional[str] = None,
         target_price: Optional[float] = None,
         thesis: Optional[str] = None,
+        reasons: Optional[list] = None,
     ) -> None:
         now = datetime.now(tz=timezone.utc)
         self._open[symbol] = TradeRecord(
@@ -120,7 +121,7 @@ class TradeJournal:
         tg.notify_trade_open(
             symbol=symbol, direction=direction, score=score,
             entry=entry_price, sl=sl_price, tp=tp_price,
-            lots=lots, equity=equity, atr=atr, df=df,
+            lots=lots, equity=equity, atr=atr, df=df, reasons=reasons,
         )
 
     def update_path(self, symbol: str, high: float, low: float) -> None:

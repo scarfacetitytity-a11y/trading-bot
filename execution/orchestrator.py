@@ -1851,6 +1851,8 @@ class TradingEngine(Component):
                                 _atr_series = getattr(self._strategy, "_atr_cache", None)
                                 _atr_val = float(_atr_series.iloc[-1]) if _atr_series is not None and not np.isnan(float(_atr_series.iloc[-1])) else None
                                 _p = self._last_plan
+                                _sr = getattr(self._strategy, "_score_reasons", None)
+                                _reasons = list(_sr.iloc[-1]) if _sr is not None and len(_sr) else []
                                 self._journal.open_trade(
                                     symbol=self._symbol,
                                     direction=desired,
@@ -1866,6 +1868,7 @@ class TradingEngine(Component):
                                     grade=_p.grade if _p else None,
                                     target_price=_p.tp if _p else None,
                                     thesis=_p.thesis if _p else None,
+                                    reasons=_reasons,
                                 )
 
             except Exception as exc:

@@ -218,6 +218,7 @@ def notify_trade_open(
     equity: float,
     atr: Optional[float] = None,
     df: Optional[pd.DataFrame] = None,
+    reasons: Optional[list] = None,
 ) -> None:
     dir_icon = "🟢" if direction == 1 else "🔴"
     dir_word = "LONG" if direction == 1 else "SHORT"
@@ -244,8 +245,11 @@ def notify_trade_open(
         f"<b>Entry</b> <code>{entry:.5g}</code> · {lots:.2f} lots\n"
         f"🎯 <code>{tp_str}</code>  ·  🛡 <code>{sl:.5g}</code>\n\n"
         f"📊 {score}/10 {_score_bar_blocks(score)} <b>{_conviction(score)}</b>\n"
-        f"🕐 {datetime.now(tz=timezone.utc).strftime('%H:%M UTC')}"
     )
+    # Score breakdown — the confluences that built the number
+    if reasons:
+        caption += "".join(f"   ✓ {r}\n" for r in reasons)
+    caption += f"🕐 {datetime.now(tz=timezone.utc).strftime('%H:%M UTC')}"
     if hold_str:
         caption += f" · {hold_str}"
 
