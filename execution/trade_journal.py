@@ -58,6 +58,8 @@ class TradeRecord:
     grade:        Optional[str] = None     # A | B | C
     target_price: Optional[float] = None   # liquidity target (structural TP)
     thesis:       Optional[str] = None
+    reasons:      Optional[list] = None    # confluences that built the score
+    atr:          Optional[float] = None   # ATR at entry (for stop-distance diagnostics)
     # ── Path tracking (MFE/MAE while open) ──
     path_high:    Optional[float] = None
     path_low:     Optional[float] = None
@@ -74,6 +76,7 @@ class TradeJournal:
 
     def __init__(self, log_dir: str = "logs"):
         self._path   = Path(log_dir) / "trades.jsonl"
+        self._misfire_path = Path(log_dir) / "misfires.jsonl"   # self-improvement ledger
         self._path.parent.mkdir(parents=True, exist_ok=True)
         self._open: dict[str, TradeRecord] = {}   # symbol → open trade
 
@@ -113,6 +116,8 @@ class TradeJournal:
             grade=grade,
             target_price=target_price,
             thesis=thesis,
+            reasons=reasons or [],
+            atr=atr,
             path_high=entry_price,
             path_low=entry_price,
         )
@@ -161,6 +166,8 @@ class TradeJournal:
         self._review(rec, close_price)
 
         self._append(rec)
+        if rec.outcome == "loss":
+            self._log_misfire(rec)
         self._council_review(rec)
         session_pnl = sum(
             t.get("pnl_usd", 0) or 0
@@ -175,6 +182,59 @@ class TradeJournal:
             equity=equity_after,
             session_pnl=session_pnl,
         )
+
+    # ── Misfire postmortem — the self-improvement ledger ──────────────────────
+
+    def _log_misfire(self, rec: TradeRecord) -> None:
+        """Structured postmortem of a losing trade: its confluences + diagnostic
+        flags, so we can mine WHAT keeps bleeding us and turn it into new gates."""
+        risk_dist = abs(rec.entry_price - rec.sl_price)
+        stop_atr  = (risk_dist / rec.atr) if rec.atr else None
+        flags = []
+        if stop_atr is not None and stop_atr < 0.6:
+            flags.append("tight_stop")                 # stop too close (US500 class)
+        if rec.grade == "C":
+            flags.append("low_grade")
+        if rec.mfe_r is not None and rec.mfe_r < 0.3:
+            flags.append("never_worked")               # never went green → bad entry/location
+        if rec.mfe_r is not None and rec.mfe_r >= 1.5 and (rec.r_multiple or 0) < 0:
+            flags.append("gave_back")                  # was +1.5R then closed red → management
+        misfire = {
+            "time": rec.close_time, "symbol": rec.symbol, "direction": rec.direction,
+            "score": rec.score, "grade": rec.grade, "trade_type": rec.trade_type,
+            "reasons": rec.reasons or [], "r_multiple": round(rec.r_multiple or 0, 2),
+            "pnl_usd": round(rec.pnl_usd or 0, 2),
+            "stop_atr": round(stop_atr, 2) if stop_atr else None,
+            "mfe_r": rec.mfe_r, "mae_r": rec.mae_r, "flags": flags,
+        }
+        try:
+            with open(self._misfire_path, "a", encoding="utf-8") as f:
+                f.write(json.dumps(misfire) + "\n")
+        except Exception:
+            logger.exception("[Journal] misfire log failed")
+        logger.warning("[MISFIRE] %s %s score=%d R=%.2f flags=%s reasons=%s",
+                       rec.symbol, "LONG" if rec.direction == 1 else "SHORT",
+                       rec.score, rec.r_multiple or 0, flags, rec.reasons)
+
+    def misfire_report(self, n: int = 200) -> dict:
+        """Aggregate recent misfires → what patterns keep losing (mine for gates)."""
+        if not self._misfire_path.exists():
+            return {}
+        rows = [json.loads(l) for l in
+                self._misfire_path.read_text(encoding="utf-8").splitlines() if l][-n:]
+        if not rows:
+            return {}
+        from collections import Counter
+        flag_ct   = Counter(f for r in rows for f in r.get("flags", []))
+        reason_ct = Counter(x for r in rows for x in r.get("reasons", []))
+        type_ct   = Counter(r.get("trade_type") for r in rows)
+        return {
+            "count":  len(rows),
+            "avg_r":  round(sum(r["r_multiple"] for r in rows) / len(rows), 2),
+            "top_flags":         flag_ct.most_common(5),
+            "losers_by_type":    type_ct.most_common(),
+            "confluences_in_losers": reason_ct.most_common(8),
+        }
 
     # ── Post-trade review ─────────────────────────────────────────────────────
 
