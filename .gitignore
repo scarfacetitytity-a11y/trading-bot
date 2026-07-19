@@ -14,9 +14,9 @@ dist/
 .env
 config/config.yaml
 
-# Logs
-logs/*.log
-logs/reports/
+# Logs — runtime state and outputs (regenerated on run)
+logs/
+!logs/.gitkeep
 
 # Historical/processed data (regenerate from source, don't commit)
 data/raw/*
