@@ -12,6 +12,8 @@ Best config on XAUUSD H1 2015-2025: RSI 35/65, +107.9%, 59.4% WR, 224 trades, Sh
 """
 import numpy as np
 import pandas as pd
+from strategies.indicators import atr as _atr, rsi as _rsi
+
 
 from strategies.base import Strategy
 
@@ -118,19 +120,5 @@ class SniperStrategy(Strategy):
         return signals
 
 
-def _rsi(close: pd.Series, period: int) -> pd.Series:
-    delta = close.diff()
-    gain  = delta.clip(lower=0).rolling(period).mean()
-    loss  = (-delta.clip(upper=0)).rolling(period).mean()
-    rs    = gain / loss.replace(0, float("nan"))
-    return 100 - (100 / (1 + rs))
 
 
-def _atr(high: pd.Series, low: pd.Series, close: pd.Series, period: int) -> pd.Series:
-    prev_close = close.shift(1)
-    tr = pd.concat([
-        high - low,
-        (high - prev_close).abs(),
-        (low  - prev_close).abs(),
-    ], axis=1).max(axis=1)
-    return tr.rolling(period).mean()

@@ -37,22 +37,8 @@ from strategies.base import Strategy
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
-def _atr(high: pd.Series, low: pd.Series, close: pd.Series, period: int) -> pd.Series:
-    prev = close.shift(1)
-    tr = pd.concat([
-        high - low,
-        (high - prev).abs(),
-        (low  - prev).abs(),
-    ], axis=1).max(axis=1)
-    return tr.rolling(period).mean()
-
-
-def _rsi(close: pd.Series, period: int = 14) -> pd.Series:
-    delta = close.diff()
-    gain  = delta.clip(lower=0).rolling(period).mean()
-    loss  = (-delta.clip(upper=0)).rolling(period).mean()
-    rs    = gain / loss.replace(0, np.nan)
-    return 100 - 100 / (1 + rs)
+# Indicators live in the shared single-source module (strategies/indicators.py).
+from strategies.indicators import atr as _atr, rsi as _rsi   # noqa: E402
 
 
 def _resample_d1(df: pd.DataFrame) -> pd.DataFrame:
