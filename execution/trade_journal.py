@@ -76,9 +76,30 @@ class TradeJournal:
 
     def __init__(self, log_dir: str = "logs"):
         self._path   = Path(log_dir) / "trades.jsonl"
-        self._misfire_path = Path(log_dir) / "misfires.jsonl"   # self-improvement ledger
+        self._misfire_path = Path(log_dir) / "misfires.jsonl"   # what LOSES (avoid)
+        self._wins_path    = Path(log_dir) / "wins.jsonl"       # what WORKS (protect/amplify)
+        self._open_path    = Path(log_dir) / "open_trades.json" # DURABLE open state
         self._path.parent.mkdir(parents=True, exist_ok=True)
         self._open: dict[str, TradeRecord] = {}   # symbol → open trade
+        self._load_open()   # survive restarts — the knowledge base can't learn from lost context
+
+    def _save_open(self) -> None:
+        try:
+            from dataclasses import asdict
+            self._open_path.write_text(
+                json.dumps({k: asdict(v) for k, v in self._open.items()}), encoding="utf-8")
+        except Exception:
+            logger.exception("[Journal] could not persist open trades")
+
+    def _load_open(self) -> None:
+        try:
+            if self._open_path.exists():
+                d = json.loads(self._open_path.read_text(encoding="utf-8"))
+                self._open = {k: TradeRecord(**v) for k, v in d.items()}
+                if self._open:
+                    logger.info("[Journal] restored %d open trade(s) from disk", len(self._open))
+        except Exception:
+            logger.exception("[Journal] could not load open trades")
 
     # ── Open / close ─────────────────────────────────────────────────────────
 
@@ -121,6 +142,7 @@ class TradeJournal:
             path_high=entry_price,
             path_low=entry_price,
         )
+        self._save_open()   # durable — survives a restart before the trade closes
         logger.info("[Journal] OPEN %s dir=%+d score=%d entry=%.5f SL=%.5f TP=%s",
                     symbol, direction, score, entry_price, sl_price, tp_price)
         tg.notify_trade_open(
@@ -143,6 +165,7 @@ class TradeJournal:
         rec = self._open.pop(symbol, None)
         if rec is None:
             return
+        self._save_open()   # persist the removal
 
         rec.close_time  = datetime.now(tz=timezone.utc).isoformat()
         rec.close_price = close_price
@@ -168,6 +191,8 @@ class TradeJournal:
         self._append(rec)
         if rec.outcome == "loss":
             self._log_misfire(rec)
+        elif rec.outcome == "win":
+            self._log_win(rec)           # wins are journaled too — learn what WORKS
         self._council_review(rec)
         session_pnl = sum(
             t.get("pnl_usd", 0) or 0
@@ -215,6 +240,38 @@ class TradeJournal:
         logger.warning("[MISFIRE] %s %s score=%d R=%.2f flags=%s reasons=%s",
                        rec.symbol, "LONG" if rec.direction == 1 else "SHORT",
                        rec.score, rec.r_multiple or 0, flags, rec.reasons)
+
+    def _log_win(self, rec: TradeRecord) -> None:
+        """Structured record of a WINNING trade — the other half of learning:
+        which confluences/setups actually make money, so we protect + amplify them."""
+        win = {
+            "time": rec.close_time, "symbol": rec.symbol, "direction": rec.direction,
+            "score": rec.score, "grade": rec.grade, "trade_type": rec.trade_type,
+            "reasons": rec.reasons or [], "r_multiple": round(rec.r_multiple or 0, 2),
+            "pnl_usd": round(rec.pnl_usd or 0, 2),
+            "mfe_r": rec.mfe_r, "hit_target": rec.hit_target,
+        }
+        try:
+            with open(self._wins_path, "a", encoding="utf-8") as f:
+                f.write(json.dumps(win) + "\n")
+        except Exception:
+            logger.exception("[Journal] win log failed")
+
+    def win_report(self, n: int = 200) -> dict:
+        """What WORKS: confluences/types that recur in winners (protect these)."""
+        if not self._wins_path.exists():
+            return {}
+        rows = [json.loads(l) for l in
+                self._wins_path.read_text(encoding="utf-8").splitlines() if l][-n:]
+        if not rows:
+            return {}
+        from collections import Counter
+        return {
+            "count": len(rows),
+            "avg_r": round(sum(r["r_multiple"] for r in rows) / len(rows), 2),
+            "winners_by_type": Counter(r.get("trade_type") for r in rows).most_common(),
+            "confluences_in_winners": Counter(x for r in rows for x in r.get("reasons", [])).most_common(8),
+        }
 
     def misfire_report(self, n: int = 200) -> dict:
         """Aggregate recent misfires → what patterns keep losing (mine for gates)."""
