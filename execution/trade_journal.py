@@ -256,15 +256,15 @@ class TradeJournal:
             logger.warning("[Journal] review failed for %s: %s", rec.symbol, exc)
             return
         rec.hit_target   = review.hit_target
-        rec.mfe_r        = review.mfe_r
-        rec.mae_r        = review.mae_r
+        rec.mfe_r        = review.mfe_R    # TradeReview uses capital-R attrs
+        rec.mae_r        = review.mae_R
         rec.thesis_valid = review.thesis_valid
         rec.lesson       = review.lesson
         rec.review_notes = review.notes
         logger.info(
             "[Journal] REVIEW %s [%s/%s] hitTP=%s MFE=%.1fR MAE=%.1fR | %s%s",
             rec.symbol, rec.trade_type or "?", rec.grade or "?",
-            review.hit_target, review.mfe_r, review.mae_r, review.lesson,
+            review.hit_target, review.mfe_R, review.mae_R, review.lesson,
             (" | " + "; ".join(review.notes)) if review.notes else "",
         )
 
