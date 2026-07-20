@@ -1332,6 +1332,38 @@ class TradingEngine(Component):
                     self._tighten_all_sl(new_sl, -1)   # protects scaled-in add-ons too
                     logger.info("[%s] Trail SL: %.5f -> %.5f (short)", self.name, current_sl, new_sl)
 
+        # ── News protection (JP mentor): protect profits before high-impact events ──
+        # "If I'm up four grand before that time, I'll protect my four grand." — don't let
+        # a news spike wipe an already-won position. Move SL to BE if in profit and event
+        # is within 30 minutes. Only fires once per trade (SL already at or past BE).
+        if self._news_gate is not None and risk_dist > 0:
+            _news_ctx = self._news_gate.get_context()
+            _instr_ccy = ng._INSTRUMENT_CURRENCY.get(self._symbol, "")
+            _relevant_high = [
+                e for e in _news_ctx.upcoming_high
+                if e.currency == _instr_ccy and e.minutes_until <= 30
+            ]
+            if _relevant_high:
+                _cur_r = (
+                    (mid_price - entry) / risk_dist if pos.type == mt5.ORDER_TYPE_BUY
+                    else (entry - mid_price) / risk_dist
+                )
+                if _cur_r >= 0.5 and current_sl != entry:
+                    _event_names = ", ".join(e.name for e in _relevant_high)
+                    logger.info(
+                        "[%s] NEWS PROTECT: High event in %.0fmin (%s) — "
+                        "trade at %.2fR, moving SL to BE %.5f",
+                        self.name, min(e.minutes_until for e in _relevant_high),
+                        _event_names, _cur_r, entry,
+                    )
+                    _protect_sl = entry  # breakeven
+                    if pos.type == mt5.ORDER_TYPE_BUY:
+                        _protect_sl = max(current_sl, entry)
+                    else:
+                        _protect_sl = min(current_sl, entry)
+                    if abs(_protect_sl - current_sl) > 1e-8:
+                        self._tighten_all_sl(_protect_sl, 1 if pos.type == mt5.ORDER_TYPE_BUY else -1)
+
         # ── Adaptive structural management (per trade type) ──
         # Ratchet the stop to new structure and extend the target to the next draw
         # as the trade develops. Tighten-only on SL; only extends TP.
@@ -1775,7 +1807,17 @@ class TradingEngine(Component):
                                     "counter-trend" if against_trend else "with-trend")
                         continue
 
-                    score_mult   = _size_mult_from_score(signal_score) if signal_score > 0 else 1.0
+                    # Quality-scaled risk (JP mentor): size scales DOWN for borderline setups.
+                    # A soldier executes on strategy; he doesn't double-down on a shaky setup.
+                    # 99% of prop account blowups = oversized trades that weren't that great.
+                    _score_over_floor = signal_score - needed
+                    if _score_over_floor <= 0:
+                        score_mult = 0.25   # floor entry — borderline, reduce exposure hard
+                    elif _score_over_floor == 1:
+                        score_mult = 0.50   # decent setup — half risk
+                    else:
+                        score_mult = 1.00   # well above floor — full risk; never over-size
+
                     # Concentration mult: fewer concurrent positions = more size per trade
                     # 0-1 open → 2x  |  2-3 open → 1.5x  |  4+ open → 1x
                     n_open = len(trader.get_all_positions())   # magic-filtered (H3)
