@@ -36,6 +36,14 @@ Negative confluences (subtract from score):
                                                       magnet pulls price there first)
   Both Asian H+L swept early                     -1  (JP mentor v7: "leaked early, always
                                                       a concern" — directional clarity lost)
+  Mid daily range (40-60% of prior day H/L)      -1  (JP mentor v7: "market could go up or
+                                                      down, I'm a bit concerned about that"
+                                                      — no premium/discount edge available)
+
+Order Block detection (upgraded v7):
+  Requires wick on the OB candle + next candle body fully engulfs the OB body.
+  JP mentor v7: "There has to be some wick sticking out here. It needs to touch a
+  red wick and then the next candle swallows that candle — that becomes an order block."
 
 Dynamic RR:
   Base: rr_target (default 2.5)
@@ -123,18 +131,63 @@ def _compute_h4_bias_swing(h4: pd.DataFrame, lookback: int) -> tuple[pd.Series, 
 
 
 def _find_bullish_ob(open_, close, high, low, start_i, lookback):
-    """Last bearish candle before start_i (body zone)."""
+    """Bullish order block: bearish candle with a lower wick, followed by a bullish
+    engulfing candle whose body fully covers the prior candle's body.
+
+    JP mentor v7: "There has to be some wick sticking out here. It needs to touch a red
+    wick and then the next candle's body swallows that candle — that becomes an order block."
+
+    Returns (ob_low, ob_high) — the body zone of the bearish OB candle — or (None, None).
+    """
     for j in range(start_i, max(0, start_i - lookback), -1):
-        if close.iloc[j] < open_.iloc[j]:
-            return float(min(open_.iloc[j], close.iloc[j])), float(max(open_.iloc[j], close.iloc[j]))
+        if j + 1 > start_i:
+            continue
+        ob_o = float(open_.iloc[j]); ob_c = float(close.iloc[j])
+        ob_lo_w = float(low.iloc[j]); ob_hi_w = float(high.iloc[j])
+        if ob_c >= ob_o:
+            continue  # not a bearish candle
+        has_lower_wick = ob_lo_w < min(ob_o, ob_c)
+        if not has_lower_wick:
+            continue
+        # Check if the NEXT candle (j+1) is a bullish engulfing of the OB body
+        nj = j + 1
+        if nj > start_i:
+            break
+        next_o = float(open_.iloc[nj]); next_c = float(close.iloc[nj])
+        if next_c <= next_o:
+            continue  # next candle not bullish
+        ob_body_lo = min(ob_o, ob_c); ob_body_hi = max(ob_o, ob_c)
+        if next_o <= ob_body_lo and next_c >= ob_body_hi:
+            return ob_body_lo, ob_body_hi
     return None, None
 
 
 def _find_bearish_ob(open_, close, high, low, start_i, lookback):
-    """Last bullish candle before start_i (body zone) — bearish OB for short setups."""
+    """Bearish order block: bullish candle with an upper wick, followed by a bearish
+    engulfing candle whose body fully covers the prior candle's body.
+
+    Mirror of _find_bullish_ob for short setups.
+    Returns (ob_low, ob_high) — the body zone of the bullish OB candle — or (None, None).
+    """
     for j in range(start_i, max(0, start_i - lookback), -1):
-        if close.iloc[j] > open_.iloc[j]:
-            return float(min(open_.iloc[j], close.iloc[j])), float(max(open_.iloc[j], close.iloc[j]))
+        if j + 1 > start_i:
+            continue
+        ob_o = float(open_.iloc[j]); ob_c = float(close.iloc[j])
+        ob_lo_w = float(low.iloc[j]); ob_hi_w = float(high.iloc[j])
+        if ob_c <= ob_o:
+            continue  # not a bullish candle
+        has_upper_wick = ob_hi_w > max(ob_o, ob_c)
+        if not has_upper_wick:
+            continue
+        nj = j + 1
+        if nj > start_i:
+            break
+        next_o = float(open_.iloc[nj]); next_c = float(close.iloc[nj])
+        if next_c >= next_o:
+            continue  # next candle not bearish
+        ob_body_lo = min(ob_o, ob_c); ob_body_hi = max(ob_o, ob_c)
+        if next_o >= ob_body_hi and next_c <= ob_body_lo:
+            return ob_body_lo, ob_body_hi
     return None, None
 
 
@@ -641,6 +694,17 @@ class AiDENIndexStrategy(Strategy):
                                 and _cdh_i >= _ph_i and _cdl_i <= _pl_i):
                             score -= 1; reasons.append("-Both Asian H+L swept")
 
+                        # Mid daily range (40-60%): JP mentor v7 — "kind of in the middle
+                        # of the range, market could go up or down, I'm a bit concerned."
+                        # Neither premium nor discount = no directional edge from range position.
+                        _pdh_i = _pdh[i]; _pdl_i = _pdl[i]
+                        if (not np.isnan(_pdh_i) and not np.isnan(_pdl_i)
+                                and _pdh_i > _pdl_i):
+                            _d_rng = _pdh_i - _pdl_i
+                            _pct   = (cv - _pdl_i) / _d_rng
+                            if 0.40 <= _pct <= 0.60:
+                                score -= 1; reasons.append("-Mid daily range")
+
                         ob_lo, ob_hi = _find_bullish_ob(open_, close, high, low, i - 2, self.ob_lookback)
                         if ob_lo is not None and min(ob_hi, lv) - max(ob_lo, h2) > 0:
                             score += 2; is_model3 = True; reasons.append("Order block (M3) +2")
@@ -761,6 +825,16 @@ class AiDENIndexStrategy(Strategy):
                                 and not np.isnan(_cdh_i) and not np.isnan(_cdl_i)
                                 and _cdh_i >= _ph_i and _cdl_i <= _pl_i):
                             score -= 1; reasons.append("-Both Asian H+L swept")
+
+                        # Mid daily range (40-60%): JP mentor v7 — "kind of in the middle
+                        # of the range, market could go up or down, I'm a bit concerned."
+                        _pdh_i = _pdh[i]; _pdl_i = _pdl[i]
+                        if (not np.isnan(_pdh_i) and not np.isnan(_pdl_i)
+                                and _pdh_i > _pdl_i):
+                            _d_rng = _pdh_i - _pdl_i
+                            _pct   = (cv - _pdl_i) / _d_rng
+                            if 0.40 <= _pct <= 0.60:
+                                score -= 1; reasons.append("-Mid daily range")
 
                         ob_lo, ob_hi = _find_bearish_ob(open_, close, high, low, i - 2, self.ob_lookback)
                         if ob_lo is not None and min(ob_hi, l2) - max(ob_lo, hv) > 0:
