@@ -140,15 +140,19 @@ class LevelMonitor:
                 levels.append(KeyLevel(f"PB High D-{_pb_day}", _pb_h, +1, "D1", now))
                 levels.append(KeyLevel(f"PB Low D-{_pb_day}",  _pb_l, -1, "D1", now))
 
-        # ── Asian Session H/L (00:00–07:00 UTC of today) ─────────────────────
+        # ── Asian Session H/L + 50% midpoint (00:00–07:00 UTC of today) ────────
+        # JP mentor v6: "50% of the Asian session range is a point of interest
+        # where maybe this market decides to come back down in here before continuing."
         asian_start = today_utc
         asian_end   = today_utc.replace(hour=7)
         asian_mask  = (times >= asian_start) & (times < asian_end)
         if asian_mask.any():
             a_high = float(high[asian_mask].max())
             a_low  = float(low[asian_mask].min())
+            a_mid  = (a_high + a_low) / 2.0
             levels.append(KeyLevel("Asian Session High", a_high, +1, "Asian", now))
             levels.append(KeyLevel("Asian Session Low",  a_low,  -1, "Asian", now))
+            levels.append(KeyLevel("Asian 50% Mid",      a_mid,   0, "Asian", now))
 
         # ── Weekly H/L (Mon 00:00 UTC of current week) ───────────────────────
         days_since_mon = now.weekday()  # Monday=0

@@ -1812,10 +1812,11 @@ class TradingEngine(Component):
                     # DXY alignment check — metals and forex pairs with known DXY correlation.
                     # JP mentor: "Dixie is the driving force behind GU and EU — if Dixie gains
                     # strength, GU and EU come down because the dollar side gets heavier."
-                    # Metals (XAUUSD, XAGUSD): inverse relationship — DXY bullish = metals bearish.
-                    # Forex USD pairs (GBPUSD, EURUSD): inverse relationship — DXY bullish = pair bearish.
+                    # XAGUSD, GBPUSD, EURUSD: inverse DXY relationship — DXY bullish = pair bearish.
+                    # XAUUSD excluded: JP mentor v6 — gold is "its own entity / safe haven",
+                    # "the correlation isn't that tight" — DXY filter overfits on gold.
                     # → DXY is a FILTER (opposition = -1), not a bonus (alignment = no change).
-                    _DXY_INVERSE = {"XAUUSD", "XAGUSD", "GBPUSD", "EURUSD"}
+                    _DXY_INVERSE = {"XAGUSD", "GBPUSD", "EURUSD"}
                     if self._symbol in _DXY_INVERSE:
                         _dxy_bias = self._fetch_dxy_bias()
                         if _dxy_bias != 0:
