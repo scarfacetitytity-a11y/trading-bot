@@ -594,6 +594,12 @@ class AiDENIndexStrategy(Strategy):
                             mid = swing_lo + (swing_hi - swing_lo) * self.discount_pct
                             if cv < mid:
                                 score += 1; reasons.append("Discount zone")
+                            # H4 impulse 50% POI: price at midpoint of H4 swing range.
+                            # JP mentor video 5: "50% of the impulse is always a point of interest"
+                            # — more specific than discount zone, rewards being exactly at the wall.
+                            h4_rng = swing_hi - swing_lo
+                            if h4_rng > 0 and abs(cv - mid) <= 0.10 * h4_rng:
+                                score += 1; reasons.append("H4 impulse 50%")
 
                         # ── Negatives — reasons NOT to trade ─────────────────
                         # No liquidity sweep: longs need to see prior lows swept before entry.
@@ -707,6 +713,10 @@ class AiDENIndexStrategy(Strategy):
                             mid = swing_lo + (swing_hi - swing_lo) * self.discount_pct
                             if cv > mid:
                                 score += 1; reasons.append("Premium zone")
+                            # H4 impulse 50% POI (SHORT): same logic, bearish direction
+                            h4_rng = swing_hi - swing_lo
+                            if h4_rng > 0 and abs(cv - mid) <= 0.10 * h4_rng:
+                                score += 1; reasons.append("H4 impulse 50%")
 
                         # ── Negatives — reasons NOT to trade ─────────────────
                         if _liq_swept_high(high, i, self.liq_lookback):

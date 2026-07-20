@@ -91,7 +91,8 @@ _CORR_GROUPS: list[set] = [
     {"US30.cash", "US100.cash", "US500.cash", "US2000.cash"},  # US indices
     {"UK100.cash", "GER40.cash"},                               # EU indices
     {"XAUUSD", "XAGUSD"},                                       # metals
-    {"GBPUSD", "EURUSD"},                                       # DXY-driven forex pairs
+    {"GBPUSD", "EURUSD"},                                       # DXY-driven forex pairs (inverse)
+    {"USDJPY"},                                                  # JPY pair — BOJ-sensitive, standalone
 ]
 
 # Max concurrent SAME-direction positions within a correlation group.

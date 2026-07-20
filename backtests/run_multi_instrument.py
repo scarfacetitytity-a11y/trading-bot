@@ -51,6 +51,8 @@ INSTRUMENTS = {
     # Forex — JP mentor primary pairs; DXY inverse filter applied at execution layer
     "GBPUSD":      dict(session_start=7,  session_end=21),   # London + NY crossover
     "EURUSD":      dict(session_start=7,  session_end=21),   # London + NY crossover
+    # JPY pair — Alan + mentor: "UJ is one of the most important currencies; BOJ drives markets"
+    "USDJPY":      dict(session_start=0,  session_end=21),   # Tokyo + London + NY (all sessions)
     # Metals
     "XAUUSD":      dict(session_start=7,  session_end=21),   # London + NY
     # US indices — NY session

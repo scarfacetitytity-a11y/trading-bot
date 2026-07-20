@@ -126,6 +126,20 @@ class LevelMonitor:
             levels.append(KeyLevel("Prior D1 High", d1_high, +1, "D1", now))
             levels.append(KeyLevel("Prior D1 Low",  d1_low,  -1, "D1", now))
 
+        # ── Previous Battlefields (PB) — D1 swing extremes from past 2–7 days ─
+        # JP mentor video 5: "When the market came back and tapped into a previous
+        # battlefield, that is an easy trade." A PB is a prior day's swing high/low
+        # that price previously reversed from — strong POI when price returns.
+        for _pb_day in range(2, 8):
+            _pb_start = today_utc - pd.Timedelta(days=_pb_day)
+            _pb_end   = today_utc - pd.Timedelta(days=_pb_day - 1)
+            _pb_mask  = (times >= _pb_start) & (times < _pb_end)
+            if _pb_mask.any():
+                _pb_h = float(high[_pb_mask].max())
+                _pb_l = float(low[_pb_mask].min())
+                levels.append(KeyLevel(f"PB High D-{_pb_day}", _pb_h, +1, "D1", now))
+                levels.append(KeyLevel(f"PB Low D-{_pb_day}",  _pb_l, -1, "D1", now))
+
         # ── Asian Session H/L (00:00–07:00 UTC of today) ─────────────────────
         asian_start = today_utc
         asian_end   = today_utc.replace(hour=7)
