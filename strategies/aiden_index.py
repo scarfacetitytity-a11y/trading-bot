@@ -430,6 +430,27 @@ class AiDENIndexStrategy(Strategy):
         _presess_mid = (_ph + _pl) / 2.0
         _presess_rng = _ph - _pl
 
+        # ── London session range (JP mentor video 4: NY taps into 50% of London range) ──
+        # London session: 07:00–12:00 UTC. When NY opens (hour >= 13) and price is at
+        # 50% of today's London H/L → strong POI. "NY pushed up to 50% of previous session
+        # (London) and had huge wick rejection, then continued London's bearish energy."
+        _lon_ph = np.full(len(df), np.nan)  # London session high per bar
+        _lon_pl = np.full(len(df), np.nan)  # London session low per bar
+        _london_start_h, _london_end_h = 7, 12
+        for _k, _d in enumerate(_all_dates_list):
+            _idxs  = _date_idx_map[_d]
+            _lon_m = np.where(
+                (hours.iloc[_idxs].values >= _london_start_h) &
+                (hours.iloc[_idxs].values < _london_end_h)
+            )[0]
+            if len(_lon_m):
+                _lh = float(high.iloc[_idxs[_lon_m]].max())
+                _ll = float(low.iloc[_idxs[_lon_m]].min())
+                _lon_ph[_idxs] = _lh
+                _lon_pl[_idxs] = _ll
+        _lon_mid = (_lon_ph + _lon_pl) / 2.0
+        _lon_rng = _lon_ph - _lon_pl
+
         h4["bias"]   = h4_bias.values
         h4["spread"] = h4_spread.values
         h4_times     = h4["time"]
@@ -636,6 +657,12 @@ class AiDENIndexStrategy(Strategy):
                                 score += 1; reasons.append("Asian 50% level")
                             if not np.isnan(_pdl_i) and _pl[i] < _pdl_i:
                                 score += 1; reasons.append("Early leakage (London sweep)")
+                        # London 50% level as NY POI: when NY is open and price taps into
+                        # 50% of the London session range — mentor video 4: "NY pushed up
+                        # to 50% of the previous session (London) and had huge wick rejection"
+                        if hour >= 13 and not np.isnan(_lon_mid[i]) and _lon_rng[i] > 0:
+                            if abs(cv - _lon_mid[i]) <= 0.20 * _lon_rng[i]:
+                                score += 1; reasons.append("London 50% NY POI")
                         if (not np.isnan(_pdh_i) and not np.isnan(_pdl_i)
                                 and hv < _pdh_i and lv > _pdl_i
                                 and (_pdh_i - cv) < (cv - _pdl_i)):
@@ -739,6 +766,10 @@ class AiDENIndexStrategy(Strategy):
                                 score += 1; reasons.append("Asian 50% level")
                             if not np.isnan(_pdh_i) and _ph[i] > _pdh_i:
                                 score += 1; reasons.append("Early leakage (London sweep)")
+                        # London 50% level as NY POI (SHORT): same logic, bearish direction
+                        if hour >= 13 and not np.isnan(_lon_mid[i]) and _lon_rng[i] > 0:
+                            if abs(cv - _lon_mid[i]) <= 0.20 * _lon_rng[i]:
+                                score += 1; reasons.append("London 50% NY POI")
                         if (not np.isnan(_pdh_i) and not np.isnan(_pdl_i)
                                 and hv < _pdh_i and lv > _pdl_i
                                 and (cv - _pdl_i) < (_pdh_i - cv)):

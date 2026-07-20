@@ -874,6 +874,22 @@ class TradingEngine(Component):
                 return sl, tp, 0.0
 
             risk_pct = float(self._trade_cfg.get("risk_pct", 1.0)) / 100
+            # Automatic risk reduction during news-heavy/volatile days.
+            # JP mentor video 4: "Be risk off — half a percent. Take what you're given."
+            # If >= 2 high-impact events are upcoming within 4 hours, cap risk at 50%.
+            if self._news_gate is not None:
+                try:
+                    _nctx = self._news_gate.get_context()
+                    _high_soon = [
+                        e for e in _nctx.upcoming_high
+                        if e.minutes_until <= 240
+                    ]
+                    if len(_high_soon) >= 2:
+                        risk_pct *= 0.5
+                        logger.info("[%s] News-heavy period (%d events ≤4h) → risk halved to %.3f%%",
+                                    self.name, len(_high_soon), risk_pct * 100)
+                except Exception:
+                    pass
             if info and info.trade_tick_size > 0 and dist > 0:
                 point_value_per_lot = (
                     info.trade_tick_value / info.trade_tick_size * info.point

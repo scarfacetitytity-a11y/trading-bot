@@ -159,6 +159,17 @@ class LevelMonitor:
             levels.append(KeyLevel("Prior NY High", ny_high, +1, "NY", now))
             levels.append(KeyLevel("Prior NY Low",  ny_low,  -1, "NY", now))
 
+        # ── London Session 50% Midpoint (07:00–12:00 UTC today) ────────────────
+        # JP mentor video 4: "NY pushed up to 50% of the London session and had
+        # huge wick rejection, then continued London's bearish energy."
+        lon_start_h, lon_end_h = 7, 12
+        lon_mask = (times >= today_utc) & (times.dt.hour >= lon_start_h) & (times.dt.hour < lon_end_h)
+        if lon_mask.any():
+            lon_high = float(high[lon_mask].max())
+            lon_low  = float(low[lon_mask].min())
+            lon_mid  = (lon_high + lon_low) / 2.0
+            levels.append(KeyLevel("London 50% Mid", lon_mid, 0, "London", now))
+
         # ── H4 Swing Highs / Lows (last 5 H4 bars) ───────────────────────────
         h4_start = today_utc - pd.Timedelta(hours=20)
         h4_mask  = times >= h4_start
