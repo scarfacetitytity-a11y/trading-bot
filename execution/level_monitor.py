@@ -146,6 +146,19 @@ class LevelMonitor:
             levels.append(KeyLevel("Weekly High", w_high, +1, "Weekly", now))
             levels.append(KeyLevel("Weekly Low",  w_low,  -1, "Weekly", now))
 
+        # ── Prior NY Session H/L (12:00–21:00 UTC yesterday) ────────────────────
+        # JP mentor places alerts at "New York session highs" as key POIs.
+        ny_start_h, ny_end_h = 12, 21
+        ny_mask = (
+            (times >= yesterday) & (times < today_utc)
+            & (times.dt.hour >= ny_start_h) & (times.dt.hour < ny_end_h)
+        )
+        if ny_mask.any():
+            ny_high = float(high[ny_mask].max())
+            ny_low  = float(low[ny_mask].min())
+            levels.append(KeyLevel("Prior NY High", ny_high, +1, "NY", now))
+            levels.append(KeyLevel("Prior NY Low",  ny_low,  -1, "NY", now))
+
         # ── H4 Swing Highs / Lows (last 5 H4 bars) ───────────────────────────
         h4_start = today_utc - pd.Timedelta(hours=20)
         h4_mask  = times >= h4_start

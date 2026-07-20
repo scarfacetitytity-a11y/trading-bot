@@ -22,6 +22,8 @@ OS Confluence scoring (max 10 per setup):
     extreme = London reversal sweep setup)
   Inside day + closer target (trade toward       +1  [JP mentor]
     nearer daily high/low when inside day)
+  PDH/PDL swept today (9/10 sessions market takes +1  [JP mentor v2]
+    prior D1 high or low — confirmed tick in box)
   D1 aligned (daily EMA agrees with H4) ......... +1  [optional]
 
 Dynamic RR:
@@ -371,12 +373,15 @@ class AiDENIndexStrategy(Strategy):
         # For each UTC day, compute the high/low of bars BEFORE session_start (the
         # "Asian" or pre-market range) and the previous day's high/low. Three new
         # confluences are derived from these at FVG detection time (below).
+        # _cdh/_cdl: running daily high/low up to each bar (for PDH/PDL sweep check).
         _dates_arr       = times.dt.normalize()
         _all_dates_list  = sorted(_dates_arr.unique())
         _ph  = np.full(len(df), np.nan)
         _pl  = np.full(len(df), np.nan)
         _pdh = np.full(len(df), np.nan)  # prior day high
         _pdl = np.full(len(df), np.nan)  # prior day low
+        _cdh = np.full(len(df), np.nan)  # current day running high at bar i
+        _cdl = np.full(len(df), np.nan)  # current day running low at bar i
         _date_idx_map: dict = {}
         for _d in _all_dates_list:
             _date_idx_map[_d] = np.where((_dates_arr == _d).values)[0]
@@ -386,6 +391,12 @@ class AiDENIndexStrategy(Strategy):
             if len(_pre):
                 _ph[_idxs] = float(high.iloc[_idxs[_pre]].max())
                 _pl[_idxs] = float(low.iloc[_idxs[_pre]].min())
+            # Running cumulative high/low within each day
+            _hi_vals = high.iloc[_idxs].values
+            _lo_vals = low.iloc[_idxs].values
+            for _j in range(len(_idxs)):
+                _cdh[_idxs[_j]] = float(np.max(_hi_vals[:_j + 1]))
+                _cdl[_idxs[_j]] = float(np.min(_lo_vals[:_j + 1]))
             if _k > 0:
                 _pi = _date_idx_map[_all_dates_list[_k - 1]]
                 _pdh[_idxs] = float(high.iloc[_pi].max())
@@ -581,6 +592,10 @@ class AiDENIndexStrategy(Strategy):
                         # Manipulation W: sweep of prior lows + right shoulder + CHoCH
                         if _manipulation_w(high, low, i, lookback=min(20, i)):
                             score += 1; reasons.append("Manipulation W")
+                        # PDL swept today (+1): today's running low has taken prior day low
+                        # JP mentor: 9/10 sessions the market takes PDH or PDL — tick in box
+                        if not np.isnan(_pdl[i]) and not np.isnan(_cdl[i]) and _cdl[i] < _pdl[i]:
+                            score += 1; reasons.append("PDL swept today")
 
                         if score >= self.min_score:
                             active_fvgs.append({
@@ -655,6 +670,9 @@ class AiDENIndexStrategy(Strategy):
                         # Manipulation M: sweep of prior highs + right shoulder + CHoCH
                         if _manipulation_m(high, low, i, lookback=min(20, i)):
                             score += 1; reasons.append("Manipulation M")
+                        # PDH swept today (+1): today's running high has taken prior day high
+                        if not np.isnan(_pdh[i]) and not np.isnan(_cdh[i]) and _cdh[i] > _pdh[i]:
+                            score += 1; reasons.append("PDH swept today")
 
                         if score >= self.min_score:
                             active_fvgs.append({
