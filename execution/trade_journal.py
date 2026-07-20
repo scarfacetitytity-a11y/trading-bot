@@ -199,13 +199,26 @@ class TradeJournal:
             for t in self._load_recent(200)
             if t.get("open_time", "")[:10] == datetime.now(tz=timezone.utc).date().isoformat()
         )
-        tg.notify_trade_close(
-            symbol=rec.symbol, direction=rec.direction,
-            outcome=rec.outcome or "unknown",
+        tg.notify_trade_review(
+            symbol=rec.symbol,
+            direction=rec.direction,
+            score=rec.score,
+            entry=rec.entry_price,
+            sl=rec.sl_price,
+            tp=rec.tp_price,
+            close_price=close_price,
             r_multiple=rec.r_multiple or 0.0,
             pnl_usd=rec.pnl_usd or 0.0,
             equity=equity_after,
             session_pnl=session_pnl,
+            outcome=rec.outcome or "unknown",
+            thesis=rec.thesis,
+            reasons=rec.reasons,
+            hit_target=rec.hit_target,
+            mfe_r=rec.mfe_r,
+            mae_r=rec.mae_r,
+            lesson=rec.lesson,
+            review_notes=rec.review_notes,
         )
 
     # ── Misfire postmortem — the self-improvement ledger ──────────────────────

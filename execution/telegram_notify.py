@@ -290,6 +290,80 @@ def notify_trade_close(
     )
 
 
+def notify_trade_review(
+    symbol:       str,
+    direction:    int,
+    score:        int,
+    entry:        float,
+    sl:           float,
+    tp:           Optional[float],
+    close_price:  float,
+    r_multiple:   float,
+    pnl_usd:      float,
+    equity:       float,
+    session_pnl:  float,
+    outcome:      str,
+    thesis:       Optional[str]  = None,
+    reasons:      Optional[list] = None,
+    hit_target:   Optional[bool] = None,
+    mfe_r:        Optional[float] = None,
+    mae_r:        Optional[float] = None,
+    lesson:       Optional[str]  = None,
+    review_notes: Optional[list] = None,
+) -> None:
+    """Full post-trade analysis message — entry, TP, thesis, convictions, result, lesson, balance."""
+    icons   = {"win": "✅", "loss": "❌", "breakeven": "➖", "unknown": "❓"}
+    icon    = icons.get(outcome, "❓")
+    dir_str = "LONG" if direction == 1 else "SHORT"
+    s_sign  = "+" if session_pnl >= 0 else ""
+    r_sign  = "+" if r_multiple >= 0 else ""
+    usd_sign = "+" if pnl_usd >= 0 else ""
+
+    tp_str = f"{tp:.5g}" if tp else "—"
+
+    msg = (
+        f"{icon} <b>{dir_str}  {symbol}  {r_sign}{r_multiple:.2f}R</b>\n\n"
+        f"<b>Entry</b> <code>{entry:.5g}</code>  ·  "
+        f"<b>TP</b> <code>{tp_str}</code>  ·  "
+        f"<b>SL</b> <code>{sl:.5g}</code>\n"
+        f"<b>Close</b> <code>{close_price:.5g}</code>  ·  "
+        f"<b>P&L</b> <code>{usd_sign}${pnl_usd:,.2f}</code>\n\n"
+    )
+
+    if thesis:
+        msg += f"<b>Thesis:</b> {thesis}\n\n"
+
+    msg += f"<b>Score:</b> {score}/10 {_score_bar_blocks(score)} <b>{_conviction(score)}</b>\n"
+    if reasons:
+        msg += "".join(f"   ✓ {r}\n" for r in reasons)
+
+    msg += "\n"
+
+    # Path analysis
+    if mfe_r is not None and mae_r is not None:
+        msg += (
+            f"<b>MFE</b> {'+' if mfe_r >= 0 else ''}{mfe_r:.2f}R  ·  "
+            f"<b>MAE</b> {mae_r:.2f}R"
+        )
+        if hit_target is not None:
+            msg += f"  ·  <b>Target hit:</b> {'YES' if hit_target else 'NO'}"
+        msg += "\n"
+
+    if lesson:
+        msg += f"\n<b>Lesson:</b> <i>{lesson}</i>\n"
+    if review_notes:
+        for n in review_notes:
+            msg += f"   • {n}\n"
+
+    msg += (
+        f"\n💰 <b>Balance:</b> ${equity:,.2f}  "
+        f"| <b>Session:</b> {s_sign}${session_pnl:,.2f}\n"
+        f"🕐 {datetime.now(tz=timezone.utc).strftime('%H:%M UTC')}"
+    )
+
+    _send_text(msg)
+
+
 def notify_council_flag(member: str, message: str) -> None:
     _send_text(
         f"⚠️ <b>Council #{member}</b>\n\n"
