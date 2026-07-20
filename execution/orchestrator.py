@@ -1966,7 +1966,14 @@ class Orchestrator:
         # Shared RiskAgent + FTMO tracker — both persist state to disk
         initial_equity = trade_cfg.get("initial_equity", 10_000)
         challenge_type = trade_cfg.get("ftmo_challenge", "2step-p1")
-        self._risk_agent   = RiskAgent(initial_equity=initial_equity)
+        self._risk_agent   = RiskAgent(
+            initial_equity=initial_equity,
+            config=RiskConfig(
+                max_account_dd_pct=float(trade_cfg.get("total_kill_pct", 9.5)) / 100,
+                max_daily_loss_pct=float(trade_cfg.get("daily_halt_pct", 2.0)) / 100,
+                max_weekly_dd_pct=float(trade_cfg.get("soft_dd_halt_pct", 9.0)) / 100,
+            ),
+        )
         self._ftmo_tracker = FTMOTracker(initial_equity=initial_equity, challenge=challenge_type)
         log_cfg            = cfg.get("logging", {})
         self._journal      = TradeJournal(log_dir=log_cfg.get("log_dir", "logs"))
