@@ -30,6 +30,8 @@ OS Confluence scoring:
   Weekly discount/premium (range position) ...... +1  [JP mentor v7]
   NY swept London Low/High ..................... +1  [JP mentor v7]
   Double bottom/top cluster at FVG ............. +1  [JP mentor v9]
+  Multi-TF synchrony (H4 or D1 close alignment) +1  [JP mentor — candle close confluence]
+  USDJPY macro aligned (DXY-linked instruments)  +1  [JP mentor v7 — UJ as DXY proxy]
 
 Negative confluences (subtract from score):
   No liquidity sweep                             -1  (market uncleared)
@@ -379,6 +381,9 @@ class AiDENIndexStrategy(Strategy):
         self.t1_partial_pct       = t1_partial_pct
         self.time_stop_bars       = time_stop_bars
         self._last_h4_bias:       int = 0   # updated on each generate_signals call
+        # Gap 7 — USDJPY macro H4 bias; set externally by orchestrator before each bar.
+        # +1 = USD trending up (JPY weak), -1 = USD trending down, 0 = neutral/unknown.
+        self._uj_h4_bias:         int = 0
 
     @property
     def name(self) -> str:
@@ -842,6 +847,26 @@ class AiDENIndexStrategy(Strategy):
                         if _db_count >= 2:
                             score += 1; reasons.append("Double bottom cluster")
 
+                        # Gap 10 — Multi-TF synchrony (+1): H4 or D1 candle close alignment.
+                        # JP mentor: entering on a candle that closes multiple TFs simultaneously
+                        # concentrates institutional order flow at that moment.
+                        _bar_hour = hour if isinstance(hour, int) else int(hours.iloc[i])
+                        if _bar_hour % 4 == 0:
+                            score += 1; reasons.append("H4 sync")
+                        elif _bar_hour == 0:
+                            score += 1; reasons.append("D1 sync")
+
+                        # Gap 7 — USDJPY macro filter (+1/-1 for DXY-linked instruments).
+                        # JP mentor v7: "I look at UJ — it tells me the DXY direction."
+                        # EURUSD/GBPUSD/XAUUSD/XAGUSD are DXY-inverse: USDJPY bullish
+                        # (USD strong) means these pairs naturally weaken → penalise longs.
+                        # USDJPY bearish (USD weak) → tailwind for longs → reward.
+                        if self._uj_h4_bias != 0:
+                            if self._uj_h4_bias == 1:
+                                score -= 1; reasons.append("-UJ macro headwind (long)")
+                            else:  # _uj_h4_bias == -1
+                                score += 1; reasons.append("UJ macro tailwind (long)")
+
                         if score >= self.min_score:
                             active_fvgs.append({
                                 "dir":      "bull",
@@ -997,6 +1022,22 @@ class AiDENIndexStrategy(Strategy):
                         )
                         if _dt_count >= 2:
                             score += 1; reasons.append("Double top cluster")
+
+                        # Gap 10 — Multi-TF synchrony (+1)
+                        _bar_hour_s = hour if isinstance(hour, int) else int(hours.iloc[i])
+                        if _bar_hour_s % 4 == 0:
+                            score += 1; reasons.append("H4 sync")
+                        elif _bar_hour_s == 0:
+                            score += 1; reasons.append("D1 sync")
+
+                        # Gap 7 — USDJPY macro filter (SHORT, DXY-inverse instruments).
+                        # USDJPY bullish (USD strong) → DXY-inverse pairs weaken → tailwind for shorts.
+                        # USDJPY bearish (USD weak) → DXY-inverse pairs strengthen → headwind for shorts.
+                        if self._uj_h4_bias != 0:
+                            if self._uj_h4_bias == 1:
+                                score += 1; reasons.append("UJ macro tailwind (short)")
+                            else:  # _uj_h4_bias == -1
+                                score -= 1; reasons.append("-UJ macro headwind (short)")
 
                         if score >= self.min_score:
                             active_fvgs.append({

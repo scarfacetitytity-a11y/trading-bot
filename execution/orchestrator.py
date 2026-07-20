@@ -1486,11 +1486,14 @@ class TradingEngine(Component):
                     if _lv.name == "Asian 50% Mid":
                         _asian_50 = _lv.price
                         break
+            _t1_price: Optional[float] = (
+                self._last_plan.t1_price if self._last_plan is not None else None
+            )
             mdec = analyze_manage(
                 df=df_mgmt, direction=pos_dir, entry=entry, initial_sl=init_sl,
                 current_sl=live_sl, current_tp=live_tp, price=mid_price,
                 atr=atr_m, trade_type=ttype, cur_r=cur_r, bank_min_r=bank_r,
-                asian_50=_asian_50,
+                asian_50=_asian_50, t1_price=_t1_price,
             )
             apply_sl = mdec.new_sl if (mdec.new_sl is not None and (
                 (pos_dir == 1 and mdec.new_sl > live_sl + 1e-8) or
@@ -1645,6 +1648,31 @@ class TradingEngine(Component):
                 df = pd.DataFrame(rates)
                 df["time"] = pd.to_datetime(df["time"], unit="s", utc=True)
                 df = df[["time", "open", "high", "low", "close", "tick_volume"]]
+
+                # Gap 7 — USDJPY macro filter: set H4 bias on strategy before signal gen.
+                # Only applies to DXY-inverse instruments (EUR/GBP/metals).
+                # USDJPY bullish = USD strong = headwind for DXY-inverse longs.
+                _DXY_INVERSE = {"EURUSD", "GBPUSD", "XAUUSD", "XAGUSD"}
+                if self._symbol in _DXY_INVERSE and hasattr(self._strategy, "_uj_h4_bias"):
+                    try:
+                        _uj_rates = mt5.copy_rates_from_pos(
+                            "USDJPY", TIMEFRAME_MAP.get("H1", mt5.TIMEFRAME_H1), 0, 200
+                        )
+                        if _uj_rates is not None and len(_uj_rates) >= 20:
+                            _uj_df = pd.DataFrame(_uj_rates)
+                            _uj_df["time"] = pd.to_datetime(_uj_df["time"], unit="s", utc=True)
+                            from strategies.aiden_index import _resample_h4 as _uj_resample_h4
+                            from strategies.aiden_index import _compute_h4_bias_ema as _uj_bias_fn
+                            _uj_h4 = _uj_resample_h4(_uj_df)
+                            if len(_uj_h4) >= 10:
+                                _uj_bias, _ = _uj_bias_fn(_uj_h4, 10, 20)
+                                self._strategy._uj_h4_bias = int(_uj_bias.iloc[-1]) if len(_uj_bias) > 0 else 0
+                            else:
+                                self._strategy._uj_h4_bias = 0
+                        else:
+                            self._strategy._uj_h4_bias = 0
+                    except Exception:
+                        self._strategy._uj_h4_bias = 0
 
                 signals = self._strategy.generate_signals(df)
                 desired = int(signals.iloc[-1])

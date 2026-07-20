@@ -59,6 +59,11 @@ class TradePlan:
     stop_src:    str                   # sweep | swing_low/high | order_block | atr_fallback
     thesis:      str                   # human-readable WHY
     n_touches:   int = 0               # liquidity-pool touch count (higher = stronger draw)
+    # Gap 12 — T1 at first structural obstacle between entry and main target.
+    # JP mentor: "when it hits a level, it's going to react — go risk-free there."
+    # BE is triggered at t1_price rather than at a fixed R multiple.
+    t1_price:    Optional[float] = None   # nearest structural level between entry and tp
+    t1_src:      str = ""
 
 
 @dataclass
@@ -110,6 +115,42 @@ def _find_target(
 
     src = ("equal_highs" if direction == 1 else "equal_lows") if best_touches >= 2 else "swing"
     return float(best_level), src, int(best_touches)
+
+
+def _find_t1(
+    df: pd.DataFrame, direction: int, entry: float, target: float, atr: float,
+) -> tuple[Optional[float], str]:
+    """Return (t1_price, source) — the nearest structural level between entry and
+    the main target that price is likely to react at on the way there.
+
+    JP mentor: "when it hits a level, it's going to react — go risk-free there."
+    Used as a structural BE trigger instead of a fixed R multiple.
+    Returns None if no qualifying level exists between entry and target.
+    """
+    if df is None or len(df) < LOOKBACK_BARS or atr <= 0 or abs(target - entry) < atr * 0.5:
+        return None, ""
+
+    window  = df.tail(LOOKBACK_BARS)
+    min_gap = atr * MIN_BEYOND_ATR    # level must be meaningfully beyond entry
+    max_gap = abs(target - entry)     # cap at the main target — don't look past it
+
+    if direction == 1:
+        sh   = _swing_highs(window["high"], order=SWING_ORDER)
+        vals = window["high"][sh].values
+        # levels between entry+min_gap and target
+        cands = [h for h in vals if entry + min_gap <= h <= target]
+    else:
+        sl   = _swing_lows(window["low"], order=SWING_ORDER)
+        vals = window["low"][sl].values
+        cands = [l for l in vals if target <= l <= entry - min_gap]
+
+    if not cands:
+        return None, ""
+
+    # Nearest structural level — the first obstacle price faces
+    nearest = min(cands, key=lambda x: abs(x - entry))
+    src = "swing_t1"
+    return float(nearest), src
 
 
 def _find_structural_stop(
@@ -350,10 +391,17 @@ def analyze_entry(
     thesis = (f"{trade_type}: stop@{stop_src} {s_stop:.5f} -> draw to {pool} @ {tgt:.5f} "
               f"(RR {rr:.2f}, H4 {'aligned' if aligned else 'neutral'})")
 
+    # Gap 12 — T1 at first structural obstacle between entry and main target.
+    # Use M5 first (more granular), fall back to M15.
+    t1_px, t1_src = _find_t1(df_m5, direction, entry, tgt, atr)
+    if t1_px is None:
+        t1_px, t1_src = _find_t1(df_m15, direction, entry, tgt, atr)
+
     return TradePlan(
         tradeable=(grade != "C"), tp=round(tgt, 6), stop=round(s_stop, 6),
         rr=round(rr, 2), trade_type=trade_type, grade=grade, size_mult=size_mult,
         target_src=src, stop_src=stop_src, thesis=thesis, n_touches=touches,
+        t1_price=round(t1_px, 6) if t1_px is not None else None, t1_src=t1_src,
     )
 
 
@@ -379,6 +427,7 @@ def manage_trade(
     cur_r:       float,
     bank_min_r:  float = 0.0,
     asian_50:    Optional[float] = None,
+    t1_price:    Optional[float] = None,
 ) -> ManageDecision:
     """Adaptive per-type management. Moves the stop to new structure as the trade
     develops (tighten-only) and extends the target to the next draw when price
@@ -413,6 +462,21 @@ def manage_trade(
             elif direction == -1 and be < current_sl:
                 dec.new_sl = be
                 dec.reason = "BE@Asian50%"
+
+    # ── 0b. T1 structural POI → breakeven (Gap 12) ──
+    # JP mentor: "when it hits a level, it's going to react — go risk-free there."
+    # Fires before the R-based ratchet: structural level takes priority over arithmetic.
+    if t1_price is not None and dec.new_sl is None:
+        t1_reached = (direction == 1 and price >= t1_price) or \
+                     (direction == -1 and price <= t1_price)
+        if t1_reached:
+            be = entry
+            if direction == 1 and be > current_sl:
+                dec.new_sl = be
+                dec.reason = "BE@T1_POI"
+            elif direction == -1 and be < current_sl:
+                dec.new_sl = be
+                dec.reason = "BE@T1_POI"
 
     # ── 1. Breakeven ratchet (type-specific trigger) ──
     be_trigger = 0.5 if trade_type == "sweep_reversal" else 1.0
