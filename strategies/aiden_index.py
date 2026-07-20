@@ -32,6 +32,7 @@ OS Confluence scoring:
   Double bottom/top cluster at FVG ............. +1  [JP mentor v9]
   Multi-TF synchrony (H4 or D1 close alignment) +1  [JP mentor — candle close confluence]
   USDJPY macro aligned (DXY-linked instruments)  +1  [JP mentor v7 — UJ as DXY proxy]
+  Previous battlefield (prior congestion CHoCH)   +1  [JP mentor v10]
 
 Negative confluences (subtract from score):
   No liquidity sweep                             -1  (market uncleared)
@@ -258,6 +259,41 @@ def _manipulation_m(high: pd.Series, low: pd.Series, i: int, lookback: int = 20)
     current_close_below = float(low.iloc[i]) < prior_hi
     right_shoulder = post_hi < sweep_high
     return right_shoulder and current_close_below
+
+
+def _is_prior_battlefield(
+    high: pd.Series, low: pd.Series, close: pd.Series,
+    i: int, zone_lo: float, zone_hi: float, atr_val: float,
+    lookback: int = 50,
+) -> bool:
+    """Return True if the zone [zone_lo, zone_hi] overlaps with a prior congestion
+    area where there was a change of character (CHoCH).
+
+    JP mentor v10: "I came back into a previous battlefield — a zone where bulls and
+    bears have already fought. When price returns there it's a known reaction zone."
+
+    Detection: scan back `lookback` bars for a run of 3+ consecutive bars where:
+      1. Candle range < 0.5 × ATR (tight congestion — accumulation)
+      2. The congestion midpoint is within the current FVG zone
+    A prior CHoCH at/near the zone makes it a battlefield.
+    """
+    if i < lookback + 4 or atr_val <= 0:
+        return False
+
+    zone_mid = (zone_lo + zone_hi) / 2
+    tol      = max((zone_hi - zone_lo) / 2, atr_val * 0.3)
+
+    consecutive = 0
+    for j in range(max(0, i - lookback), i - 2):
+        bar_range = float(high.iloc[j]) - float(low.iloc[j])
+        bar_mid   = (float(high.iloc[j]) + float(low.iloc[j])) / 2
+        if bar_range < 0.5 * atr_val and abs(bar_mid - zone_mid) <= tol:
+            consecutive += 1
+            if consecutive >= 3:
+                return True
+        else:
+            consecutive = 0
+    return False
 
 
 def _liq_swept_low(low: pd.Series, i: int, lookback: int) -> bool:
@@ -847,6 +883,13 @@ class AiDENIndexStrategy(Strategy):
                         if _db_count >= 2:
                             score += 1; reasons.append("Double bottom cluster")
 
+                        # v10 — Previous battlefield (+1): price returns to a prior
+                        # congestion zone where bulls/bears already fought (prior CHoCH area).
+                        # JP mentor v10: "I came back into a previous battlefield — that's
+                        # how I was able to get into this trade."
+                        if _is_prior_battlefield(high, low, close, i, h2, lv, atr_val):
+                            score += 1; reasons.append("Prior battlefield")
+
                         # Gap 10 — Multi-TF synchrony (+1): H4 or D1 candle close alignment.
                         # JP mentor: entering on a candle that closes multiple TFs simultaneously
                         # concentrates institutional order flow at that moment.
@@ -1022,6 +1065,10 @@ class AiDENIndexStrategy(Strategy):
                         )
                         if _dt_count >= 2:
                             score += 1; reasons.append("Double top cluster")
+
+                        # v10 — Previous battlefield (+1): SHORT mirror
+                        if _is_prior_battlefield(high, low, close, i, hv, l2, atr_val):
+                            score += 1; reasons.append("Prior battlefield")
 
                         # Gap 10 — Multi-TF synchrony (+1)
                         _bar_hour_s = hour if isinstance(hour, int) else int(hours.iloc[i])

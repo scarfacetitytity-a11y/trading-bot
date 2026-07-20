@@ -371,6 +371,51 @@ def notify_council_flag(member: str, message: str) -> None:
     )
 
 
+def notify_preday_brief(brief: dict) -> None:
+    """Morning pre-day analysis brief.
+
+    brief keys:
+      date          : str  e.g. "Mon 21 Jul"
+      levels        : list of dict {symbol, label, price, note}
+      watchlist     : list of str  e.g. ["XAUUSD watching Asian sweep"]
+      news          : list of str  e.g. ["09:30 USD CPI (high)"]
+      equity        : float
+    """
+    lines = [
+        f"<b>AiDEN Pre-Day Brief — {brief.get('date', '')}</b>",
+        f"Equity: <b>${brief.get('equity', 0):,.0f}</b>",
+        "",
+    ]
+
+    news = brief.get("news", [])
+    if news:
+        lines.append("<b>Key News</b>")
+        for n in news[:6]:
+            lines.append(f"  • {n}")
+        lines.append("")
+
+    levels = brief.get("levels", [])
+    if levels:
+        lines.append("<b>Key Levels</b>")
+        sym_groups: dict = {}
+        for lv in levels:
+            sym_groups.setdefault(lv["symbol"], []).append(lv)
+        for sym, lvs in sym_groups.items():
+            lines.append(f"  <b>{sym}</b>")
+            for lv in lvs:
+                note = f" — {lv['note']}" if lv.get("note") else ""
+                lines.append(f"    {lv['label']}: {lv['price']:.5g}{note}")
+        lines.append("")
+
+    watchlist = brief.get("watchlist", [])
+    if watchlist:
+        lines.append("<b>Watching</b>")
+        for w in watchlist[:6]:
+            lines.append(f"  • {w}")
+
+    _send_text("\n".join(lines))
+
+
 # ── Telegram approval flow ────────────────────────────────────────────────────
 # Sends a trade proposal with APPROVE / VETO inline buttons.
 # Polls getUpdates for up to timeout_sec. Auto-decides on timeout based on score.

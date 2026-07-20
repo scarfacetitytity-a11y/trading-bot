@@ -2321,9 +2321,26 @@ class Orchestrator:
     # ── Monitor loop ─────────────────────────────────────────────────────────
 
     def _monitor_loop(self) -> None:
+        _preday_sent_date: Optional[str] = None   # track which UTC date brief was sent
         try:
             while not self.kill_switch.is_set():
                 self._print_dashboard()
+
+                # Pre-day brief — send once per day at London open (07:00 UTC)
+                _now = datetime.now(timezone.utc)
+                _today_str = _now.strftime("%Y-%m-%d")
+                if (_now.hour == 7 and _now.minute < 2
+                        and _preday_sent_date != _today_str):
+                    try:
+                        from execution.preday_analysis import run_preday_brief
+                        import MetaTrader5 as _mt5_pd
+                        _acct = _mt5_pd.account_info()
+                        _eq   = _acct.equity if _acct else 0.0
+                        run_preday_brief(self._symbols, _eq)
+                        _preday_sent_date = _today_str
+                    except Exception:
+                        logger.exception("[PreDay] brief failed")
+
                 time.sleep(MONITOR_INTERVAL)
         except KeyboardInterrupt:
             logger.info("Shutdown requested by user.")
