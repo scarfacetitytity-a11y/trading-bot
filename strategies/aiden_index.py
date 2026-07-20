@@ -125,6 +125,57 @@ def _find_bearish_ob(open_, close, high, low, start_i, lookback):
     return None, None
 
 
+def _manipulation_w(high: pd.Series, low: pd.Series, i: int, lookback: int = 20) -> bool:
+    """Detect Manipulation W pattern (bullish reversal) within the last `lookback` bars.
+
+    Structure: swing low → sweep below it (right shoulder wick) → close back above
+    the prior swing low = change of character. JP mentor's W = lower-low wick that
+    closes back up, indicating smart money swept retail longs then reversed.
+    """
+    if i < lookback + 4:
+        return False
+    window_lo = low.iloc[i - lookback:i + 1]
+    window_hi = high.iloc[i - lookback:i + 1]
+    # Find the lowest wick in the window (the sweep candle)
+    sweep_idx = int(window_lo.argmin())
+    if sweep_idx == 0 or sweep_idx >= lookback:
+        return False
+    sweep_low = float(window_lo.iloc[sweep_idx])
+    # Prior swing low = min before the sweep
+    prior_lo = float(window_lo.iloc[:sweep_idx].min())
+    # Sweep must go below prior low (the manipulation)
+    if sweep_low >= prior_lo:
+        return False
+    # Right shoulder: after the sweep, price makes a higher low (doesn't retake the sweep)
+    post_lo = float(window_lo.iloc[sweep_idx + 1:].min())
+    # Close of current bar must be above the prior swing low (change of character)
+    current_close_above = float(high.iloc[i]) > prior_lo
+    right_shoulder = post_lo > sweep_low
+    return right_shoulder and current_close_above
+
+
+def _manipulation_m(high: pd.Series, low: pd.Series, i: int, lookback: int = 20) -> bool:
+    """Detect Manipulation M pattern (bearish reversal) within the last `lookback` bars.
+
+    Structure: swing high → sweep above it → close back below = change of character.
+    """
+    if i < lookback + 4:
+        return False
+    window_hi = high.iloc[i - lookback:i + 1]
+    window_lo = low.iloc[i - lookback:i + 1]
+    sweep_idx = int(window_hi.argmax())
+    if sweep_idx == 0 or sweep_idx >= lookback:
+        return False
+    sweep_high = float(window_hi.iloc[sweep_idx])
+    prior_hi   = float(window_hi.iloc[:sweep_idx].max())
+    if sweep_high <= prior_hi:
+        return False
+    post_hi = float(window_hi.iloc[sweep_idx + 1:].max())
+    current_close_below = float(low.iloc[i]) < prior_hi
+    right_shoulder = post_hi < sweep_high
+    return right_shoulder and current_close_below
+
+
 def _liq_swept_low(low: pd.Series, i: int, lookback: int) -> bool:
     """Wick below prior N-bar swing low — used for LONG setups."""
     if i < lookback + 2:
@@ -518,20 +569,18 @@ class AiDENIndexStrategy(Strategy):
                         # ── JP Mentor confluences (Asian session structure) ──
                         _psm = _presess_mid[i]; _psr = _presess_rng[i]
                         _pdh_i = _pdh[i];       _pdl_i = _pdl[i]
-                        # Asian 50% level: FVG formed within 20% of pre-session range
-                        # around the midpoint — highest-probability London entry zone
                         if not np.isnan(_psm) and _psr > 0:
                             if abs(cv - _psm) <= 0.20 * _psr:
                                 score += 1; reasons.append("Asian 50% level")
-                            # Early leakage (long): pre-session swept prior day lows before
-                            # London opened — London completing the sweep = reversal buy
                             if not np.isnan(_pdl_i) and _pl[i] < _pdl_i:
                                 score += 1; reasons.append("Early leakage (London sweep)")
-                        # Inside day + closer target: trade toward the nearer daily extreme
                         if (not np.isnan(_pdh_i) and not np.isnan(_pdl_i)
                                 and hv < _pdh_i and lv > _pdl_i
                                 and (_pdh_i - cv) < (cv - _pdl_i)):
                             score += 1; reasons.append("Inside day (closer high)")
+                        # Manipulation W: sweep of prior lows + right shoulder + CHoCH
+                        if _manipulation_w(high, low, i, lookback=min(20, i)):
+                            score += 1; reasons.append("Manipulation W")
 
                         if score >= self.min_score:
                             active_fvgs.append({
@@ -597,14 +646,15 @@ class AiDENIndexStrategy(Strategy):
                         if not np.isnan(_psm) and _psr > 0:
                             if abs(cv - _psm) <= 0.20 * _psr:
                                 score += 1; reasons.append("Asian 50% level")
-                            # Early leakage (short): pre-session swept prior day highs —
-                            # London completing the sweep = reversal sell
                             if not np.isnan(_pdh_i) and _ph[i] > _pdh_i:
                                 score += 1; reasons.append("Early leakage (London sweep)")
                         if (not np.isnan(_pdh_i) and not np.isnan(_pdl_i)
                                 and hv < _pdh_i and lv > _pdl_i
                                 and (cv - _pdl_i) < (_pdh_i - cv)):
                             score += 1; reasons.append("Inside day (closer low)")
+                        # Manipulation M: sweep of prior highs + right shoulder + CHoCH
+                        if _manipulation_m(high, low, i, lookback=min(20, i)):
+                            score += 1; reasons.append("Manipulation M")
 
                         if score >= self.min_score:
                             active_fvgs.append({
