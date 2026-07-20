@@ -1727,6 +1727,27 @@ class TradingEngine(Component):
                         h4_bias = 0
                     against_trend = (h4_bias != 0 and desired != h4_bias)
                     needed = counter_min if against_trend else base_min
+
+                    # ── DD-aware score boost ───────────────────────────────────
+                    # When equity is deep in drawdown (within dd_score_boost_threshold %
+                    # of the soft halt), raise the bar. This gates marginal setups in
+                    # correlated instruments while still allowing genuinely high-conviction
+                    # trades to fire naturally (score high enough to clear the boosted floor).
+                    if self._risk_guard is not None:
+                        _init_eq   = getattr(self._risk_guard, "_initial_equity", None)
+                        _soft_pct  = float(self._trade_cfg.get("soft_dd_halt_pct", 7.0))
+                        _boost_thr = float(self._trade_cfg.get("dd_score_boost_threshold", 1.5))
+                        _boost_n   = int(self._trade_cfg.get("dd_score_boost", 2))
+                        if _init_eq and _init_eq > 0:
+                            _total_dd_pct = (_init_eq - equity) / _init_eq * 100
+                            if _total_dd_pct >= (_soft_pct - _boost_thr):
+                                old_needed = needed
+                                needed = needed + _boost_n
+                                logger.info(
+                                    "[%s] DD-boost active (DD=%.2f%%, within %.1f%% of soft halt): "
+                                    "score floor %d→%d",
+                                    self.name, _total_dd_pct, _boost_thr, old_needed, needed)
+
                     if signal_score < needed:
                         logger.info("[%s] LOW CONVICTION skip: %s score=%d < %d (%s)",
                                     self.name, "BUY" if desired == 1 else "SELL",
