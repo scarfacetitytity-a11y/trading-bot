@@ -1674,6 +1674,8 @@ class TradingEngine(Component):
                     except Exception:
                         self._strategy._uj_h4_bias = 0
 
+                if hasattr(self._strategy, "_symbol"):
+                    self._strategy._symbol = self._symbol
                 signals = self._strategy.generate_signals(df)
                 desired = int(signals.iloc[-1])
                 current = trader.get_position_direction(self._symbol)
@@ -1876,6 +1878,7 @@ class TradingEngine(Component):
                     # Score-based sizing: psychology_mult * score_mult * concentration_mult
                     _sc          = getattr(self._strategy, "_scores", None)
                     signal_score = int(_sc.iloc[-1]) if _sc is not None else 0
+                    _extra_reasons: list[str] = []   # orchestrator-level modifiers (merged into reasons at log time)
 
                     # News gate: price-confirmed direction preferred; consensus as fallback
                     # Amplifier only — never penalises
@@ -1887,6 +1890,7 @@ class TradingEngine(Component):
                                 logger.info("[%s] Post-event price confirms signal: score +1 | events=%s",
                                             self.name, [e.name for e in news_ctx.fired_high])
                                 signal_score += 1
+                                _extra_reasons.append("News confirm +1")
                         else:
                             news_mod = news_ctx.score_modifier(self._symbol, desired)
                             if news_mod > 0:
@@ -1894,12 +1898,14 @@ class TradingEngine(Component):
                                             self.name, news_mod,
                                             news_ctx.fired_summary(self._symbol))
                                 signal_score += news_mod
+                                _extra_reasons.append(f"Macro consensus +{news_mod}")
 
                     # Level confluence: +1 when entry fires at a pre-marked key level
                     if _approaching_levels:
                         signal_score += 1
                         lvl_names = ", ".join(l.label for l in _approaching_levels)
                         logger.info("[%s] Key level confluence +1: %s", self.name, lvl_names)
+                        _extra_reasons.append(f"Key level +1 ({lvl_names})")
 
                     # DXY alignment check — metals and forex pairs with known DXY correlation.
                     # JP mentor: "Dixie is the driving force behind GU and EU — if Dixie gains
@@ -1916,6 +1922,7 @@ class TradingEngine(Component):
                             # DXY bearish + going short (metals or USD pair) = DXY opposing
                             if (_dxy_bias == 1 and desired == 1) or (_dxy_bias == -1 and desired == -1):
                                 signal_score -= 1
+                                _extra_reasons.append(f"-DXY opposing (bias={_dxy_bias:+d})")
                                 logger.info("[%s] DXY opposing: DXY bias=%+d, trade=%+d → score %d",
                                             self.name, _dxy_bias, desired, signal_score)
 
@@ -2142,6 +2149,7 @@ class TradingEngine(Component):
                                 _p = self._last_plan
                                 _sr = getattr(self._strategy, "_score_reasons", None)
                                 _reasons = list(_sr.iloc[-1]) if _sr is not None and len(_sr) else []
+                                _reasons = _reasons + _extra_reasons
                                 self._journal.open_trade(
                                     symbol=self._symbol,
                                     direction=desired,

@@ -215,7 +215,7 @@ def _generate_returns(
 
     # v2 dynamic RR + session prime window defaults (NY 13-15 UTC bonus)
     v2_defaults = dict(
-        long_only=(symbol not in BIDIRECTIONAL),  # metals = bidirectional, all else = long-only
+        long_only=(symbol not in BIDIRECTIONAL),  # always False — BIDIRECTIONAL = all instruments
         rr_model3_bonus=0.5,
         rr_trend_bonus=0.5,
         rr_trend_threshold=0.003,

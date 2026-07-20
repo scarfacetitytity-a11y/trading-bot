@@ -75,6 +75,38 @@ from strategies.base import Strategy
 # Indicators live in the shared single-source module (strategies/indicators.py).
 from strategies.indicators import atr as _atr, rsi as _rsi   # noqa: E402
 
+# Per-instrument active session windows (UTC hours, inclusive start exclusive end).
+# Session confluence fires when the bar hour falls inside ANY of the listed ranges.
+# An instrument with multiple active windows (e.g. JPY trades London + Asia) can
+# list both. Gold/Silver are 24h so any hour qualifies.
+_INSTRUMENT_SESSIONS: dict[str, list[tuple[int, int]]] = {
+    # Forex — London + NY overlap
+    "GBPUSD":     [(7, 17)],
+    "EURUSD":     [(7, 17)],
+    "USDJPY":     [(0, 8), (12, 17)],   # Asia + NY overlap
+    # Metals — near 24h, weight toward NY
+    "XAUUSD":     [(0, 22)],
+    "XAGUSD":     [(0, 22)],
+    # US indices — NY only
+    "US30":       [(13, 21)],
+    "US100":      [(13, 21)],
+    "US500":      [(13, 21)],
+    "US2000":     [(13, 21)],
+    # Asian indices — Tokyo session
+    "JP225":      [(0, 8)],
+    "HK50":       [(1, 9)],
+}
+_DEFAULT_SESSION: list[tuple[int, int]] = [(7, 21)]   # fallback for unknown symbols
+
+
+def _active_session(symbol: str, hour: int) -> bool:
+    """Return True if hour is within any active window for the symbol."""
+    key = symbol.replace(".cash", "").replace(".fx", "").upper()
+    for pat, windows in _INSTRUMENT_SESSIONS.items():
+        if key.startswith(pat):
+            return any(s <= hour < e for s, e in windows)
+    return any(s <= hour < e for s, e in _DEFAULT_SESSION)
+
 
 def _resample_d1(df: pd.DataFrame) -> pd.DataFrame:
     times = pd.to_datetime(df["time"])
@@ -420,6 +452,8 @@ class AiDENIndexStrategy(Strategy):
         # Gap 7 — USDJPY macro H4 bias; set externally by orchestrator before each bar.
         # +1 = USD trending up (JPY weak), -1 = USD trending down, 0 = neutral/unknown.
         self._uj_h4_bias:         int = 0
+        # Set by orchestrator at startup so session windows are instrument-aware.
+        self._symbol:             str = ""
 
     @property
     def name(self) -> str:
@@ -709,7 +743,7 @@ class AiDENIndexStrategy(Strategy):
             if position == 0 and i >= warmup + 2:
                 htf_bias, trend_strength = _h4_at(bar_time)
                 swing_hi, swing_lo       = _swing_range_at(bar_time)
-                in_session   = self.session_start <= hour < self.session_end
+                in_session   = _active_session(self._symbol, hour)
                 in_prime     = self.session_prime_start <= hour < self.session_prime_end
                 rsi_val      = float(rsi_s.iloc[i]) if rsi_s is not None else float("nan")
                 strongly_trending = abs(trend_strength) > self.rr_trend_threshold
