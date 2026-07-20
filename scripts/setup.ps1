@@ -44,11 +44,8 @@ if (-not (Test-Path "$InstallDir\config\config.yaml")) {
 # 5. Logs dir
 New-Item -ItemType Directory -Force -Path "$InstallDir\logs" | Out-Null
 
-# 6. Register as Windows scheduled task (runs at system startup)
-$action  = New-ScheduledTaskAction -Execute "powershell.exe" -Argument "-NonInteractive -File $InstallDir\scripts\start.ps1"
-$trigger = New-ScheduledTaskTrigger -AtStartup
-$settings = New-ScheduledTaskSettingsSet -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 5) -ExecutionTimeLimit (New-TimeSpan -Hours 0)
-Register-ScheduledTask -TaskName "AiDEN-Bot" -Action $action -Trigger $trigger -Settings $settings -RunLevel Highest -Force | Out-Null
+# 6. Register as Windows scheduled task (hidden, no terminal window)
+& "$InstallDir\scripts\register_task.ps1" -BotDir $InstallDir
 
 Write-Host ""
 Write-Host "Setup complete." -ForegroundColor Green
