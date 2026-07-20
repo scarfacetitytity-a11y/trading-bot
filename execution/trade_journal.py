@@ -15,6 +15,7 @@ import json
 import logging
 import os
 import subprocess
+import threading
 from dataclasses import dataclass, asdict
 from datetime import datetime, timezone
 from pathlib import Path
@@ -199,27 +200,15 @@ class TradeJournal:
             for t in self._load_recent(200)
             if t.get("open_time", "")[:10] == datetime.now(tz=timezone.utc).date().isoformat()
         )
-        tg.notify_trade_review(
-            symbol=rec.symbol,
-            direction=rec.direction,
-            score=rec.score,
-            entry=rec.entry_price,
-            sl=rec.sl_price,
-            tp=rec.tp_price,
-            close_price=close_price,
+        tg.notify_trade_close(
+            symbol=rec.symbol, direction=rec.direction,
+            outcome=rec.outcome or "unknown",
             r_multiple=rec.r_multiple or 0.0,
             pnl_usd=rec.pnl_usd or 0.0,
             equity=equity_after,
             session_pnl=session_pnl,
-            outcome=rec.outcome or "unknown",
-            thesis=rec.thesis,
-            reasons=rec.reasons,
-            hit_target=rec.hit_target,
-            mfe_r=rec.mfe_r,
-            mae_r=rec.mae_r,
-            lesson=rec.lesson,
-            review_notes=rec.review_notes,
         )
+        self._run_learning_loop()
 
     # ── Misfire postmortem — the self-improvement ledger ──────────────────────
 
@@ -392,6 +381,28 @@ class TradeJournal:
             rec.symbol, rec.outcome, rec.r_multiple or 0,
             n, stats.get("win_rate", 0) * 100, stats.get("avg_r", 0),
         )
+
+    # ── Continuous learning loop ──────────────────────────────────────────────
+
+    def _run_learning_loop(self) -> None:
+        """Fire-and-forget: analyze every trade close in the background so the
+        system continuously mines patterns from wins AND losses and writes fresh
+        proposals — without blocking the execution thread."""
+        def _bg():
+            try:
+                from execution import learning_loop
+                result = learning_loop.analyze(days=60)
+                learning_loop.write_report(result)
+                n = len(result["proposals"])
+                logger.info(
+                    "[LearningLoop] %d deals / %d wins / %d misfires → %d proposals",
+                    result["deals"], result.get("wins", 0), result["misfires"], n,
+                )
+                if n:
+                    logger.info("[LearningLoop] Proposals written to logs/learning_proposals.md")
+            except Exception:
+                logger.exception("[LearningLoop] background analysis failed")
+        threading.Thread(target=_bg, name="LearningLoop", daemon=True).start()
 
     # ── GitHub auto-push ──────────────────────────────────────────────────────
 
