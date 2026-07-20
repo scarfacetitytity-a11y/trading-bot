@@ -1791,16 +1791,18 @@ class TradingEngine(Component):
                         lvl_names = ", ".join(l.label for l in _approaching_levels)
                         logger.info("[%s] Key level confluence +1: %s", self.name, lvl_names)
 
-                    # DXY alignment check — metals only (XAUUSD, XAGUSD have robust inverse DXY correlation)
-                    # Mentor: "Let's normalize not taking a trade because we're looking at the Dixie
-                    # and we're coming to a conclusion that the Dixie isn't doing."
+                    # DXY alignment check — metals and forex pairs with known DXY correlation.
+                    # JP mentor: "Dixie is the driving force behind GU and EU — if Dixie gains
+                    # strength, GU and EU come down because the dollar side gets heavier."
+                    # Metals (XAUUSD, XAGUSD): inverse relationship — DXY bullish = metals bearish.
+                    # Forex USD pairs (GBPUSD, EURUSD): inverse relationship — DXY bullish = pair bearish.
                     # → DXY is a FILTER (opposition = -1), not a bonus (alignment = no change).
-                    _METALS_DXY = {"XAUUSD", "XAGUSD"}
-                    if self._symbol in _METALS_DXY:
+                    _DXY_INVERSE = {"XAUUSD", "XAGUSD", "GBPUSD", "EURUSD"}
+                    if self._symbol in _DXY_INVERSE:
                         _dxy_bias = self._fetch_dxy_bias()
                         if _dxy_bias != 0:
-                            # DXY bullish + going long gold = DXY opposing gold
-                            # DXY bearish + going short gold = DXY opposing gold
+                            # DXY bullish + going long (metals or USD pair) = DXY opposing
+                            # DXY bearish + going short (metals or USD pair) = DXY opposing
                             if (_dxy_bias == 1 and desired == 1) or (_dxy_bias == -1 and desired == -1):
                                 signal_score -= 1
                                 logger.info("[%s] DXY opposing: DXY bias=%+d, trade=%+d → score %d",

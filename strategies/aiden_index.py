@@ -31,6 +31,9 @@ Negative confluences (subtract from score):
   No liquidity sweep                             -1  (market uncleared)
   Opposing manipulation pattern                  -1  (M on long / W on short)
   RSI extreme against trade                      -1  (>75 for long / <25 for short)
+  Untaken session liquidity in trade path        -1  (session low not swept for long /
+                                                      session high not swept for short —
+                                                      magnet will pull price there first)
 
 Dynamic RR:
   Base: rr_target (default 2.5)
@@ -591,6 +594,14 @@ class AiDENIndexStrategy(Strategy):
                             if not np.isnan(_rsi_now) and _rsi_now > 75.0:
                                 score -= 1; reasons.append("-RSI overbought")
 
+                        # Untaken session low below: if Asian session low hasn't been swept
+                        # today, that liquidity is a magnet — price may dip there first before
+                        # any long continuation. JP mentor: "liquidity is drawn to price."
+                        _pl_i = _pl[i]; _cdl_i = _cdl[i]
+                        if (not np.isnan(_pl_i) and not np.isnan(_cdl_i)
+                                and _cdl_i > _pl_i and _pl_i < cv):
+                            score -= 1; reasons.append("-Untaken session low below")
+
                         ob_lo, ob_hi = _find_bullish_ob(open_, close, high, low, i - 2, self.ob_lookback)
                         if ob_lo is not None and min(ob_hi, lv) - max(ob_lo, h2) > 0:
                             score += 2; is_model3 = True; reasons.append("Order block (M3) +2")
@@ -685,6 +696,14 @@ class AiDENIndexStrategy(Strategy):
                             _rsi_now = float(rsi_s.iloc[i])
                             if not np.isnan(_rsi_now) and _rsi_now < 25.0:
                                 score -= 1; reasons.append("-RSI oversold")
+
+                        # Untaken session high above: if Asian session high hasn't been swept
+                        # today, that liquidity is a magnet — price may rally there first before
+                        # any short continuation. JP mentor: "why would it turn before taking that high?"
+                        _ph_i = _ph[i]; _cdh_i = _cdh[i]
+                        if (not np.isnan(_ph_i) and not np.isnan(_cdh_i)
+                                and _cdh_i < _ph_i and _ph_i > cv):
+                            score -= 1; reasons.append("-Untaken session high above")
 
                         ob_lo, ob_hi = _find_bearish_ob(open_, close, high, low, i - 2, self.ob_lookback)
                         if ob_lo is not None and min(ob_hi, l2) - max(ob_lo, hv) > 0:
