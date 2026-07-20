@@ -48,6 +48,9 @@ PROCESSED = Path(__file__).resolve().parent.parent / "data" / "processed"
 # session_start/end = UTC hours. max_fvg_wait/max_entry_wait scaled for M15.
 # JP225 trades Tokyo session (Asian open). All others: NY session.
 INSTRUMENTS = {
+    # Forex — JP mentor primary pairs; DXY inverse filter applied at execution layer
+    "GBPUSD":      dict(session_start=7,  session_end=21),   # London + NY crossover
+    "EURUSD":      dict(session_start=7,  session_end=21),   # London + NY crossover
     # Metals
     "XAUUSD":      dict(session_start=7,  session_end=21),   # London + NY
     # US indices — NY session
