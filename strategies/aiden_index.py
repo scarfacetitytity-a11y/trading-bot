@@ -16,6 +16,13 @@ OS Confluence scoring (max 10 per setup):
   Session prime window (NY first hour 13-15 UTC) +1  [stacks with session]
   RSI pullback zone ............................ +1
   Trend regime (H4 EMA strongly trending) ...... +1
+  Asian 50% level (FVG within 20% of pre-session +1  [JP mentor]
+    range midpoint — highest-probability London zone)
+  Early leakage (pre-session swept prior day     +1  [JP mentor]
+    extreme = London reversal sweep setup)
+  Inside day + closer target (trade toward       +1  [JP mentor]
+    nearer daily high/low when inside day)
+  D1 aligned (daily EMA agrees with H4) ......... +1  [optional]
 
 Dynamic RR:
   Base: rr_target (default 2.5)
@@ -309,6 +316,32 @@ class AiDENIndexStrategy(Strategy):
                     return int(_d1b.iloc[idx]) if idx >= 0 else 0
                 d1_bias_at = _d1_bias_at
 
+        # ── Pre-session range (JP mentor: Asian 50% level, early leakage, inside day) ──
+        # For each UTC day, compute the high/low of bars BEFORE session_start (the
+        # "Asian" or pre-market range) and the previous day's high/low. Three new
+        # confluences are derived from these at FVG detection time (below).
+        _dates_arr       = times.dt.normalize()
+        _all_dates_list  = sorted(_dates_arr.unique())
+        _ph  = np.full(len(df), np.nan)
+        _pl  = np.full(len(df), np.nan)
+        _pdh = np.full(len(df), np.nan)  # prior day high
+        _pdl = np.full(len(df), np.nan)  # prior day low
+        _date_idx_map: dict = {}
+        for _d in _all_dates_list:
+            _date_idx_map[_d] = np.where((_dates_arr == _d).values)[0]
+        for _k, _d in enumerate(_all_dates_list):
+            _idxs = _date_idx_map[_d]
+            _pre  = np.where(hours.iloc[_idxs].values < self.session_start)[0]
+            if len(_pre):
+                _ph[_idxs] = float(high.iloc[_idxs[_pre]].max())
+                _pl[_idxs] = float(low.iloc[_idxs[_pre]].min())
+            if _k > 0:
+                _pi = _date_idx_map[_all_dates_list[_k - 1]]
+                _pdh[_idxs] = float(high.iloc[_pi].max())
+                _pdl[_idxs] = float(low.iloc[_pi].min())
+        _presess_mid = (_ph + _pl) / 2.0
+        _presess_rng = _ph - _pl
+
         h4["bias"]   = h4_bias.values
         h4["spread"] = h4_spread.values
         h4_times     = h4["time"]
@@ -482,6 +515,24 @@ class AiDENIndexStrategy(Strategy):
                         if d1_bias_at is not None and d1_bias_at(bar_time) == 1:
                             score += 1; reasons.append("D1 aligned")
 
+                        # ── JP Mentor confluences (Asian session structure) ──
+                        _psm = _presess_mid[i]; _psr = _presess_rng[i]
+                        _pdh_i = _pdh[i];       _pdl_i = _pdl[i]
+                        # Asian 50% level: FVG formed within 20% of pre-session range
+                        # around the midpoint — highest-probability London entry zone
+                        if not np.isnan(_psm) and _psr > 0:
+                            if abs(cv - _psm) <= 0.20 * _psr:
+                                score += 1; reasons.append("Asian 50% level")
+                            # Early leakage (long): pre-session swept prior day lows before
+                            # London opened — London completing the sweep = reversal buy
+                            if not np.isnan(_pdl_i) and _pl[i] < _pdl_i:
+                                score += 1; reasons.append("Early leakage (London sweep)")
+                        # Inside day + closer target: trade toward the nearer daily extreme
+                        if (not np.isnan(_pdh_i) and not np.isnan(_pdl_i)
+                                and hv < _pdh_i and lv > _pdl_i
+                                and (_pdh_i - cv) < (cv - _pdl_i)):
+                            score += 1; reasons.append("Inside day (closer high)")
+
                         if score >= self.min_score:
                             active_fvgs.append({
                                 "dir":      "bull",
@@ -539,6 +590,21 @@ class AiDENIndexStrategy(Strategy):
 
                         if d1_bias_at is not None and d1_bias_at(bar_time) == -1:
                             score += 1; reasons.append("D1 aligned")
+
+                        # ── JP Mentor confluences (Asian session structure) ──
+                        _psm = _presess_mid[i]; _psr = _presess_rng[i]
+                        _pdh_i = _pdh[i];       _pdl_i = _pdl[i]
+                        if not np.isnan(_psm) and _psr > 0:
+                            if abs(cv - _psm) <= 0.20 * _psr:
+                                score += 1; reasons.append("Asian 50% level")
+                            # Early leakage (short): pre-session swept prior day highs —
+                            # London completing the sweep = reversal sell
+                            if not np.isnan(_pdh_i) and _ph[i] > _pdh_i:
+                                score += 1; reasons.append("Early leakage (London sweep)")
+                        if (not np.isnan(_pdh_i) and not np.isnan(_pdl_i)
+                                and hv < _pdh_i and lv > _pdl_i
+                                and (cv - _pdl_i) < (_pdh_i - cv)):
+                            score += 1; reasons.append("Inside day (closer low)")
 
                         if score >= self.min_score:
                             active_fvgs.append({
