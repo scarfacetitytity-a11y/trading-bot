@@ -52,6 +52,14 @@ class RiskConfig:
     # Decision fatigue kicks in; every trade after the first few is lower quality."
     max_daily_entries: int        = 6
 
+    # Daily profit floor — JP mentor: "I am not going to leave the financial markets today
+    # without $1,500 clear profit… that means I've got $500 to play with."
+    # Once daily gain >= daily_profit_target_pct, protect gains down to daily_profit_floor_pct.
+    # Any new trade whose worst case (1× risk loss) would push P&L below the floor is blocked.
+    # Set to 0.0 to disable (default: disabled until live trading proves the system).
+    daily_profit_target_pct: float = 0.0   # % of day-start equity; 0 = feature off
+    daily_profit_floor_pct:  float = 0.0   # % of day-start equity to protect
+
 
 @dataclass
 class RiskState:
@@ -166,6 +174,20 @@ class RiskAgent:
             return False, 0.0, (
                 f"Daily entry cap ({cfg.max_daily_entries}) reached — done for today"
             )
+
+        # 6b. Daily profit floor — JP mentor: "I've got $500 to play with"
+        # Once the day's gain hits the target, only risk funds above the floor.
+        # If a new loss (1× risk) would push today's P&L below the floor, block it.
+        if cfg.daily_profit_target_pct > 0 and s.daily_start_equity > 0:
+            daily_gain_pct = (current_equity - s.daily_start_equity) / s.daily_start_equity
+            if daily_gain_pct >= cfg.daily_profit_target_pct:
+                floor_equity = s.daily_start_equity * (1 + cfg.daily_profit_floor_pct)
+                risk_loss    = current_equity * (cfg.max_daily_loss_pct / cfg.max_daily_entries)
+                if current_equity - risk_loss < floor_equity:
+                    return False, 0.0, (
+                        f"Profit floor active: +{daily_gain_pct*100:.1f}% today — "
+                        f"protecting floor {cfg.daily_profit_floor_pct*100:.1f}%"
+                    )
 
         # 7. Rolling win rate check
         size_mult = 1.0

@@ -101,6 +101,61 @@ _CORR_GROUPS: list[set] = [
 # keeping winners — lowers blow rate AND slightly raises pass rate.
 MAX_SAME_DIR_CLUSTER = 3
 
+# Cousin pairs: when both qualify in same direction on the same bar, only the
+# higher-scoring one enters (JP mentor: "GU and EU are cousins — pick the better one").
+_COUSIN_PAIRS: list[frozenset] = [
+    frozenset({"GBPUSD", "EURUSD"}),
+]
+
+
+class CousinRouter:
+    """Thread-safe quality router for correlated cousin pairs.
+
+    Engine calls try_claim(bar_time, symbol, score, direction) before placing
+    an order.  Returns True if cleared to enter, False if a better cousin
+    already claimed this bar+direction slot.
+    """
+
+    def __init__(self):
+        self._lock  = threading.Lock()
+        # key: (bar_time, frozenset_pair, direction) → (symbol, score)
+        self._slots: dict = {}
+
+    def _pair_for(self, symbol: str) -> frozenset | None:
+        for pair in _COUSIN_PAIRS:
+            if symbol in pair:
+                return pair
+        return None
+
+    def try_claim(
+        self, bar_time: int, symbol: str, score: int, direction: int
+    ) -> bool:
+        pair = self._pair_for(symbol)
+        if pair is None:
+            return True   # not a cousin pair — always cleared
+        key = (bar_time, pair, direction)
+        with self._lock:
+            existing = self._slots.get(key)
+            if existing is None:
+                self._slots[key] = (symbol, score)
+                return True
+            ex_sym, ex_score = existing
+            if ex_sym == symbol:
+                return True   # same engine re-checking
+            if score > ex_score:
+                # this engine wins — take the slot, block the previous claimant
+                self._slots[key] = (symbol, score)
+                return True
+            return False   # a better-scoring cousin already claimed it
+
+    def cleanup(self, current_bar_time: int):
+        """Drop slots older than 2 bars to prevent unbounded growth."""
+        with self._lock:
+            stale = [k for k in self._slots if k[0] < current_bar_time - 2]
+            for k in stale:
+                del self._slots[k]
+
+
 STRATEGY_MAP = {
     "sniper":          SniperStrategy,
     "london_breakout": LondonBreakoutStrategy,
@@ -742,6 +797,7 @@ class TradingEngine(Component):
         self._risk_guard       = risk_guard
         self._allocator        = allocator
         self._book             = book
+        self._cousin_router:   Optional["CousinRouter"] = None
         self._adaptive_port    = bool(trade_cfg.get("adaptive_portfolio", False))
         self._lookback         = trade_cfg.get("lookback_bars", 500)
         self._level_monitor:   Optional[LevelMonitor] = None
@@ -2006,6 +2062,18 @@ class TradingEngine(Component):
                             logger.info("[%s] Trade vetoed via Telegram", self.name)
                             continue
 
+                    # ── Cousin quality router (JP mentor): GU/EU — only the
+                    # higher-scoring cousin enters when both qualify same bar+direction.
+                    if self._cousin_router is not None:
+                        if not self._cousin_router.try_claim(bar_time, self._symbol, signal_score, desired):
+                            logger.info(
+                                "[%s] COUSIN SKIP: %s dir=%+d score=%d — better cousin claimed this bar",
+                                self.name, self._symbol, desired, signal_score,
+                            )
+                            self._cousin_router.cleanup(bar_time)
+                            continue
+                        self._cousin_router.cleanup(bar_time)
+
                     if self._dry_run:
                         logger.info("[%s] DRY RUN: %s %.2f lots SL=%s TP=%s | score=%d x%.2f | %s",
                                     self.name, direction_str, lots, sl, tp,
@@ -2187,6 +2255,7 @@ class Orchestrator:
         level_monitor = LevelMonitor(
             proximity_atr=float(self._trade_cfg.get("level_proximity_atr", 1.0))
         )
+        cousin_router = CousinRouter()
 
         for symbol in self._symbols:
             engine = TradingEngine(
@@ -2206,8 +2275,9 @@ class Orchestrator:
                 allocator=self._alloc,
                 book=self._book,
             )
-            engine._news_gate    = self._news_gate
+            engine._news_gate     = self._news_gate
             engine._level_monitor = level_monitor
+            engine._cousin_router = cousin_router
             components.append(engine)
 
         self._components = components

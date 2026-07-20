@@ -26,6 +26,10 @@ OS Confluence scoring:
   D1 FVG retest (price inside daily imbalance)   +1  [JP mentor v2]
   D1 aligned (daily EMA agrees with H4) ......... +1  [optional]
   Volume spike ................................. +1  [optional]
+  W1 FVG retest (weekly imbalance zone) ......... +2  [JP mentor v3]
+  Weekly discount/premium (range position) ...... +1  [JP mentor v7]
+  NY swept London Low/High ..................... +1  [JP mentor v7]
+  Double bottom/top cluster at FVG ............. +1  [JP mentor v9]
 
 Negative confluences (subtract from score):
   No liquidity sweep                             -1  (market uncleared)
@@ -91,6 +95,18 @@ def _resample_h4(df: pd.DataFrame) -> pd.DataFrame:
     h4 = h4.reset_index().rename(columns={"index": "time"})
     h4["time"] = pd.to_datetime(h4["time"])
     return h4
+
+
+def _resample_weekly(df: pd.DataFrame) -> pd.DataFrame:
+    times = pd.to_datetime(df["time"])
+    tmp   = df[["open", "high", "low", "close"]].copy()
+    tmp.index = times
+    w1 = tmp.resample("W-MON", closed="left", label="left").agg({
+        "open": "first", "high": "max", "low": "min", "close": "last",
+    }).dropna()
+    w1 = w1.reset_index().rename(columns={"index": "time"})
+    w1["time"] = pd.to_datetime(w1["time"])
+    return w1
 
 
 def _compute_h4_bias_ema(
@@ -450,6 +466,35 @@ class AiDENIndexStrategy(Strategy):
                 if _bear_gap_d1 > 0:
                     _d1_fvg_zones.append((_d1h.iloc[_dj], _d1l.iloc[_dj - 2], -1))
 
+        # ── Weekly FVG zones + range (JP mentor: "closing up weekly imbalance") ──
+        # Weekly FVGs are major draw targets — the largest-TF unfilled institutional
+        # imbalance. +2 score when price is retesting a weekly FVG zone.
+        # Weekly mid/range used for weekly premium/discount score (+1 / -1).
+        _w1_fvg_zones: list[tuple[float, float, int]] = []  # (lo, hi, direction)
+        _w1_mid_arr  = np.full(len(df), np.nan)
+        _w1_rng_arr  = np.full(len(df), np.nan)
+        _w1_df = _resample_weekly(df)
+        if len(_w1_df) >= 3:
+            _w1h = _w1_df["high"].astype(float)
+            _w1l = _w1_df["low"].astype(float)
+            for _wj in range(2, min(len(_w1_df), 6)):  # last 5 weekly candles
+                _bull_gap_w1 = _w1l.iloc[_wj] - _w1h.iloc[_wj - 2]
+                if _bull_gap_w1 > 0:
+                    _w1_fvg_zones.append((_w1h.iloc[_wj - 2], _w1l.iloc[_wj], 1))
+                _bear_gap_w1 = _w1l.iloc[_wj - 2] - _w1h.iloc[_wj]
+                if _bear_gap_w1 > 0:
+                    _w1_fvg_zones.append((_w1h.iloc[_wj], _w1l.iloc[_wj - 2], -1))
+        # Current week mid/range for each bar — map weekly rows onto input bars
+        _w1_times = pd.to_datetime(_w1_df["time"]) if len(_w1_df) else pd.Series([], dtype="datetime64[ns]")
+        for _wi in range(len(_w1_df)):
+            _wstart = _w1_times.iloc[_wi]
+            _wend   = _w1_times.iloc[_wi + 1] if _wi + 1 < len(_w1_df) else pd.Timestamp.max
+            _wmask  = (times >= _wstart) & (times < _wend)
+            _wh     = float(_w1_df["high"].iloc[_wi])
+            _wl     = float(_w1_df["low"].iloc[_wi])
+            _w1_mid_arr[_wmask.values] = (_wh + _wl) / 2.0
+            _w1_rng_arr[_wmask.values] = _wh - _wl
+
         # ── Pre-session range (JP mentor: Asian 50% level, early leakage, inside day) ──
         # For each UTC day, compute the high/low of bars BEFORE session_start (the
         # "Asian" or pre-market range) and the previous day's high/low. Three new
@@ -761,6 +806,42 @@ class AiDENIndexStrategy(Strategy):
                             if _z[2] == 1 and _z[0] <= cv <= _z[1]:
                                 score += 1; reasons.append("D1 FVG retest"); break
 
+                        # Gap 6 — Weekly FVG retest (+2): highest-TF institutional imbalance
+                        # JP mentor v3: "we are currently closing up a little bit of weekly imbalance"
+                        for _wz in _w1_fvg_zones:
+                            if _wz[2] == 1 and _wz[0] <= cv <= _wz[1]:
+                                score += 2; reasons.append("W1 FVG retest +2"); break
+
+                        # Gap 13 — Weekly range position: discount (lower half) favours longs
+                        # JP mentor v7: "before I do anything, I zoom out to the weekly —
+                        # are we at a weekly high, low, or in the middle?"
+                        _w1_mid_i = _w1_mid_arr[i]; _w1_rng_i = _w1_rng_arr[i]
+                        if not np.isnan(_w1_mid_i) and _w1_rng_i > 0:
+                            if cv < _w1_mid_i:
+                                score += 1; reasons.append("Weekly discount")
+                            elif cv > _w1_mid_i + 0.30 * _w1_rng_i:
+                                score -= 1; reasons.append("-At weekly premium (risk long)")
+
+                        # Gap 5 — NY swept London Low (bullish): NY's first move takes the
+                        # London session low, then reverses — the classic NY reversal setup.
+                        # JP mentor v7: "typically NY sweeps London levels, goes takes the
+                        # London low, then reverses and rallies"
+                        if (hour >= 13 and not np.isnan(_lon_pl[i])
+                                and not np.isnan(_cdl_i) and _cdl_i <= _lon_pl[i]):
+                            score += 1; reasons.append("NY swept London Low")
+
+                        # Gap 11 — Double bottom cluster at FVG zone (+1): two or more prior
+                        # swing lows at approximately the same level as fvg_lo = accumulated
+                        # resting liquidity. JP mentor v9: "double bottom... accumulation beside
+                        # the liquidity is your signal."
+                        _db_tol = 0.15 * atr_val
+                        _db_count = sum(
+                            1 for _j in range(max(0, i - 30), i - 2)
+                            if abs(float(low.iloc[_j]) - h2) <= _db_tol
+                        )
+                        if _db_count >= 2:
+                            score += 1; reasons.append("Double bottom cluster")
+
                         if score >= self.min_score:
                             active_fvgs.append({
                                 "dir":      "bull",
@@ -888,6 +969,34 @@ class AiDENIndexStrategy(Strategy):
                         for _z in _d1_fvg_zones:
                             if _z[2] == -1 and _z[0] <= cv <= _z[1]:
                                 score += 1; reasons.append("D1 FVG retest"); break
+
+                        # Gap 6 — Weekly FVG retest (+2): bearish weekly imbalance
+                        for _wz in _w1_fvg_zones:
+                            if _wz[2] == -1 and _wz[0] <= cv <= _wz[1]:
+                                score += 2; reasons.append("W1 FVG retest +2"); break
+
+                        # Gap 13 — Weekly premium favours shorts
+                        _w1_mid_i = _w1_mid_arr[i]; _w1_rng_i = _w1_rng_arr[i]
+                        if not np.isnan(_w1_mid_i) and _w1_rng_i > 0:
+                            if cv > _w1_mid_i:
+                                score += 1; reasons.append("Weekly premium")
+                            elif cv < _w1_mid_i - 0.30 * _w1_rng_i:
+                                score -= 1; reasons.append("-At weekly discount (risk short)")
+
+                        # Gap 5 — NY swept London High (bearish): NY sweeps the London high
+                        # then reverses — the bearish NY setup. JP mentor v7.
+                        if (hour >= 13 and not np.isnan(_lon_ph[i])
+                                and not np.isnan(_cdh_i) and _cdh_i >= _lon_ph[i]):
+                            score += 1; reasons.append("NY swept London High")
+
+                        # Gap 11 — Double top cluster at FVG zone (+1)
+                        _dt_tol = 0.15 * atr_val
+                        _dt_count = sum(
+                            1 for _j in range(max(0, i - 30), i - 2)
+                            if abs(float(high.iloc[_j]) - l2) <= _dt_tol
+                        )
+                        if _dt_count >= 2:
+                            score += 1; reasons.append("Double top cluster")
 
                         if score >= self.min_score:
                             active_fvgs.append({
