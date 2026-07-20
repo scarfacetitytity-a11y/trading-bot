@@ -6,9 +6,10 @@ Cadre:
   Builder(MEM-003) — implementation, shorts mirror, regime scoring
   Scout  (MEM-004) — 7-instrument universe confirmed
 
-OS Confluence scoring (max 10 per setup):
+OS Confluence scoring:
   HTF bias confirmed (H4 EMA direction) ......... +2  [hard gate]
   Price in discount (long) / premium (short) .... +1
+  H4 impulse 50% (within 10% of H4 swing mid) .. +1  [JP mentor v5 — "50% is always a POI"]
   Liquidity swept (lows for longs / highs for shorts) +1
   OB + FVG aligned — Model 3 ................... +2
   FVG only — Model 1 ........................... +1
@@ -16,24 +17,23 @@ OS Confluence scoring (max 10 per setup):
   Session prime window (NY first hour 13-15 UTC) +1  [stacks with session]
   RSI pullback zone ............................ +1
   Trend regime (H4 EMA strongly trending) ...... +1
-  Asian 50% level (FVG within 20% of pre-session +1  [JP mentor]
-    range midpoint — highest-probability London zone)
-  Early leakage (pre-session swept prior day     +1  [JP mentor]
-    extreme = London reversal sweep setup)
-  Inside day + closer target (trade toward       +1  [JP mentor]
-    nearer daily high/low when inside day)
-  PDH/PDL swept today (9/10 sessions market takes +1  [JP mentor v2]
-    prior D1 high or low — confirmed tick in box)
+  Manipulation W (long) / M (short) ............ +1  [JP mentor — ICC entry model]
+  Asian 50% level (within 20% of Asian H/L mid)  +1  [JP mentor]
+  London 50% NY POI (NY session + at London mid) +1  [JP mentor v4]
+  Early leakage (Asian range broken before London)+1  [JP mentor]
+  Inside day + closer target ................... +1  [JP mentor]
+  PDH/PDL swept today ......................... +1  [JP mentor v2]
   D1 FVG retest (price inside daily imbalance)   +1  [JP mentor v2]
   D1 aligned (daily EMA agrees with H4) ......... +1  [optional]
+  Volume spike ................................. +1  [optional]
 
 Negative confluences (subtract from score):
   No liquidity sweep                             -1  (market uncleared)
-  Opposing manipulation pattern                  -1  (M on long / W on short)
+  Opposing manipulation pattern                  -1  (M against long / W against short)
   RSI extreme against trade                      -1  (>75 for long / <25 for short)
   Untaken session liquidity in trade path        -1  (session low not swept for long /
                                                       session high not swept for short —
-                                                      magnet will pull price there first)
+                                                      magnet pulls price there first)
 
 Dynamic RR:
   Base: rr_target (default 2.5)
