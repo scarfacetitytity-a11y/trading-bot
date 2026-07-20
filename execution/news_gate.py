@@ -154,6 +154,30 @@ class NewsContext:
             return 1
         return 0
 
+    # Keywords that identify a central bank rate decision — JP mentor v7:
+    # "Do you want to surf in the tsunami wave?" → hard block on FOMC/rate days.
+    _RATE_KEYWORDS = (
+        "fomc", "federal funds", "interest rate decision", "interest rate statement",
+        "rate decision", "monetary policy statement", "fed rate", "boe rate",
+        "ecb rate", "boj rate", "reserve bank",
+    )
+
+    def is_rate_decision_window(self, window_min: float = 240.0) -> bool:
+        """True if a central bank rate decision fires within window_min minutes.
+
+        Any upcoming HIGH event whose name matches _RATE_KEYWORDS is treated as a
+        tsunami event — block entries entirely per JP mentor v7 guidance.
+        """
+        all_events = list(self.upcoming_high) + list(self.fired_high)
+        for e in all_events:
+            name_low = e.name.lower()
+            if any(kw in name_low for kw in self._RATE_KEYWORDS):
+                if not e.has_fired and e.minutes_until <= window_min:
+                    return True
+                if e.has_fired and e.minutes_since <= 60.0:
+                    return True
+        return False
+
     def upcoming_summary(self) -> str:
         """Human-readable string of upcoming HIGH events."""
         if not self.upcoming_high:

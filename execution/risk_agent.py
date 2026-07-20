@@ -48,6 +48,10 @@ class RiskConfig:
     # Set high so valid setups never get blocked by position count alone.
     max_concurrent_trades: int    = 20
 
+    # Max entries per UTC day across all symbols — JP mentor v7: "I do more when I do less.
+    # Decision fatigue kicks in; every trade after the first few is lower quality."
+    max_daily_entries: int        = 6
+
 
 @dataclass
 class RiskState:
@@ -55,6 +59,7 @@ class RiskState:
     pause_until: Optional[str]    = None    # ISO datetime string
     daily_start_equity: float     = 0.0
     daily_date: str               = ""      # YYYY-MM-DD
+    daily_entries: int            = 0       # entries placed today (UTC day)
     weekly_start_equity: float    = 0.0
     weekly_start_date: str        = ""      # ISO date of Monday
     peak_equity: float            = 0.0
@@ -155,7 +160,14 @@ class RiskAgent:
                     f"Weekly DD {weekly_dd*100:.1f}% >= {cfg.max_weekly_dd_pct*100:.0f}% — wait until Monday"
                 )
 
-        # 6. Rolling win rate check
+        # 6. Daily entry cap — JP mentor v7: "I do more when I do less."
+        # Decision fatigue degrades trade quality; hard cap per UTC day.
+        if s.daily_entries >= cfg.max_daily_entries:
+            return False, 0.0, (
+                f"Daily entry cap ({cfg.max_daily_entries}) reached — done for today"
+            )
+
+        # 7. Rolling win rate check
         size_mult = 1.0
         reason    = "OK"
         if len(s.recent_trades) >= cfg.wr_lookback_trades:
@@ -171,6 +183,11 @@ class RiskAgent:
 
         self._save_state()
         return True, size_mult, reason
+
+    def record_entry(self):
+        """Call when a new trade is placed (before it closes) to count daily entries."""
+        self.state.daily_entries += 1
+        self._save_state()
 
     def record_trade(self, r_multiple: float, equity_after: float):
         """Call after every trade closes."""
@@ -252,6 +269,7 @@ class RiskAgent:
         if self.state.daily_date != today:
             self.state.daily_start_equity = current_equity
             self.state.daily_date         = today
+            self.state.daily_entries      = 0   # reset entry count each UTC day
 
         if self.state.weekly_start_date != mon:
             self.state.weekly_start_equity = current_equity

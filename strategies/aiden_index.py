@@ -34,6 +34,8 @@ Negative confluences (subtract from score):
   Untaken session liquidity in trade path        -1  (session low not swept for long /
                                                       session high not swept for short —
                                                       magnet pulls price there first)
+  Both Asian H+L swept early                     -1  (JP mentor v7: "leaked early, always
+                                                      a concern" — directional clarity lost)
 
 Dynamic RR:
   Base: rr_target (default 2.5)
@@ -629,6 +631,16 @@ class AiDENIndexStrategy(Strategy):
                                 and _cdl_i > _pl_i and _pl_i < cv):
                             score -= 1; reasons.append("-Untaken session low below")
 
+                        # Both Asian H + L swept before trade = concern (JP mentor v7:
+                        # "It leaked early. I always have a concern about that.")
+                        # When liquidity has been taken on BOTH sides, directional clarity
+                        # is reduced — the market may reverse or go sideways.
+                        _ph_i = _ph[i]; _cdh_i = _cdh[i]
+                        if (not np.isnan(_ph_i) and not np.isnan(_pl_i)
+                                and not np.isnan(_cdh_i) and not np.isnan(_cdl_i)
+                                and _cdh_i >= _ph_i and _cdl_i <= _pl_i):
+                            score -= 1; reasons.append("-Both Asian H+L swept")
+
                         ob_lo, ob_hi = _find_bullish_ob(open_, close, high, low, i - 2, self.ob_lookback)
                         if ob_lo is not None and min(ob_hi, lv) - max(ob_lo, h2) > 0:
                             score += 2; is_model3 = True; reasons.append("Order block (M3) +2")
@@ -741,6 +753,14 @@ class AiDENIndexStrategy(Strategy):
                         if (not np.isnan(_ph_i) and not np.isnan(_cdh_i)
                                 and _cdh_i < _ph_i and _ph_i > cv):
                             score -= 1; reasons.append("-Untaken session high above")
+
+                        # Both Asian H + L swept before trade = concern (JP mentor v7:
+                        # "It leaked early. I always have a concern about that.")
+                        _pl_i = _pl[i]; _cdl_i = _cdl[i]
+                        if (not np.isnan(_ph_i) and not np.isnan(_pl_i)
+                                and not np.isnan(_cdh_i) and not np.isnan(_cdl_i)
+                                and _cdh_i >= _ph_i and _cdl_i <= _pl_i):
+                            score -= 1; reasons.append("-Both Asian H+L swept")
 
                         ob_lo, ob_hi = _find_bearish_ob(open_, close, high, low, i - 2, self.ob_lookback)
                         if ob_lo is not None and min(ob_hi, l2) - max(ob_lo, hv) > 0:

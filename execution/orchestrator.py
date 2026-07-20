@@ -1863,6 +1863,24 @@ class TradingEngine(Component):
                                     "score floor %d→%d",
                                     self.name, _total_dd_pct, _boost_thr, old_needed, needed)
 
+                    # ── FOMC / central bank rate-decision block ────────────────
+                    # JP mentor v7: "Do you want to surf in a tsunami wave?"
+                    # Hard block all entries within 4h of a rate decision or for
+                    # 1h after it fires — spread widens, slippage can be extreme.
+                    if self._news_gate is not None:
+                        try:
+                            _nctx2 = self._news_gate.get_context(
+                                fired_window_min=120.0, upcoming_window_min=240.0
+                            )
+                            if _nctx2.is_rate_decision_window():
+                                logger.info(
+                                    "[%s] FOMC/rate-decision window → entry blocked (tsunami rule)",
+                                    self.name,
+                                )
+                                continue
+                        except Exception:
+                            pass
+
                     if signal_score < needed:
                         logger.info("[%s] LOW CONVICTION skip: %s score=%d < %d (%s)",
                                     self.name, "BUY" if desired == 1 else "SELL",
@@ -1995,6 +2013,8 @@ class TradingEngine(Component):
                             self._t1_hit            = False
                             self._bars_since_entry  = 0
                             self._save_position_state()
+                            if self._risk_agent is not None:
+                                self._risk_agent.record_entry()
                             # Register this trade's quality in the shared book so
                             # the allocator can weigh it against future setups.
                             if self._book is not None:
