@@ -62,6 +62,7 @@ from execution.risk_agent import RiskAgent, RiskConfig
 from execution.ftmo_tracker import FTMOTracker
 from execution.trade_journal import TradeJournal
 from execution.portfolio_manager import PortfolioAllocator, PortfolioBook, OpenPos, Trim
+from execution.level_monitor import LevelMonitor
 from execution import telegram_notify as tg
 from backtests.run_multi_instrument import (
     INSTRUMENTS, OPTIMISED_PARAMS, TRAIL_CONFIGS, BIDIRECTIONAL, M15_PARAMS,
@@ -741,6 +742,7 @@ class TradingEngine(Component):
         self._book             = book
         self._adaptive_port    = bool(trade_cfg.get("adaptive_portfolio", False))
         self._lookback         = trade_cfg.get("lookback_bars", 500)
+        self._level_monitor:   Optional[LevelMonitor] = None
         self._news_gate:        Optional[ng.NewsGate] = None
         self._event_dir_cache: dict[str, int] = {}
         self._trade_manager:   TradeManager = TradeManager()
@@ -1690,6 +1692,18 @@ class TradingEngine(Component):
                                                 self.name, daily_dd, ftmo_status["daily_dd_limit"])
                                 continue
 
+                    # Level monitor — update key levels, log any approaches
+                    _approaching_levels = []
+                    if self._level_monitor is not None:
+                        try:
+                            _atr_now = float(getattr(self._strategy, "_atr_cache", pd.Series()).iloc[-1]) \
+                                       if hasattr(self._strategy, "_atr_cache") else 0.0
+                            _approaching_levels = self._level_monitor.update(
+                                self._symbol, df, _atr_now or (equity * 0.002)
+                            )
+                        except Exception:
+                            pass
+
                     # Score-based sizing: psychology_mult * score_mult * concentration_mult
                     _sc          = getattr(self._strategy, "_scores", None)
                     signal_score = int(_sc.iloc[-1]) if _sc is not None else 0
@@ -1711,6 +1725,12 @@ class TradingEngine(Component):
                                             self.name, news_mod,
                                             news_ctx.fired_summary(self._symbol))
                                 signal_score += news_mod
+
+                    # Level confluence: +1 when entry fires at a pre-marked key level
+                    if _approaching_levels:
+                        signal_score += 1
+                        lvl_names = ", ".join(l.label for l in _approaching_levels)
+                        logger.info("[%s] Key level confluence +1: %s", self.name, lvl_names)
 
                     # ── Trend-aware quality bar (fix #4) ──────────────────────
                     # Bidirectional stays. The bar is NOT a flat score-6 on every
@@ -2024,6 +2044,10 @@ class Orchestrator:
             reconciler,
         ]
 
+        level_monitor = LevelMonitor(
+            proximity_atr=float(self._trade_cfg.get("level_proximity_atr", 1.0))
+        )
+
         for symbol in self._symbols:
             engine = TradingEngine(
                 self.registry,
@@ -2042,7 +2066,8 @@ class Orchestrator:
                 allocator=self._alloc,
                 book=self._book,
             )
-            engine._news_gate = self._news_gate
+            engine._news_gate    = self._news_gate
+            engine._level_monitor = level_monitor
             components.append(engine)
 
         self._components = components
