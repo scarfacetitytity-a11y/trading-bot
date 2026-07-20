@@ -2109,10 +2109,21 @@ class TradingEngine(Component):
                     else:
                         ok = trader.place_order(self._symbol, desired, lots, sl=sl, tp=tp)
                         if ok:
-                            tick = mt5.symbol_info_tick(self._symbol)
-                            self._open_entry_price  = tick.ask if desired == 1 else tick.bid
-                            self._open_sl           = sl
-                            self._open_tp           = tp
+                            # Read confirmed fill from MT5 — price_open/sl/tp reflect the
+                            # actual broker values after slippage, not the pre-order estimate.
+                            _live_pos = trader.get_positions(self._symbol)
+                            if _live_pos:
+                                _lp = _live_pos[0]
+                                self._open_entry_price = _lp.price_open
+                                self._open_sl          = _lp.sl if _lp.sl > 0 else sl
+                                self._open_tp          = _lp.tp if _lp.tp > 0 else tp
+                                sl = self._open_sl    # use confirmed values downstream
+                                tp = self._open_tp
+                            else:
+                                tick = mt5.symbol_info_tick(self._symbol)
+                                self._open_entry_price = tick.ask if desired == 1 else tick.bid
+                                self._open_sl          = sl
+                                self._open_tp          = tp
                             self._open_score        = signal_score
                             self._t1_hit            = False
                             self._bars_since_entry  = 0
