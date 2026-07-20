@@ -222,7 +222,21 @@ def notify_trade_open(
 ) -> None:
     dir_icon = "🟢" if direction == 1 else "🔴"
     dir_word = "LONG" if direction == 1 else "SHORT"
-    risk_usd = equity * float(os.environ.get("RISK_PCT", "0.5")) / 100
+
+    # Actual risk from lot size × SL distance (pip value approximation)
+    # Falls back to equity × risk_pct only if we can't compute from position
+    if sl and abs(entry - sl) > 0 and lots > 0:
+        try:
+            import MetaTrader5 as mt5
+            info = mt5.symbol_info(symbol)
+            tick_val = info.trade_tick_value if info else 1.0
+            tick_size = info.trade_tick_size if info else 0.00001
+            sl_points = abs(entry - sl) / tick_size
+            risk_usd = lots * sl_points * tick_val
+        except Exception:
+            risk_usd = equity * float(os.environ.get("RISK_PCT", "0.5")) / 100
+    else:
+        risk_usd = equity * float(os.environ.get("RISK_PCT", "0.5")) / 100
 
     # R:R + potential profit (the money)
     if tp and sl and abs(entry - sl) > 0:
