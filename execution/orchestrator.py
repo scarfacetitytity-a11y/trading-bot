@@ -1423,10 +1423,18 @@ class TradingEngine(Component):
             live_sl = pos.sl if pos.sl > 0 else current_sl
             live_tp = pos.tp if pos.tp > 0 else (self._open_tp or 0.0)
             bank_r = float(self._trade_cfg.get("bank_tp_r", 0.0)) if self._adaptive_port else 0.0
+            # Asian session 50% midpoint — structural BE trigger (JP mentor v9)
+            _asian_50: Optional[float] = None
+            if self._level_monitor is not None:
+                for _lv in self._level_monitor.get_levels(self._symbol):
+                    if _lv.name == "Asian 50% Mid":
+                        _asian_50 = _lv.price
+                        break
             mdec = analyze_manage(
                 df=df_mgmt, direction=pos_dir, entry=entry, initial_sl=init_sl,
                 current_sl=live_sl, current_tp=live_tp, price=mid_price,
                 atr=atr_m, trade_type=ttype, cur_r=cur_r, bank_min_r=bank_r,
+                asian_50=_asian_50,
             )
             apply_sl = mdec.new_sl if (mdec.new_sl is not None and (
                 (pos_dir == 1 and mdec.new_sl > live_sl + 1e-8) or

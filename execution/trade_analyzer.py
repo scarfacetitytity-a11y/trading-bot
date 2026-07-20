@@ -367,17 +367,18 @@ class ManageDecision:
 
 
 def manage_trade(
-    df:         pd.DataFrame,
-    direction:  int,
-    entry:      float,
-    initial_sl: float,
-    current_sl: float,
-    current_tp: float,
-    price:      float,
-    atr:        float,
-    trade_type: str,
-    cur_r:      float,
-    bank_min_r: float = 0.0,
+    df:          pd.DataFrame,
+    direction:   int,
+    entry:       float,
+    initial_sl:  float,
+    current_sl:  float,
+    current_tp:  float,
+    price:       float,
+    atr:         float,
+    trade_type:  str,
+    cur_r:       float,
+    bank_min_r:  float = 0.0,
+    asian_50:    Optional[float] = None,
 ) -> ManageDecision:
     """Adaptive per-type management. Moves the stop to new structure as the trade
     develops (tighten-only) and extends the target to the next draw when price
@@ -387,12 +388,31 @@ def manage_trade(
       continuation   : ride — BE by +1R, trail behind each new higher-low/OB,
                        extend TP to the next liquidity pool.
       breakout       : BE by +1R, trail behind the reclaimed level.
+
+    asian_50: if price reaches the Asian session 50% midpoint in the trade direction,
+    go risk-free immediately — JP mentor v9: "50% of the Asian session range is a
+    point of interest; I made it risk-free there." It's a known reaction level.
     """
     if df is None or len(df) < 20 or atr <= 0 or abs(entry - initial_sl) < 1e-9:
         return ManageDecision()
 
     rdist = abs(entry - initial_sl)
     dec   = ManageDecision()
+
+    # ── 0. Asian session 50% → immediate breakeven (structural reaction point) ──
+    # JP v9: "50% of the Asian session range is a point of interest — made myself
+    # risk-free there." Trigger before the R-based ratchet so it fires first.
+    if asian_50 is not None:
+        reached = (direction == 1 and price >= asian_50) or \
+                  (direction == -1 and price <= asian_50)
+        if reached:
+            be = entry
+            if direction == 1 and be > current_sl:
+                dec.new_sl = be
+                dec.reason = "BE@Asian50%"
+            elif direction == -1 and be < current_sl:
+                dec.new_sl = be
+                dec.reason = "BE@Asian50%"
 
     # ── 1. Breakeven ratchet (type-specific trigger) ──
     be_trigger = 0.5 if trade_type == "sweep_reversal" else 1.0

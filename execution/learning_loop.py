@@ -1,12 +1,13 @@
-"""Automatic learning loop — analyze every trade, PROPOSE changes, never apply.
+"""Automatic learning loop — analyze live forward-test trades, PROPOSE changes, never apply.
 
-Reads the durable trade record (MT5 deal history + the journal's context +
-the misfire ledger), mines what keeps losing, and writes structured PROPOSALS
-to logs/learning_proposals.md for Anton to review.
+Reads only the live journal files (trades.jsonl, misfires.jsonl, wins.jsonl) —
+the durable record of every real trade the bot has taken. No backtesting data.
 
 HARD RULE (Anton, 2026-07-19): this NEVER edits the strategy or config. It only
 proposes. A human approves every change — the loop can be wrong about what
 matters, so removal/tightening is always human-gated.
+
+Forward testing only — keep backtesting analysis separate (Anton, 2026-07-20).
 
 Usage:  venv/Scripts/python.exe -m execution.learning_loop
 """
@@ -14,12 +15,11 @@ from __future__ import annotations
 
 import json
 from collections import Counter, defaultdict
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from pathlib import Path
 
 LOG_DIR = Path(__file__).resolve().parent.parent / "logs"
 PROPOSALS = LOG_DIR / "learning_proposals.md"
-MAGIC = 234001
 
 
 # ── Data loading ──────────────────────────────────────────────────────────────
@@ -31,40 +31,16 @@ def _load_jsonl(name: str) -> list:
     return [json.loads(l) for l in p.read_text(encoding="utf-8").splitlines() if l.strip()]
 
 
-def _deal_history(days: int = 30) -> list:
-    """Durable closed-trade truth from MT5, grouped per position_id."""
-    try:
-        import MetaTrader5 as mt5
-    except Exception:
-        return []
-    if not mt5.initialize():
-        return []
-    now = datetime.now()
-    deals = mt5.history_deals_get(now - timedelta(days=days), now + timedelta(minutes=1)) or []
-    by_pos = defaultdict(list)
-    for d in deals:
-        if d.magic == MAGIC:
-            by_pos[d.position_id].append(d)
-    trades = []
-    for pid, dl in by_pos.items():
-        outs = [d for d in dl if d.entry in (1, 3)]
-        ins  = [d for d in dl if d.entry == 0]
-        if not outs or not ins:
-            continue
-        trades.append({
-            "pos": pid, "symbol": dl[0].symbol,
-            "direction": -1 if ins[0].type == 1 else 1,
-            "lots": round(sum(d.volume for d in ins), 2),
-            "pnl": round(sum(d.profit + d.swap + d.commission for d in dl), 2),
-        })
-    mt5.shutdown()
-    return trades
+def _live_trades() -> list:
+    """All closed trades from the live journal — forward-test data only."""
+    trades = _load_jsonl("trades.jsonl")
+    return [t for t in trades if t.get("outcome")]   # closed only
 
 
 # ── Analysis → proposals (evidence-based, conservative) ───────────────────────
 
-def analyze(days: int = 30) -> dict:
-    deals    = _deal_history(days)
+def analyze(days: int = 0) -> dict:  # days param kept for API compat, ignored
+    trades   = _live_trades()
     misfires = _load_jsonl("misfires.jsonl")
     wins     = _load_jsonl("wins.jsonl")
     proposals = []
@@ -73,11 +49,13 @@ def analyze(days: int = 30) -> dict:
         proposals.append(dict(title=title, evidence=evidence, change=change,
                               confidence=confidence, status="NEEDS APPROVAL"))
 
-    # ── Per-symbol performance (durable pnl) ──
+    # ── Per-symbol performance (live journal pnl) ──
     by_sym = defaultdict(lambda: {"n": 0, "pnl": 0.0, "wins": 0})
-    for t in deals:
+    for t in trades:
         s = by_sym[t["symbol"]]
-        s["n"] += 1; s["pnl"] += t["pnl"]; s["wins"] += (t["pnl"] > 0)
+        s["n"] += 1
+        s["pnl"] += t.get("pnl_usd", 0) or 0
+        s["wins"] += (t.get("outcome") == "win")
     for sym, s in by_sym.items():
         if s["n"] >= 5:
             wr = s["wins"] / s["n"] * 100
@@ -97,9 +75,9 @@ def analyze(days: int = 30) -> dict:
 
     # ── Direction bias per symbol ──
     dir_sym = defaultdict(lambda: {"n": 0, "pnl": 0.0})
-    for t in deals:
-        d = dir_sym[(t["symbol"], t["direction"])]
-        d["n"] += 1; d["pnl"] += t["pnl"]
+    for t in trades:
+        d = dir_sym[(t["symbol"], t.get("direction", 0))]
+        d["n"] += 1; d["pnl"] += t.get("pnl_usd", 0) or 0
     for (sym, direction), d in dir_sym.items():
         if d["n"] >= 4 and d["pnl"] < -200:
             side = "SHORT" if direction == -1 else "LONG"
@@ -150,19 +128,20 @@ def analyze(days: int = 30) -> dict:
                 f"Prioritise / size-up '{wtype[0][0]}' setups.", "low")
 
     # ── Size anomalies (runaway lots) ──
-    if deals:
-        lots = sorted(t["lots"] for t in deals)
-        med = lots[len(lots) // 2]
-        big = [t for t in deals if t["lots"] > med * 10 and t["lots"] > 20]
-        if big:
-            worst = min(big, key=lambda t: t["pnl"])
-            propose(
-                f"Runaway lot sizes ({len(big)} trades > 10x median {med})",
-                f"e.g. {worst['symbol']} {worst['lots']} lots -> ${worst['pnl']:+.0f}",
-                "notional cap + min-stop guards now added — verify no new trade exceeds them.",
-                "high")
+    if trades:
+        all_lots = sorted(t.get("lots", 0) for t in trades if t.get("lots"))
+        if all_lots:
+            med = all_lots[len(all_lots) // 2]
+            big = [t for t in trades if (t.get("lots") or 0) > med * 10 and (t.get("lots") or 0) > 20]
+            if big:
+                worst = min(big, key=lambda t: t.get("pnl_usd", 0) or 0)
+                propose(
+                    f"Runaway lot sizes ({len(big)} trades > 10x median {med})",
+                    f"e.g. {worst['symbol']} {worst.get('lots')} lots -> ${worst.get('pnl_usd',0):+.0f}",
+                    "notional cap + min-stop guards now added — verify no new trade exceeds them.",
+                    "high")
 
-    return dict(deals=len(deals), misfires=len(misfires), wins=len(wins), proposals=proposals)
+    return dict(trades=len(trades), misfires=len(misfires), wins=len(wins), proposals=proposals)
 
 
 # ── Report ────────────────────────────────────────────────────────────────────
@@ -173,7 +152,7 @@ def write_report(result: dict) -> None:
         "tags: [trading-bot, learning-loop, proposals, risk]",
         "relatedTo: [trading-bot, misfire-ledger]", "---", "",
         f"# Learning-loop proposals — {datetime.now(timezone.utc):%Y-%m-%d %H:%M UTC}", "",
-        f"Analyzed **{result['deals']}** closed trades, **{result.get('wins',0)}** wins, "
+        f"Analyzed **{result['trades']}** live trades, **{result.get('wins',0)}** wins, "
         f"**{result['misfires']}** misfires. "
         f"**{len(result['proposals'])} proposals — NONE applied. Every one needs your approval.**", "",
     ]
@@ -192,7 +171,7 @@ def write_report(result: dict) -> None:
 def main():
     res = analyze()
     write_report(res)
-    print(f"Learning loop: {res['deals']} trades, {res['misfires']} misfires "
+    print(f"Learning loop: {res['trades']} live trades, {res['misfires']} misfires "
           f"-> {len(res['proposals'])} PROPOSALS (needs approval)")
     for p in res["proposals"]:
         print(f"  [{p['confidence']:>6}] {p['title']}")

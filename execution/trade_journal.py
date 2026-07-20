@@ -391,12 +391,12 @@ class TradeJournal:
         def _bg():
             try:
                 from execution import learning_loop
-                result = learning_loop.analyze(days=60)
+                result = learning_loop.analyze()
                 learning_loop.write_report(result)
                 n = len(result["proposals"])
                 logger.info(
-                    "[LearningLoop] %d deals / %d wins / %d misfires → %d proposals",
-                    result["deals"], result.get("wins", 0), result["misfires"], n,
+                    "[LearningLoop] %d live trades / %d wins / %d misfires → %d proposals",
+                    result["trades"], result.get("wins", 0), result["misfires"], n,
                 )
                 if n:
                     logger.info("[LearningLoop] Proposals written to logs/learning_proposals.md")
