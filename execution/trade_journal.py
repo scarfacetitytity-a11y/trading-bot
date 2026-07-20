@@ -180,7 +180,7 @@ class TradeJournal:
 
         if rec.r_multiple > 0.1:
             rec.outcome = "win"
-        elif rec.r_multiple < -0.8:
+        elif rec.r_multiple < -0.2:
             rec.outcome = "loss"
         else:
             rec.outcome = "breakeven"

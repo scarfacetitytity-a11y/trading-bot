@@ -1125,6 +1125,33 @@ class TradingEngine(Component):
         except Exception:
             return MAX_DAILY_LOSS_PCT, SOFT_DD_HALT_PCT
 
+    def _fetch_dxy_bias(self) -> int:
+        """H4 EMA bias of DXY index. Returns +1 (USD strong), -1 (USD weak), 0 (unavailable).
+
+        Tries common broker symbol names for USD index. Gold has a robust inverse
+        relationship with DXY — DXY bullish = gold bearish and vice versa.
+        """
+        _dxy_symbols = ("DXY", "USDX", "USDINDEX", "DX.f", "USDOLLAR")
+        for _sym in _dxy_symbols:
+            try:
+                _rates = mt5.copy_rates_from_pos(_sym, mt5.TIMEFRAME_M15, 0, 200)
+                if _rates is None or len(_rates) < 50:
+                    continue
+                _ddf = pd.DataFrame(_rates)
+                _ddf.columns = [c.lower() for c in _ddf.columns]
+                _times = pd.to_datetime(_ddf["time"], unit="s", utc=True)
+                _tmp = _ddf[["close"]].copy()
+                _tmp.index = _times
+                _h4c = _tmp["close"].resample("4h").last().dropna()
+                if len(_h4c) < 10:
+                    continue
+                _fast = _h4c.ewm(span=5, adjust=False).mean()
+                _slow = _h4c.ewm(span=20, adjust=False).mean()
+                return 1 if float(_fast.iloc[-1]) > float(_slow.iloc[-1]) else -1
+            except Exception:
+                continue
+        return 0  # DXY not available on this broker — no penalty
+
     def _portfolio_pnl_r(self) -> float:
         """Return total portfolio floating P&L in R units (risk_pct of equity per trade)."""
         try:
@@ -1763,6 +1790,21 @@ class TradingEngine(Component):
                         signal_score += 1
                         lvl_names = ", ".join(l.label for l in _approaching_levels)
                         logger.info("[%s] Key level confluence +1: %s", self.name, lvl_names)
+
+                    # DXY alignment check — metals only (XAUUSD, XAGUSD have robust inverse DXY correlation)
+                    # Mentor: "Let's normalize not taking a trade because we're looking at the Dixie
+                    # and we're coming to a conclusion that the Dixie isn't doing."
+                    # → DXY is a FILTER (opposition = -1), not a bonus (alignment = no change).
+                    _METALS_DXY = {"XAUUSD", "XAGUSD"}
+                    if self._symbol in _METALS_DXY:
+                        _dxy_bias = self._fetch_dxy_bias()
+                        if _dxy_bias != 0:
+                            # DXY bullish + going long gold = DXY opposing gold
+                            # DXY bearish + going short gold = DXY opposing gold
+                            if (_dxy_bias == 1 and desired == 1) or (_dxy_bias == -1 and desired == -1):
+                                signal_score -= 1
+                                logger.info("[%s] DXY opposing: DXY bias=%+d, trade=%+d → score %d",
+                                            self.name, _dxy_bias, desired, signal_score)
 
                     # ── Trend-aware quality bar (fix #4) ──────────────────────
                     # Bidirectional stays. The bar is NOT a flat score-6 on every

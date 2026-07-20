@@ -24,7 +24,13 @@ OS Confluence scoring (max 10 per setup):
     nearer daily high/low when inside day)
   PDH/PDL swept today (9/10 sessions market takes +1  [JP mentor v2]
     prior D1 high or low — confirmed tick in box)
+  D1 FVG retest (price inside daily imbalance)   +1  [JP mentor v2]
   D1 aligned (daily EMA agrees with H4) ......... +1  [optional]
+
+Negative confluences (subtract from score):
+  No liquidity sweep                             -1  (market uncleared)
+  Opposing manipulation pattern                  -1  (M on long / W on short)
+  RSI extreme against trade                      -1  (>75 for long / <25 for short)
 
 Dynamic RR:
   Base: rr_target (default 2.5)
@@ -369,6 +375,23 @@ class AiDENIndexStrategy(Strategy):
                     return int(_d1b.iloc[idx]) if idx >= 0 else 0
                 d1_bias_at = _d1_bias_at
 
+        # ── D1 FVG zones (mentor: "I marked out the imbalance between candles on the daily") ──
+        # Bullish D1 FVG: gap between bar[i-2].high and bar[i].low (bar i's low > bar i-2's high).
+        # Bearish D1 FVG: gap between bar[i-2].low and bar[i].high (bar i's high < bar i-2's low).
+        # Computed once from D1 resample; last 7 D1 bars scanned.
+        _d1_fvg_zones: list[tuple[float, float, int]] = []  # (lo, hi, direction)
+        _d1_for_fvg = _resample_d1(df)
+        if len(_d1_for_fvg) >= 3:
+            _d1h = _d1_for_fvg["high"].astype(float)
+            _d1l = _d1_for_fvg["low"].astype(float)
+            for _dj in range(2, min(len(_d1_for_fvg), 9)):
+                _bull_gap_d1 = _d1l.iloc[_dj] - _d1h.iloc[_dj - 2]
+                if _bull_gap_d1 > 0:
+                    _d1_fvg_zones.append((_d1h.iloc[_dj - 2], _d1l.iloc[_dj], 1))
+                _bear_gap_d1 = _d1l.iloc[_dj - 2] - _d1h.iloc[_dj]
+                if _bear_gap_d1 > 0:
+                    _d1_fvg_zones.append((_d1h.iloc[_dj], _d1l.iloc[_dj - 2], -1))
+
         # ── Pre-session range (JP mentor: Asian 50% level, early leakage, inside day) ──
         # For each UTC day, compute the high/low of bars BEFORE session_start (the
         # "Asian" or pre-market range) and the previous day's high/low. Three new
@@ -548,8 +571,25 @@ class AiDENIndexStrategy(Strategy):
                             if cv < mid:
                                 score += 1; reasons.append("Discount zone")
 
+                        # ── Negatives — reasons NOT to trade ─────────────────
+                        # No liquidity sweep: longs need to see prior lows swept before entry.
+                        # Market that hasn't swept lows hasn't cleared retail positions yet.
                         if _liq_swept_low(low, i, self.liq_lookback):
                             score += 1; reasons.append("Liquidity sweep")
+                        else:
+                            score -= 1; reasons.append("-No sweep")
+
+                        # Opposing manipulation M active: if M pattern formed recently,
+                        # market just signalled it wants to go DOWN. Don't fade it for a long.
+                        if _manipulation_m(high, low, i, lookback=min(20, i)):
+                            score -= 1; reasons.append("-Opposing Manip M")
+
+                        # RSI extreme against trade: entering a long when RSI already > 75
+                        # means the market is overbought — chasing a move that's exhausted.
+                        if self.use_rsi and rsi_s is not None:
+                            _rsi_now = float(rsi_s.iloc[i])
+                            if not np.isnan(_rsi_now) and _rsi_now > 75.0:
+                                score -= 1; reasons.append("-RSI overbought")
 
                         ob_lo, ob_hi = _find_bullish_ob(open_, close, high, low, i - 2, self.ob_lookback)
                         if ob_lo is not None and min(ob_hi, lv) - max(ob_lo, h2) > 0:
@@ -593,9 +633,13 @@ class AiDENIndexStrategy(Strategy):
                         if _manipulation_w(high, low, i, lookback=min(20, i)):
                             score += 1; reasons.append("Manipulation W")
                         # PDL swept today (+1): today's running low has taken prior day low
-                        # JP mentor: 9/10 sessions the market takes PDH or PDL — tick in box
                         if not np.isnan(_pdl[i]) and not np.isnan(_cdl[i]) and _cdl[i] < _pdl[i]:
                             score += 1; reasons.append("PDL swept today")
+                        # D1 FVG retest (+1): price is inside a daily-level imbalance zone
+                        # Mentor: "I marked out the imbalance — that's a point of interest"
+                        for _z in _d1_fvg_zones:
+                            if _z[2] == 1 and _z[0] <= cv <= _z[1]:
+                                score += 1; reasons.append("D1 FVG retest"); break
 
                         if score >= self.min_score:
                             active_fvgs.append({
@@ -626,8 +670,21 @@ class AiDENIndexStrategy(Strategy):
                             if cv > mid:
                                 score += 1; reasons.append("Premium zone")
 
+                        # ── Negatives — reasons NOT to trade ─────────────────
                         if _liq_swept_high(high, i, self.liq_lookback):
                             score += 1; reasons.append("Liquidity sweep")
+                        else:
+                            score -= 1; reasons.append("-No sweep")
+
+                        # Opposing Manipulation W: market just signalled it wants to go UP.
+                        if _manipulation_w(high, low, i, lookback=min(20, i)):
+                            score -= 1; reasons.append("-Opposing Manip W")
+
+                        # RSI oversold entering a short: chasing an exhausted down move.
+                        if self.use_rsi and rsi_s is not None:
+                            _rsi_now = float(rsi_s.iloc[i])
+                            if not np.isnan(_rsi_now) and _rsi_now < 25.0:
+                                score -= 1; reasons.append("-RSI oversold")
 
                         ob_lo, ob_hi = _find_bearish_ob(open_, close, high, low, i - 2, self.ob_lookback)
                         if ob_lo is not None and min(ob_hi, l2) - max(ob_lo, hv) > 0:
@@ -673,6 +730,10 @@ class AiDENIndexStrategy(Strategy):
                         # PDH swept today (+1): today's running high has taken prior day high
                         if not np.isnan(_pdh[i]) and not np.isnan(_cdh[i]) and _cdh[i] > _pdh[i]:
                             score += 1; reasons.append("PDH swept today")
+                        # D1 FVG retest (+1): price is inside a bearish daily imbalance zone
+                        for _z in _d1_fvg_zones:
+                            if _z[2] == -1 and _z[0] <= cv <= _z[1]:
+                                score += 1; reasons.append("D1 FVG retest"); break
 
                         if score >= self.min_score:
                             active_fvgs.append({
