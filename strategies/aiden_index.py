@@ -748,7 +748,18 @@ class AiDENIndexStrategy(Strategy):
                 rsi_val      = float(rsi_s.iloc[i]) if rsi_s is not None else float("nan")
                 strongly_trending = abs(trend_strength) > self.rr_trend_threshold
 
-                # Remove invalidated FVGs
+                # Remove invalidated FVGs — expire any FVG whose bias no longer matches
+                # current H4 direction. A bull FVG formed when H4 was +1 is stale if H4
+                # has since flipped to 0 or -1; entering it would mean fading the current bias.
+                to_expire = []
+                for _fvg in active_fvgs:
+                    if _fvg["dir"] == "bull" and htf_bias != 1:
+                        to_expire.append(_fvg)
+                    elif _fvg["dir"] == "bear" and htf_bias != -1:
+                        to_expire.append(_fvg)
+                for _fvg in to_expire:
+                    active_fvgs.remove(_fvg)
+
                 if htf_bias == 0:
                     self._expire_fvgs_neutral(active_fvgs, cv)
                     signals.iloc[i]     = position * position_size

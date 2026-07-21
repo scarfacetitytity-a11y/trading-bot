@@ -162,7 +162,8 @@ class TradeJournal:
         if rec.path_low is None or low < rec.path_low:
             rec.path_low = float(low)
 
-    def close_trade(self, symbol: str, close_price: float, equity_after: float) -> None:
+    def close_trade(self, symbol: str, close_price: float, equity_after: float,
+                    realized_pnl: float | None = None) -> None:
         rec = self._open.pop(symbol, None)
         if rec is None:
             return
@@ -170,7 +171,9 @@ class TradeJournal:
 
         rec.close_time  = datetime.now(tz=timezone.utc).isoformat()
         rec.close_price = close_price
-        rec.pnl_usd     = equity_after - rec.equity_at_entry
+        # Use broker-reported realized PnL when available — avoids equity-delta
+        # errors when multiple trades close in the same reconciler tick.
+        rec.pnl_usd = realized_pnl if realized_pnl is not None else (equity_after - rec.equity_at_entry)
 
         risk_dist = abs(rec.entry_price - rec.sl_price)
         if risk_dist > 0:

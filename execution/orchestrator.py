@@ -105,6 +105,8 @@ MAX_SAME_DIR_CLUSTER = 3
 # higher-scoring one enters (JP mentor: "GU and EU are cousins — pick the better one").
 _COUSIN_PAIRS: list[frozenset] = [
     frozenset({"GBPUSD", "EURUSD"}),
+    # US equity indices: highly correlated — only the highest-scoring fires per bar
+    frozenset({"US30.cash", "US500.cash", "US100.cash", "US2000.cash"}),
 ]
 
 
@@ -721,7 +723,7 @@ class TradeReconciler(Component):
                 self._ftmo.record_trade_day(equity)
             if self._journal is not None:
                 try:
-                    self._journal.close_trade(symbol, last_out.price, equity)
+                    self._journal.close_trade(symbol, last_out.price, equity, realized_pnl=realized)
                 except Exception:
                     logger.exception("[TradeReconciler] journal close failed for %s", symbol)
 
