@@ -492,7 +492,8 @@ class AiDENIndexStrategy(Strategy):
         high   = df["high"].astype(float)
         low    = df["low"].astype(float)
         open_  = df["open"].astype(float)
-        times  = pd.to_datetime(df["time"])
+        _t     = pd.to_datetime(df["time"])
+        times  = _t.dt.tz_localize(None) if _t.dt.tz is not None else _t
         hours  = times.dt.hour
 
         atr_s = _atr(high, low, close, self.atr_period)
@@ -560,7 +561,8 @@ class AiDENIndexStrategy(Strategy):
                 if _bear_gap_w1 > 0:
                     _w1_fvg_zones.append((_w1h.iloc[_wj], _w1l.iloc[_wj - 2], -1))
         # Current week mid/range for each bar — map weekly rows onto input bars
-        _w1_times = pd.to_datetime(_w1_df["time"]) if len(_w1_df) else pd.Series([], dtype="datetime64[ns]")
+        _w1t_raw  = pd.to_datetime(_w1_df["time"]) if len(_w1_df) else pd.Series([], dtype="datetime64[ns]")
+        _w1_times = _w1t_raw.dt.tz_localize(None) if len(_w1_df) and _w1t_raw.dt.tz is not None else _w1t_raw
         for _wi in range(len(_w1_df)):
             _wstart = _w1_times.iloc[_wi]
             _wend   = _w1_times.iloc[_wi + 1] if _wi + 1 < len(_w1_df) else pd.Timestamp.max

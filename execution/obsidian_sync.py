@@ -67,12 +67,28 @@ def write_trade(trade: dict) -> None:
 
     reasons_md = "\n".join(f"- {r}" for r in reasons) if reasons else "- (none logged)"
 
+    tp_val = f"{tp:.5g}" if tp else ""
     content = f"""---
 type: trade
 status: closed
 tags: [trade, {sym.lower().replace('.','')}, {direction.lower()}, {outcome.lower()}, score-{score}]
 relatedTo: [AiDEN, {sym}, {direction}, {outcome}]
 date: {date_str}
+symbol: {sym}
+direction: {direction}
+outcome: {outcome}
+score: {score}
+grade: {grade}
+r_multiple: {r}
+pnl_usd: {round(pnl, 2)}
+lots: {lots}
+entry_price: {entry}
+sl_price: {sl}
+tp_price: {tp_val}
+mfe_r: {mfe}
+mae_r: {mae}
+open_time: "{open_t}"
+close_time: "{close_t}"
 ---
 
 # {outcome_icon} {direction} {sym} — {outcome} ({r:+.2f}R)
@@ -90,7 +106,7 @@ date: {date_str}
 | Lots | {lots} |
 | Entry | `{entry:.5g}` |
 | SL | `{sl:.5g}` |
-| TP | `{tp:.5g}` if tp else `—` |
+| TP | {f"`{tp:.5g}`" if tp else "—"} |
 | Open | {open_t} UTC |
 | Close | {close_t} UTC |
 | MFE | {mfe:.2f}R |
