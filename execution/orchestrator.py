@@ -1816,10 +1816,38 @@ class TradingEngine(Component):
 
                 # Open new position — gate through soft halt, RiskAgent, FTMOTracker
                 if desired != 0:
-                    # Soft halt check (2% daily or 7% cumulative DD)
+                    # Soft halt check (2% daily or 7% cumulative DD).
+                    # Also compute inline — RiskGuard background thread ticks every 60s
+                    # so a loss that breaches the daily limit may not have set the flag
+                    # yet. Engines recheck equity directly so no trade slips through.
                     if self._soft_halt is not None and self._soft_halt.is_set():
                         logger.warning("[%s] SOFT HALT active — blocking new entry", self.name)
                         continue
+                    if self._risk_guard is not None:
+                        _rg_day_eq  = getattr(self._risk_guard, "_day_start_equity", None)
+                        _rg_init_eq = getattr(self._risk_guard, "_initial_equity", None)
+                        _rg_daily_limit = getattr(self._risk_guard, "_daily_halt_pct", MAX_DAILY_LOSS_PCT)
+                        _rg_soft_limit  = getattr(self._risk_guard, "_soft_dd_pct", SOFT_DD_HALT_PCT)
+                        if _rg_day_eq and _rg_day_eq > 0:
+                            _inline_daily_dd = (_rg_day_eq - equity) / _rg_day_eq * 100
+                            if _inline_daily_dd >= _rg_daily_limit:
+                                logger.critical(
+                                    "[%s] INLINE DAILY DD GATE: %.2f%% >= %.2f%% limit — blocking entry, "
+                                    "setting soft halt", self.name, _inline_daily_dd, _rg_daily_limit
+                                )
+                                if self._soft_halt is not None:
+                                    self._soft_halt.set()
+                                continue
+                        if _rg_init_eq and _rg_init_eq > 0:
+                            _inline_total_dd = (_rg_init_eq - equity) / _rg_init_eq * 100
+                            if _inline_total_dd >= _rg_soft_limit:
+                                logger.critical(
+                                    "[%s] INLINE TOTAL DD GATE: %.2f%% >= %.2f%% soft limit — blocking entry",
+                                    self.name, _inline_total_dd, _rg_soft_limit
+                                )
+                                if self._soft_halt is not None:
+                                    self._soft_halt.set()
+                                continue
 
                     # ── M5 entry trigger gate ─────────────────────────────────
                     df_m5_entry = self._fetch_ltf_bars("M5", count=40)
