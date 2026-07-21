@@ -209,6 +209,38 @@ class TradeJournal:
             session_pnl=session_pnl,
         )
         self._run_learning_loop()
+        self._sync_obsidian(rec, equity_after, session_pnl)
+
+    def _sync_obsidian(self, rec, equity: float, session_pnl: float) -> None:
+        """Write trade + session note to Obsidian vault in background."""
+        import threading
+        def _bg():
+            try:
+                from execution import obsidian_sync as ob
+                ob.write_index()
+                trade_dict = {
+                    "symbol": rec.symbol, "direction": rec.direction,
+                    "outcome": rec.outcome, "r_multiple": rec.r_multiple,
+                    "score": rec.score, "grade": rec.grade,
+                    "open_time": rec.open_time, "close_time": rec.close_time,
+                    "entry_price": rec.entry_price, "sl_price": rec.sl_price,
+                    "tp_price": rec.tp_price, "lots": rec.lots,
+                    "pnl_usd": rec.pnl_usd, "equity_at_entry": rec.equity_at_entry,
+                    "thesis": rec.thesis, "reasons": rec.reasons or [],
+                    "lesson": rec.lesson or "", "mfe_r": rec.mfe_r,
+                    "mae_r": rec.mae_r, "hit_target": rec.hit_target,
+                    "trade_type": rec.trade_type,
+                }
+                ob.write_trade(trade_dict)
+                today = datetime.now(tz=timezone.utc).date().isoformat()
+                today_trades = [
+                    t for t in self._load_recent(50)
+                    if t.get("open_time", "")[:10] == today and t.get("outcome")
+                ]
+                ob.write_session(today, today_trades, equity, session_pnl)
+            except Exception:
+                logger.exception("[Obsidian] sync failed")
+        threading.Thread(target=_bg, name="ObsidianSync", daemon=True).start()
 
     # ── Misfire postmortem — the self-improvement ledger ──────────────────────
 
@@ -393,6 +425,13 @@ class TradeJournal:
                 from execution import learning_loop
                 result = learning_loop.analyze()
                 learning_loop.write_report(result)
+                try:
+                    from execution import obsidian_sync as ob
+                    _proposals_path = Path(__file__).resolve().parent.parent / "logs" / "learning_proposals.md"
+                    if _proposals_path.exists():
+                        ob.write_council_snapshot(_proposals_path.read_text(encoding="utf-8"))
+                except Exception:
+                    pass
                 n = len(result["proposals"])
                 logger.info(
                     "[LearningLoop] %d live trades / %d wins / %d misfires → %d proposals",
