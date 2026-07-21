@@ -1680,6 +1680,32 @@ class TradingEngine(Component):
                 desired = int(signals.iloc[-1])
                 current = trader.get_position_direction(self._symbol)
 
+                # ── White-blood-cell: reconcile internal state vs MT5 reality ──
+                # If we think we're in a trade but MT5 shows flat, someone closed
+                # it externally (manual close, broker action, SL/TP hit outside loop).
+                # Trust MT5, close the journal entry, reset state, notify once.
+                _internal_in_trade = self._open_entry_price is not None
+                if _internal_in_trade and current == 0:
+                    logger.warning(
+                        "[%s] STATE MISMATCH: internal=open, MT5=flat — external close detected. "
+                        "Reconciling.", self.name
+                    )
+                    try:
+                        tick = mt5.symbol_info_tick(self._symbol)
+                        _recon_price = (tick.bid + tick.ask) / 2.0 if tick else (self._open_entry_price or 0.0)
+                        if self._journal is not None:
+                            self._journal.close_trade(self._symbol, _recon_price, equity)
+                        tg.notify_council_flag(
+                            "SRE #07",
+                            f"{self._symbol} closed externally (manual/broker). "
+                            f"Bot reconciled at {_recon_price:.5g}. State reset."
+                        )
+                    except Exception:
+                        logger.exception("[%s] Reconcile failed — forcing state reset", self.name)
+                    self._reset_position_state()
+                    if self._journal is not None:
+                        self._journal._save_open()
+
                 self.beat(
                     f"bar={bar_dt.strftime('%H:%M')} | "
                     f"signal={desired:+d} | pos={current:+d}"
