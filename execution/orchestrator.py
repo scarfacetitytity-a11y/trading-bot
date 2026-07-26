@@ -2423,6 +2423,26 @@ class Orchestrator:
         account = mt5.account_info()
         tg.notify_startup(self._symbols, self.dry_run, account.equity if account else 0.0)
 
+        # Sync system state to Obsidian vault on startup
+        try:
+            import threading
+            from execution import obsidian_sync as _ob
+            _preday = None
+            try:
+                import json as _json
+                _p = Path(__file__).resolve().parent.parent / "logs" / "preday_brief.json"
+                if _p.exists():
+                    _preday = _json.loads(_p.read_text(encoding="utf-8"))
+            except Exception:
+                pass
+            threading.Thread(
+                target=_ob.write_system_state,
+                args=(list(self._symbols), account.equity if account else 0.0, _preday),
+                daemon=True,
+            ).start()
+        except Exception:
+            pass
+
         # Build the shared risk components first so the engines can reference them:
         #  - RiskGuard owns the single server-day daily baseline (engines read it)
         #  - TradeReconciler is the single outcome recorder (engines trigger it

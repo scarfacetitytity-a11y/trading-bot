@@ -27,6 +27,12 @@ from typing import Optional
 LOG_DIR   = Path(__file__).resolve().parent.parent / "logs"
 PROPOSALS = LOG_DIR / "learning_proposals.md"
 
+# Additional log directories from other accounts. Add paths here when a second
+# or third account bot install exists. The learning loop merges all trade records.
+_EXTRA_LOG_DIRS: list[Path] = [
+    # e.g. Path("C:/Users/anton/Documents/trading-bot-account2/logs"),
+]
+
 # Backtest baseline (from 26-month XAUUSD H1 run)
 _BASELINE_WR    = 0.396
 _BASELINE_AVG_R = 0.386
@@ -38,14 +44,16 @@ _CONSEC_LOSS_LIMIT = 7
 # ── Data loading ──────────────────────────────────────────────────────────────
 
 def _load_jsonl(name: str) -> list:
-    p = LOG_DIR / name
-    if not p.exists():
-        return []
-    return [json.loads(l) for l in p.read_text(encoding="utf-8").splitlines() if l.strip()]
+    rows = []
+    for d in [LOG_DIR] + _EXTRA_LOG_DIRS:
+        p = d / name
+        if p.exists():
+            rows += [json.loads(l) for l in p.read_text(encoding="utf-8").splitlines() if l.strip()]
+    return rows
 
 
 def _live_trades() -> list:
-    """All closed trades from the live journal — forward-test data only."""
+    """All closed trades across all registered accounts — forward-test data only."""
     return [t for t in _load_jsonl("trades.jsonl") if t.get("outcome")]
 
 
@@ -539,6 +547,15 @@ def write_report(result: dict) -> None:
                 ]
 
     PROPOSALS.write_text("\n".join(lines), encoding="utf-8")
+
+    # Mirror to Obsidian Brain if there are proposals worth recording
+    if obs:
+        try:
+            from execution import obsidian_sync as ob
+            title = f"Learning Loop — {datetime.now(timezone.utc):%Y-%m-%d} ({len(obs)} proposals)"
+            ob.write_brain_entry(title, "\n".join(lines[6:]), tags=["learning-loop", "council", "aiden"])
+        except Exception:
+            pass
 
 
 def main():
