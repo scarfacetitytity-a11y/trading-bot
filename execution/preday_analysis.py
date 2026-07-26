@@ -192,6 +192,7 @@ def build_brief(symbols: list[str], equity: float) -> dict:
 
 def run_preday_brief(symbols: list[str] | None = None, equity: float = 0.0) -> None:
     """Build and send the pre-day brief. Requires MT5 connected."""
+    import json as _json
     from execution import telegram_notify as tg
 
     syms = symbols or _DEFAULT_SYMBOLS
@@ -200,6 +201,9 @@ def run_preday_brief(symbols: list[str] | None = None, equity: float = 0.0) -> N
         tg.notify_preday_brief(brief)
         logger.info("[PreDay] Brief sent — %d levels, %d news",
                     len(brief["levels"]), len(brief["news"]))
+        # Cache to disk so obsidian-session-start.py can inject it into Claude sessions
+        _cache = Path(__file__).resolve().parent.parent / "logs" / "preday_brief.json"
+        _cache.write_text(_json.dumps(brief, default=str), encoding="utf-8")
     except Exception:
         logger.exception("[PreDay] Failed to build/send brief")
 

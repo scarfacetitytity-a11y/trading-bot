@@ -34,7 +34,7 @@ from execution.signal_detectors import _swing_highs, _swing_lows
 
 # ── Tunables ──────────────────────────────────────────────────────────────────
 MIN_RR_TRADEABLE   = 1.2    # below this, the draw is too close to be worth the risk
-MAX_REACH_ATR      = 12.0   # a target beyond this many ATR is not "in reach" this session
+MAX_REACH_ATR      = 8.0    # a target beyond this many ATR is not "in reach" this session
 EQ_TOLERANCE_ATR   = 0.15   # equal-high/low cluster tolerance
 MIN_BEYOND_ATR     = 0.5    # target must sit at least this far beyond entry to count
 SWING_ORDER        = 3
@@ -104,16 +104,22 @@ def _find_target(
     if not cands:
         return None, "none", 0
 
-    # Prefer equal-level clusters (resting liquidity) over lone swings.
-    best_level, best_touches, best_dist = None, 1, float("inf")
+    # Only equal-level clusters count as targets — resting orders at tested levels.
+    # A single-touch swing (lone high/low) is NOT a liquidity target; it's arbitrary
+    # structure that price has no reason to seek. Returning it as a target produces
+    # the "weekly low" problem: bot latches onto the deepest swing in the window and
+    # treats it as an intraday draw.
+    best_level, best_touches, best_dist = None, 0, float("inf")
     for lvl in cands:
         touches = sum(1 for v in cands if abs(v - lvl) <= tol)
         dist    = abs(lvl - entry)
-        # rank: more touches first, then nearer (nearest reachable pool)
-        if touches > best_touches or (touches == best_touches and dist < best_dist):
+        if touches >= 2 and (touches > best_touches or (touches == best_touches and dist < best_dist)):
             best_level, best_touches, best_dist = lvl, touches, dist
 
-    src = ("equal_highs" if direction == 1 else "equal_lows") if best_touches >= 2 else "swing"
+    if best_level is None:
+        return None, "none", 0
+
+    src = "equal_highs" if direction == 1 else "equal_lows"
     return float(best_level), src, int(best_touches)
 
 

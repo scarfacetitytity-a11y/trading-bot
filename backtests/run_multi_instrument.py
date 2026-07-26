@@ -123,6 +123,14 @@ TRAIL_CONFIGS: dict[str, dict] = {
     #   t1_r=1.0  → at 1R profit, close 50% (jab locked), move SL to BE
     #   runner 50% uses HOLD_RUNNER (sucker punch) — rides structure until TM exits
     #
+    # Forex: tighter trail than indices — spreads are tighter, reversals are faster.
+    # Anton rule: NEVER go from profit to loss. BE at 0.5R, lock 1R at 2R.
+    "GBPUSD":      dict(trail_to_be=True, trail_be_r=0.5, trail_lock_r=2.0,
+                        t1_r=1.0, t1_partial_pct=0.50),
+    "EURUSD":      dict(trail_to_be=True, trail_be_r=0.5, trail_lock_r=2.0,
+                        t1_r=1.0, t1_partial_pct=0.50),
+    "USDJPY":      dict(trail_to_be=True, trail_be_r=0.5, trail_lock_r=2.0,
+                        t1_r=1.0, t1_partial_pct=0.50),
     # Gold: tight trail — sweeps fast, trail protects runner
     "XAUUSD":      dict(trail_to_be=True, trail_be_r=1.0, trail_lock_r=2.0,
                         t1_r=1.0, t1_partial_pct=0.50),

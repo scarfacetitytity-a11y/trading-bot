@@ -519,9 +519,11 @@ class AiDENIndexStrategy(Strategy):
                 d1_fast_n = max(3, self.htf_lookback // 4)
                 d1_slow_n = max(5, self.htf_lookback // 2)
                 d1_b, _   = _compute_h4_bias_ema(d1, d1_fast_n, d1_slow_n)
-                d1_times  = d1["time"]
+                _d1t_raw  = pd.to_datetime(d1["time"])
+                d1_times  = _d1t_raw.dt.tz_localize(None) if _d1t_raw.dt.tz is not None else _d1t_raw
                 def _d1_bias_at(bar_time, _d1b=d1_b, _d1t=d1_times):
-                    idx = _d1t.searchsorted(bar_time, side="right") - 1
+                    _bt = bar_time.replace(tzinfo=None) if hasattr(bar_time, "tzinfo") and bar_time.tzinfo is not None else bar_time
+                    idx = _d1t.searchsorted(_bt, side="right") - 1
                     return int(_d1b.iloc[idx]) if idx >= 0 else 0
                 d1_bias_at = _d1_bias_at
 
@@ -630,16 +632,19 @@ class AiDENIndexStrategy(Strategy):
 
         h4["bias"]   = h4_bias.values
         h4["spread"] = h4_spread.values
-        h4_times     = h4["time"]
+        _h4t_raw = pd.to_datetime(h4["time"])
+        h4_times = _h4t_raw.dt.tz_localize(None) if _h4t_raw.dt.tz is not None else _h4t_raw
 
         def _h4_at(bar_time):
-            idx = h4_times.searchsorted(bar_time, side="right") - 1
+            _bt = bar_time.replace(tzinfo=None) if hasattr(bar_time, "tzinfo") and bar_time.tzinfo is not None else bar_time
+            idx = h4_times.searchsorted(_bt, side="right") - 1
             if idx < 0:
                 return 0, 0.0
             return int(h4["bias"].iloc[idx]), float(h4["spread"].iloc[idx])
 
         def _swing_range_at(bar_time):
-            idx = h4_times.searchsorted(bar_time, side="right") - 1
+            _bt = bar_time.replace(tzinfo=None) if hasattr(bar_time, "tzinfo") and bar_time.tzinfo is not None else bar_time
+            idx = h4_times.searchsorted(_bt, side="right") - 1
             if idx < self.h4_swing_lookback:
                 return float("nan"), float("nan")
             w = h4.iloc[idx - self.h4_swing_lookback:idx]
