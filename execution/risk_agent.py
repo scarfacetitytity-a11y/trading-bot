@@ -113,7 +113,7 @@ class RiskAgent:
             self.state.peak_equity       = initial_equity
             self.state.daily_start_equity  = initial_equity
             self.state.weekly_start_equity = initial_equity
-            self.state.daily_date        = str(date.today())
+            self.state.daily_date        = datetime.now(timezone.utc).strftime("%Y-%m-%d")
             self.state.weekly_start_date = str(_monday())
             self._save_state()
 
@@ -273,7 +273,7 @@ class RiskAgent:
     def reset_daily(self, current_equity: float):
         """Call at start of each trading day."""
         self.state.daily_start_equity = current_equity
-        self.state.daily_date         = str(date.today())
+        self.state.daily_date         = datetime.now(timezone.utc).strftime("%Y-%m-%d")
         self._save_state()
 
     def reset_weekly(self, current_equity: float):
@@ -285,7 +285,7 @@ class RiskAgent:
     # ── Internal ──────────────────────────────────────────────────────────────
 
     def _refresh_daily_weekly(self, current_equity: float):
-        today = str(date.today())
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
         mon   = str(_monday())
 
         if self.state.daily_date != today:

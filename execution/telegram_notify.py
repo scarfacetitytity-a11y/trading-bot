@@ -27,6 +27,24 @@ import pandas as pd
 logger = logging.getLogger(__name__)
 
 
+def _mirror_obsidian(event_type: str, title: str, body: str, tags: list) -> None:
+    """Mirror significant bot events to Obsidian Brain — fire-and-forget."""
+    import threading
+    def _bg():
+        try:
+            from execution.council_obsidian import write_alert
+            write_alert(
+                alert_id=f"{event_type}-{datetime.now(timezone.utc).strftime('%Y%m%d-%H%M%S')}",
+                title=title,
+                severity="info",
+                body=body,
+                tags=tags + ["telegram-mirror", "aiden"],
+            )
+        except Exception:
+            pass
+    threading.Thread(target=_bg, name="TgObsidianMirror", daemon=True).start()
+
+
 def _load_env() -> None:
     env_path = Path(__file__).parent.parent / ".env"
     if env_path.exists():
@@ -193,6 +211,12 @@ def notify_startup(symbols: list[str], dry_run: bool, equity: float) -> None:
         f"🕐 {datetime.now(tz=timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}\n"
         f"<i>SL/TP are broker-managed — safe if connection drops.</i>"
     )
+    _mirror_obsidian(
+        "startup",
+        f"Bot Online — ${equity:,.0f} — {'DRY RUN' if dry_run else 'LIVE'}",
+        f"Equity: ${equity:,.2f}\nTarget: ${equity * 1.10:,.2f}\nInstruments: {', '.join(symbols)}",
+        ["startup", "bot-event"],
+    )
 
 
 def notify_shutdown(equity: float, pnl: float) -> None:
@@ -204,6 +228,12 @@ def notify_shutdown(equity: float, pnl: float) -> None:
         f"{icon} <b>Session P&L:</b> {sign}${pnl:,.2f}\n"
         f"<i>Open positions remain protected by broker SL/TP.</i>\n\n"
         f"🕐 {datetime.now(tz=timezone.utc).strftime('%H:%M UTC')}"
+    )
+    _mirror_obsidian(
+        "shutdown",
+        f"Bot Stopped — Session P&L {sign}${pnl:,.2f}",
+        f"Equity: ${equity:,.2f}\nSession P&L: {sign}${pnl:,.2f}",
+        ["shutdown", "bot-event"],
     )
 
 
@@ -382,6 +412,12 @@ def notify_council_flag(member: str, message: str) -> None:
     _send_text(
         f"⚠️ <b>Council #{member}</b>\n\n"
         f"{message}"
+    )
+    _mirror_obsidian(
+        "council-flag",
+        f"Council #{member} — {message[:60]}",
+        f"Member: {member}\n\n{message}",
+        ["council", "alert", "bot-event"],
     )
 
 

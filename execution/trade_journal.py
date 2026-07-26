@@ -146,11 +146,6 @@ class TradeJournal:
         self._save_open()   # durable — survives a restart before the trade closes
         logger.info("[Journal] OPEN %s dir=%+d score=%d entry=%.5f SL=%.5f TP=%s",
                     symbol, direction, score, entry_price, sl_price, tp_price)
-        tg.notify_trade_open(
-            symbol=symbol, direction=direction, score=score,
-            entry=entry_price, sl=sl_price, tp=tp_price,
-            lots=lots, equity=equity, atr=atr, df=df, reasons=reasons,
-        )
 
     def update_path(self, symbol: str, high: float, low: float) -> None:
         """Track max favourable/adverse excursion while a trade is open."""
@@ -467,8 +462,18 @@ class TradeJournal:
     # ── Internal helpers ──────────────────────────────────────────────────────
 
     def _append(self, rec: TradeRecord) -> None:
-        with open(self._path, "a", encoding="utf-8") as f:
-            f.write(json.dumps(asdict(rec)) + "\n")
+        import time as _time
+        for attempt in range(3):
+            try:
+                with open(self._path, "a", encoding="utf-8") as f:
+                    f.write(json.dumps(asdict(rec)) + "\n")
+                    f.flush()
+                    os.fsync(f.fileno())
+                return
+            except Exception as exc:
+                logger.warning("[Journal] _append attempt %d failed: %s", attempt + 1, exc)
+                _time.sleep(0.1)
+        logger.critical("[Journal] _append FAILED after 3 attempts for %s — trade NOT recorded", rec.symbol)
 
     def _load_recent(self, n: int) -> list[dict]:
         if not self._path.exists():

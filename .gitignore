@@ -31,3 +31,11 @@ data/processed/*
 # BASE knowledge graph (auto-generated, local only)
 .base/
 .base-ast-cache/
+
+# Autoresearch results — untracked per program.md
+research/results.tsv
+research/run.log
+
+# Temp files
+*.b64
+

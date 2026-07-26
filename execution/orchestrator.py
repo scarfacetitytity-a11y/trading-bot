@@ -422,7 +422,7 @@ class RiskGuard(Component):
     """
 
     CHECK_INTERVAL = 60
-    STATE_FILE = Path("logs") / "risk_guard_state.json"
+    STATE_FILE = Path(__file__).parent.parent / "logs" / "risk_guard_state.json"
 
     def __init__(
         self,
@@ -458,6 +458,33 @@ class RiskGuard(Component):
                 self._halt_cause       = d.get("halt_cause")
         except Exception:
             pass
+
+    def _reconstruct_day_start_equity(self, server_day: str) -> float:
+        """Compute true day-start equity from MT5 deal history.
+
+        Called whenever the baseline can't be trusted (fresh start or restart
+        after trades already closed today). Avoids the re-anchoring bug where
+        a post-restart baseline silently masks prior realized losses.
+        """
+        try:
+            info = mt5.account_info()
+            if info is None:
+                return self._initial_equity
+            day_start_dt = datetime.strptime(server_day, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+            deals = mt5.history_deals_get(day_start_dt, datetime.now(timezone.utc))
+            if not deals:
+                return float(info.balance)
+            today_pnl = sum(d.profit + d.commission + d.swap for d in deals)
+            reconstructed = float(info.balance) - today_pnl
+            logger.warning(
+                "[RiskGuard] Reconstructed day_start=%.2f from %d deals (today_pnl=%.2f). "
+                "Bot restarted mid-day — prior losses now visible to circuit breaker.",
+                reconstructed, len(deals), today_pnl,
+            )
+            return reconstructed
+        except Exception as exc:
+            logger.error("[RiskGuard] day_start reconstruction failed: %s — falling back to initial_equity", exc)
+            return self._initial_equity
 
     def _save_state(self) -> None:
         try:
@@ -502,20 +529,20 @@ class RiskGuard(Component):
             # halts sticky.
             if server_day != self._server_day:
                 self._server_day       = server_day
-                self._day_start_equity = equity
+                self._day_start_equity = self._reconstruct_day_start_equity(server_day)
                 if (self._soft_halt.is_set() and self._halt_cause == "daily"
                         and total_pct > -self._soft_dd_pct):
                     self._soft_halt.clear()
                     self._halt_cause = None
                     logger.info("[RiskGuard] New server day %s — daily halt cleared, baseline=%.2f",
-                                server_day, equity)
+                                server_day, self._day_start_equity)
                 else:
                     logger.info("[RiskGuard] New server day %s — daily baseline=%.2f",
-                                server_day, equity)
+                                server_day, self._day_start_equity)
                 self._save_state()
 
             if self._day_start_equity is None:
-                self._day_start_equity = equity
+                self._day_start_equity = self._reconstruct_day_start_equity(server_day)
                 self._save_state()
 
             daily_pct = (
@@ -577,7 +604,7 @@ class TradeReconciler(Component):
     """
 
     CHECK_INTERVAL = 30
-    STATE_FILE = Path("logs") / "reconciler_state.json"
+    STATE_FILE = Path(__file__).parent.parent / "logs" / "reconciler_state.json"
 
     def __init__(
         self,
@@ -860,6 +887,26 @@ class TradingEngine(Component):
                         self._open_entry_price or 0,
                         self._open_sl or 0,
                         self._t1_hit)
+
+            # If MT5 has an open position but the journal has no entry for it,
+            # create a recovery entry so the trade is always journaled.
+            if self._journal is not None and self._symbol not in self._journal._open:
+                try:
+                    pos = positions[0]
+                    pos_dir = 1 if pos.type == mt5.ORDER_TYPE_BUY else -1
+                    self._journal.open_trade(
+                        symbol=self._symbol, direction=pos_dir,
+                        score=self._open_score, entry_price=pos.price_open,
+                        sl_price=pos.sl or self._open_sl or 0.0,
+                        tp_price=pos.tp or self._open_tp,
+                        lots=pos.volume, equity=pos.price_open,
+                        trade_type="recovered", grade="B",
+                        thesis=f"[RECOVERED ON RESTART] entry={pos.price_open:.5f}",
+                        reasons=["bot_restart_recovery"],
+                    )
+                    logger.info("[%s] Journal recovery entry created for existing position", self.name)
+                except Exception as _re:
+                    logger.warning("[%s] Journal recovery failed: %s", self.name, _re)
         except Exception:
             pass
 
@@ -1394,6 +1441,28 @@ class TradingEngine(Component):
         t1_pct = getattr(self._strategy, "t1_partial_pct", 0.5)
         ts_bars = getattr(self._strategy, "time_stop_bars", 0)
 
+        # ── Hard profit-lock floor (Anton rule: NEVER go from profit to loss) ──
+        # Independent of TRAIL_CONFIGS. If trade is up ≥ 0.5R and SL is still
+        # below entry (for longs) or above entry (for shorts), force SL to BE.
+        # This fires every poll cycle so an intrabar spike to profit can't reverse
+        # all the way to the original stop.
+        cur_r_now = (
+            (mid_price - entry) / risk_dist if pos.type == mt5.ORDER_TYPE_BUY
+            else (entry - mid_price) / risk_dist
+        )
+        if cur_r_now >= 0.5:
+            be_floor = entry
+            if pos.type == mt5.ORDER_TYPE_BUY and current_sl < be_floor - 1e-8:
+                logger.info("[%s] PROFIT LOCK: %.2fR → forcing SL to BE %.5f",
+                            self.name, cur_r_now, be_floor)
+                self._tighten_all_sl(be_floor, 1)
+                current_sl = be_floor
+            elif pos.type == mt5.ORDER_TYPE_SELL and current_sl > be_floor + 1e-8:
+                logger.info("[%s] PROFIT LOCK: %.2fR → forcing SL to BE %.5f",
+                            self.name, cur_r_now, be_floor)
+                self._tighten_all_sl(be_floor, -1)
+                current_sl = be_floor
+
         # T1 partial close — fires once
         if t1_r > 0 and not self._t1_hit:
             t1_price = entry + t1_r * risk_dist if pos.type == mt5.ORDER_TYPE_BUY else entry - t1_r * risk_dist
@@ -1635,6 +1704,10 @@ class TradingEngine(Component):
 
                 bar_time = int(bars[0]["time"])
                 if bar_time == self._last_bar:
+                    # Intrabar management: run on every poll so trail/TM can react
+                    # within the bar, not only at bar close.
+                    self._portfolio_daily_guard()
+                    self._manage_open_position()
                     time.sleep(poll_interval)
                     continue
 
@@ -1816,6 +1889,22 @@ class TradingEngine(Component):
 
                 # Open new position — gate through soft halt, RiskAgent, FTMOTracker
                 if desired != 0:
+                    # Council Watch hard-halt file check (external daemon backup).
+                    _council_halt = Path(__file__).parent.parent / "logs" / "council_halt.flag"
+                    if _council_halt.exists():
+                        try:
+                            _ch = json.loads(_council_halt.read_text())
+                            if _ch.get("day") == datetime.now(timezone.utc).strftime("%Y-%m-%d"):
+                                logger.critical(
+                                    "[%s] COUNCIL HALT active (%s) — blocking new entry",
+                                    self.name, _ch.get("reason", "?"),
+                                )
+                                if self._soft_halt is not None:
+                                    self._soft_halt.set()
+                                continue
+                        except Exception:
+                            pass
+
                     # Soft halt check (2% daily or 7% cumulative DD).
                     # Also compute inline — RiskGuard background thread ticks every 60s
                     # so a loss that breaches the daily limit may not have set the flag
@@ -1849,7 +1938,8 @@ class TradingEngine(Component):
                                     self._soft_halt.set()
                                 continue
 
-                    # ── M5 entry trigger gate ─────────────────────────────────
+                    # ── M5 confluence (not a gate — confluence only) ──────────
+                    _extra_reasons: list[str] = []
                     df_m5_entry = self._fetch_ltf_bars("M5", count=40)
                     atr_entry   = 0.0
                     if df_m5_entry is not None and len(df_m5_entry) > 14:
@@ -1857,14 +1947,13 @@ class TradingEngine(Component):
                             (df_m5_entry["high"] - df_m5_entry["low"])
                             .rolling(14).mean().iloc[-1]
                         )
-                    if not detect_m5_entry_trigger(df_m5_entry, desired, atr=atr_entry):
-                        # M5 hasn't broken structure yet — set pending, wait
-                        if self._pending_signal != desired:
-                            logger.info("[%s] M5 not confirmed — pending signal=%+d",
-                                        self.name, desired)
-                            self._pending_signal = desired
-                            self._pending_bars   = 0
-                        continue
+                    m5_confirmed = detect_m5_entry_trigger(df_m5_entry, desired, atr=atr_entry)
+                    if m5_confirmed:
+                        signal_score += 1   # M5 structure break = extra confluence
+                        _extra_reasons.append("M5 structure confirmed")
+                        logger.info("[%s] M5 confirmed — +1 score → %d", self.name, signal_score)
+                    else:
+                        logger.info("[%s] M5 not confirmed — entering anyway (confluence only)", self.name)
 
                     # ── Accumulation / distribution gate ─────────────────────
                     accum_risk = detect_accumulation(
@@ -1934,7 +2023,7 @@ class TradingEngine(Component):
                     # Score-based sizing: psychology_mult * score_mult * concentration_mult
                     _sc          = getattr(self._strategy, "_scores", None)
                     signal_score = int(_sc.iloc[-1]) if _sc is not None else 0
-                    _extra_reasons: list[str] = []   # orchestrator-level modifiers (merged into reasons at log time)
+                    # _extra_reasons already initialised in M5 block above
 
                     # News gate: price-confirmed direction preferred; consensus as fallback
                     # Amplifier only — never penalises
@@ -2048,11 +2137,15 @@ class TradingEngine(Component):
                     # 99% of prop account blowups = oversized trades that weren't that great.
                     _score_over_floor = signal_score - needed
                     if _score_over_floor <= 0:
-                        score_mult = 0.25   # floor entry — borderline, reduce exposure hard
+                        score_mult = 0.25   # floor entry — borderline
                     elif _score_over_floor == 1:
-                        score_mult = 0.50   # decent setup — half risk
+                        score_mult = 0.50   # decent setup
+                    elif _score_over_floor == 2:
+                        score_mult = 1.00   # solid setup — full risk
+                    elif _score_over_floor == 3:
+                        score_mult = 1.50   # high conviction
                     else:
-                        score_mult = 1.00   # well above floor — full risk; never over-size
+                        score_mult = 2.00   # exceptional — 4+ over floor
 
                     # Concentration mult: fewer concurrent positions = more size per trade
                     # 0-1 open → 2x  |  2-3 open → 1.5x  |  4+ open → 1x
@@ -2198,31 +2291,47 @@ class TradingEngine(Component):
                             if self._book is not None:
                                 for _p in trader.get_positions(self._symbol):
                                     self._book.register(_p.ticket, signal_score)
-                            if self._journal is not None:
-                                import numpy as np
-                                _atr_series = getattr(self._strategy, "_atr_cache", None)
-                                _atr_val = float(_atr_series.iloc[-1]) if _atr_series is not None and not np.isnan(float(_atr_series.iloc[-1])) else None
-                                _p = self._last_plan
-                                _sr = getattr(self._strategy, "_score_reasons", None)
-                                _reasons = list(_sr.iloc[-1]) if _sr is not None and len(_sr) else []
-                                _reasons = _reasons + _extra_reasons
-                                self._journal.open_trade(
-                                    symbol=self._symbol,
-                                    direction=desired,
-                                    score=signal_score,
-                                    entry_price=self._open_entry_price,
-                                    sl_price=sl or 0.0,
-                                    tp_price=tp,
-                                    lots=lots,
-                                    equity=equity,
-                                    atr=_atr_val,
-                                    df=df,
-                                    trade_type=_p.trade_type if _p else None,
-                                    grade=_p.grade if _p else None,
-                                    target_price=_p.tp if _p else None,
-                                    thesis=_p.thesis if _p else None,
-                                    reasons=_reasons,
-                                )
+                            import numpy as np
+                            _atr_series = getattr(self._strategy, "_atr_cache", None)
+                            _atr_val = float(_atr_series.iloc[-1]) if _atr_series is not None and not np.isnan(float(_atr_series.iloc[-1])) else None
+                            _p = self._last_plan
+                            _sr = getattr(self._strategy, "_score_reasons", None)
+                            _reasons = list(_sr.iloc[-1]) if _sr is not None and len(_sr) else []
+                            _reasons = _reasons + _extra_reasons
+                            try:
+                                if self._journal is not None:
+                                    self._journal.open_trade(
+                                        symbol=self._symbol,
+                                        direction=desired,
+                                        score=signal_score,
+                                        entry_price=self._open_entry_price,
+                                        sl_price=sl or 0.0,
+                                        tp_price=tp,
+                                        lots=lots,
+                                        equity=equity,
+                                        atr=_atr_val,
+                                        df=df,
+                                        trade_type=_p.trade_type if _p else None,
+                                        grade=_p.grade if _p else None,
+                                        target_price=_p.tp if _p else None,
+                                        thesis=_p.thesis if _p else None,
+                                        reasons=_reasons,
+                                    )
+                            except Exception as _je:
+                                logger.exception("[%s] Journal open_trade failed (trade live): %s", self.name, _je)
+                            tg.notify_trade_open(
+                                symbol=self._symbol,
+                                direction=desired,
+                                score=signal_score,
+                                entry=self._open_entry_price,
+                                sl=sl or 0.0,
+                                tp=tp,
+                                lots=lots,
+                                equity=equity,
+                                atr=_atr_val,
+                                df=df,
+                                reasons=_reasons,
+                            )
 
             except Exception as exc:
                 self.registry.fail(self.name, str(exc))
