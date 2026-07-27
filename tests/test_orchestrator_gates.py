@@ -1,4 +1,4 @@
-"""Orchestrator integration tests — gate sequence, score sizing, risk tiers.
+﻿"""Orchestrator integration tests â€” gate sequence, score sizing, risk tiers.
 
 Mocks MT5 entirely so no broker connection is required.
 Tests the critical path in TradingEngine.run():
@@ -8,9 +8,9 @@ Tests the critical path in TradingEngine.run():
   4. Score-based size multiplier applies correctly
 
 Also tests RiskGuard tier escalation:
-  Tier 1: 2% daily  → soft_halt
-  Tier 2: 7% cumul  → soft_halt
-  Tier 3: 9.5% cumul → kill_switch
+  Tier 1: 2% daily  â†’ soft_halt
+  Tier 2: 7% cumul  â†’ soft_halt
+  Tier 3: 9.5% cumul â†’ kill_switch
 """
 import sys
 import threading
@@ -24,7 +24,7 @@ import pandas as pd
 import numpy as np
 import pytest
 
-# ── Stub MetaTrader5 before any orchestrator import ───────────────────────────
+# â”€â”€ Stub MetaTrader5 before any orchestrator import â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 # MT5 is only available on Windows with the terminal installed; stub it here.
 _mt5_stub = types.ModuleType("MetaTrader5")
 _mt5_stub.ACCOUNT_TRADE_MODE_DEMO = 0
@@ -82,7 +82,7 @@ from backtests.run_multi_instrument import _size_mult_from_score
 import execution.trader as trader_mod
 
 
-# ── Helpers ───────────────────────────────────────────────────────────────────
+# â”€â”€ Helpers â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 def _make_bars(n: int = 200) -> pd.DataFrame:
     """Minimal OHLCV dataframe for signal generation."""
@@ -121,7 +121,7 @@ def _engine(
             return_value=pd.Series([1])  # always wants to go long
         )
         strategy._stops  = pd.Series([float("nan")])
-        strategy._scores = pd.Series([6])   # score=6 → 1.5x
+        strategy._scores = pd.Series([6])   # score=6 â†’ 1.5x
 
     state_ra  = tmp_path / "risk_agent_state.json"
     state_ftmo = tmp_path / "ftmo_tracker_state.json"
@@ -159,7 +159,7 @@ def _run_one_bar(engine, kill_switch, signal: int = 1):
             return rates[:1]           # first call: new bar timestamp
         if bar_counter[0] == 2:
             return rates               # second call: full lookback
-        # After the first full cycle, return same bar → loop sleeps; kill it
+        # After the first full cycle, return same bar â†’ loop sleeps; kill it
         kill_switch.set()
         return rates[:1]
 
@@ -170,7 +170,7 @@ def _run_one_bar(engine, kill_switch, signal: int = 1):
         return_value=pd.Series([signal] * 50)
     )
 
-    trader_mod.get_position_direction.return_value = 0  # flat → wants to enter
+    trader_mod.get_position_direction.return_value = 0  # flat â†’ wants to enter
     trader_mod.get_account.return_value = {"balance": 10_000, "equity": 10_000}
 
     t = threading.Thread(target=engine.run)
@@ -179,9 +179,9 @@ def _run_one_bar(engine, kill_switch, signal: int = 1):
     return t
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 # Score-based size multiplier
-# ═══════════════════════════════════════════════════════════════════════════════
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 
 class TestScoreSizing:
     def test_score_4_is_075x(self):
@@ -197,13 +197,13 @@ class TestScoreSizing:
         assert _size_mult_from_score(7) == 1.5
 
     def test_score_0_returns_15x_default(self):
-        # 0 is treated as unknown; default is 1.5 — but orchestrator guards with signal_score > 0
+        # 0 is treated as unknown; default is 1.5 â€” but orchestrator guards with signal_score > 0
         assert _size_mult_from_score(0) == 1.5  # SIZE_CONFIGS_DEFAULT fallthrough
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 # Heartbeat registry
-# ═══════════════════════════════════════════════════════════════════════════════
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 
 class TestHeartbeatRegistry:
     def test_register_and_beat(self):
@@ -240,9 +240,9 @@ class TestHeartbeatRegistry:
         assert reg.increment_restarts("comp") == 2
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 # RiskGuard tier escalation
-# ═══════════════════════════════════════════════════════════════════════════════
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 
 class TestRiskGuardTiers:
     def _guard(self):
@@ -289,17 +289,17 @@ class TestRiskGuardTiers:
 
     def test_small_loss_no_halt(self):
         guard, kill_switch, soft_halt = self._guard()
-        self._run_once(guard, 9_900)       # -1% — all clear
+        self._run_once(guard, 9_900)       # -1% â€” all clear
         assert not soft_halt.is_set()
         assert not kill_switch.is_set()
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 # TradingEngine gate sequence
-# ═══════════════════════════════════════════════════════════════════════════════
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 
 class TestTradingEngineGates:
-    """Test entry gate sequence: soft_halt → RiskAgent → FTMOTracker → size."""
+    """Test entry gate sequence: soft_halt â†’ RiskAgent â†’ FTMOTracker â†’ size."""
 
     def test_soft_halt_blocks_entry(self, tmp_path):
         engine, kill, soft_halt, ra, ft = _engine(tmp_path)
@@ -316,7 +316,7 @@ class TestTradingEngineGates:
         ra.state.daily_start_equity   = 10_000
         ra.state.weekly_start_equity  = 10_000
         trader_mod.get_account.return_value = {
-            "balance": 9_200, "equity": 9_200   # 8% from peak → over 7% limit
+            "balance": 9_200, "equity": 9_200   # 8% from peak â†’ over 7% limit
         }
 
         _run_one_bar(engine, kill, signal=1)
@@ -351,9 +351,9 @@ class TestTradingEngineGates:
         trader_mod.place_order.assert_not_called()
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# TradeReconciler — deal-history accounting (C4)
-# ═══════════════════════════════════════════════════════════════════════════════
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+# TradeReconciler â€” deal-history accounting (C4)
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 
 def _deal(pid, entry, profit=0.0, *, symbol="XAUUSD", price=2000.0, t=1000,
           magic=234001, swap=0.0, commission=0.0, comment=""):
@@ -384,7 +384,7 @@ class TestTradeReconciler:
             _mt5_stub.account_info.return_value = acct
             _mt5_stub.positions_get.return_value = []
 
-            # Batch 1 — a pre-existing closed position: seeding must suppress it.
+            # Batch 1 â€” a pre-existing closed position: seeding must suppress it.
             _mt5_stub.history_deals_get.return_value = [
                 _deal(100, _mt5_stub.DEAL_ENTRY_IN),
                 _deal(100, _mt5_stub.DEAL_ENTRY_OUT, -50.0),
@@ -392,8 +392,8 @@ class TestTradeReconciler:
             rec._reconcile()
             ra.record_trade.assert_not_called()
 
-            # Batch 2 — a newly closed position 101: recorded exactly once, with
-            # R = net profit / (initial × risk_pct) = 200 / 100 = +2.0R.
+            # Batch 2 â€” a newly closed position 101: recorded exactly once, with
+            # R = net profit / (initial Ã— risk_pct) = 200 / 100 = +2.0R.
             _mt5_stub.history_deals_get.return_value = [
                 _deal(100, _mt5_stub.DEAL_ENTRY_IN),
                 _deal(100, _mt5_stub.DEAL_ENTRY_OUT, -50.0),
@@ -406,11 +406,11 @@ class TestTradeReconciler:
             ft.record_trade_day.assert_called_once()
             jr.close_trade.assert_called_once()
 
-            # Batch 3 — rescan with no new closes: no double-count.
+            # Batch 3 â€” rescan with no new closes: no double-count.
             rec._reconcile()
             assert ra.record_trade.call_count == 1
 
-            # Batch 4 — position 102 still open (partial close): must NOT record.
+            # Batch 4 â€” position 102 still open (partial close): must NOT record.
             _mt5_stub.positions_get.return_value = [_pos(102)]
             _mt5_stub.history_deals_get.return_value = [
                 _deal(102, _mt5_stub.DEAL_ENTRY_IN),
@@ -439,7 +439,7 @@ class TestTradeReconciler:
             _mt5_stub.history_deals_get.return_value = []
             rec._reconcile()  # seed (empty)
 
-            # Child 201 (opened with comment si:200) still OPEN → parent not recorded.
+            # Child 201 (opened with comment si:200) still OPEN â†’ parent not recorded.
             _mt5_stub.positions_get.return_value = [_pos(201)]
             _mt5_stub.history_deals_get.return_value = [
                 _deal(200, _mt5_stub.DEAL_ENTRY_IN),
@@ -449,7 +449,7 @@ class TestTradeReconciler:
             rec._reconcile()
             ra.record_trade.assert_not_called()   # group not fully flat yet
 
-            # Now the child closes too → ONE record, R = (100+50)/100 = +1.5R.
+            # Now the child closes too â†’ ONE record, R = (100+50)/100 = +1.5R.
             _mt5_stub.positions_get.return_value = []
             _mt5_stub.history_deals_get.return_value = [
                 _deal(200, _mt5_stub.DEAL_ENTRY_IN),
@@ -461,7 +461,7 @@ class TestTradeReconciler:
             assert ra.record_trade.call_count == 1
             assert ra.record_trade.call_args[0][0] == pytest.approx(1.5)
 
-            # Rescan → child 201 already marked, no double-count.
+            # Rescan â†’ child 201 already marked, no double-count.
             rec._reconcile()
             assert ra.record_trade.call_count == 1
 
@@ -469,9 +469,9 @@ class TestTradeReconciler:
         _mt5_stub.history_deals_get.return_value = []
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# Safety check — real-account block (M3 regression)
-# ═══════════════════════════════════════════════════════════════════════════════
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+# Safety check â€” real-account block (M3 regression)
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 
 class TestSafetyCheck:
     """The real-account guard must fire unless allow_real_account is explicitly set."""
@@ -500,9 +500,9 @@ class TestSafetyCheck:
         assert self._orch(allow_real=False)._safety_check() is True
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 # Score sizing wired to TradingEngine._size_order
-# ═══════════════════════════════════════════════════════════════════════════════
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 
 class TestScoreWiredToEngine:
     """Verify the score multiplier reaches the lot calculation in _size_order."""
@@ -511,7 +511,7 @@ class TestScoreWiredToEngine:
         engine, kill, soft_halt, ra, ft = _engine(tmp_path)
         engine._strategy._scores = pd.Series([score])
 
-        # No ATR stop from strategy → falls back to config lot_size=0.01 × mult
+        # No ATR stop from strategy â†’ falls back to config lot_size=0.01 Ã— mult
         engine._strategy._stops = pd.Series([float("nan")])
 
         mock_tick = MagicMock()
@@ -536,9 +536,9 @@ class TestScoreWiredToEngine:
         assert lots == pytest.approx(0.01 * 1.5, abs=0.005)
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# 2026-07-27 audit regressions — FTMO day anchoring (A1)
-# ═══════════════════════════════════════════════════════════════════════════════
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+# 2026-07-27 audit regressions â€” FTMO day anchoring (A1)
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 
 class TestFTMODayAnchoring:
     """Daily DD must anchor to live equity, never to stale initial_equity."""
@@ -575,7 +575,7 @@ class TestFTMODayAnchoring:
 
     def test_corrupt_state_backed_up_not_destroyed(self, tmp_path):
         state_file = tmp_path / "ftmo.json"
-        state_file.write_text("﻿{not valid json", encoding="utf-8")
+        state_file.write_bytes(b"\xef\xbb\xbf{not valid json")
         with patch("execution.ftmo_tracker.STATE_FILE", state_file):
             FTMOTracker(initial_equity=100_000)
         assert (tmp_path / "ftmo.json.corrupt").exists()
@@ -590,15 +590,15 @@ class TestFTMODayAnchoring:
             "day_start_equity": 96524.73, "day_start_date": "2026-07-27",
             "last_equity": 94400.93,
         }
-        state_file.write_text("﻿" + _json.dumps(payload), encoding="utf-8")
+        state_file.write_bytes(b"\xef\xbb\xbf" + _json.dumps(payload).encode("utf-8"))
         with patch("execution.ftmo_tracker.STATE_FILE", state_file):
             ft = FTMOTracker(initial_equity=100_000)
         assert ft.state.day_start_equity == pytest.approx(96_524.73)
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# 2026-07-27 audit regressions — burned targets (A3) + PID lock (A2)
-# ═══════════════════════════════════════════════════════════════════════════════
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+# 2026-07-27 audit regressions â€” burned targets (A3) + PID lock (A2)
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 
 class TestBurnedTargets:
     """A direction+target combo must be blocked for 90 min after entry."""
@@ -634,7 +634,7 @@ class TestBurnedTargets:
 
 
 class TestPidLock:
-    """Second instance must abort — no psutil dependency (2026-07-27: three
+    """Second instance must abort â€” no psutil dependency (2026-07-27: three
     concurrent instances because psutil ImportError skipped the check)."""
 
     def test_live_python_pid_detected(self):
@@ -644,7 +644,7 @@ class TestPidLock:
 
     def test_dead_pid_not_detected(self):
         from execution.orchestrator import _pid_is_python
-        # PID 4 is the Windows System process — never python
+        # PID 4 is the Windows System process â€” never python
         assert _pid_is_python(4) is False
 
     def test_second_start_aborts(self, tmp_path, monkeypatch):
@@ -666,9 +666,9 @@ class TestPidLock:
         assert pid_path.read_text().strip() == str(os.getpid())
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# 2026-07-27 audit regressions — probability model + Quant proposals
-# ═══════════════════════════════════════════════════════════════════════════════
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+# 2026-07-27 audit regressions â€” probability model + Quant proposals
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 
 class TestProbabilityModel:
     def _model(self, tmp_path):
@@ -685,7 +685,7 @@ class TestProbabilityModel:
     def test_low_probability_rejected(self, tmp_path):
         from execution.probability_model import TradeConfluences
         m = self._model(tmp_path)
-        # Continuation with nothing else going for it → below MIN_P_TO_TRADE
+        # Continuation with nothing else going for it â†’ below MIN_P_TO_TRADE
         est = m.estimate(TradeConfluences(
             fvg_present=False, trade_type="continuation", rr=1.0))
         assert est.take_trade is False
@@ -704,6 +704,39 @@ class TestProbabilityModel:
         m = self._model(tmp_path)
         assert m._lifts["fvg_present"]["lift"] == pytest.approx(1.30)
 
+    def test_profit_lock_ladder(self):
+        """A trade that reached 0.6R+ must never keep its original stop."""
+        from execution.trade_manager import TradeManager, PositionState, ActionType
+        tm = TradeManager()
+        pos = PositionState(
+            direction=1, entry_price=100.0, initial_sl=99.0,
+            current_sl=99.0, current_tp=103.0, current_price=100.2,
+            bars_elapsed=5, peak_r=0.9,   # reached 0.9R, pulled back to 0.2R
+        )
+        df = pd.DataFrame({
+            "time": range(30), "open": [100.0] * 30, "high": [100.3] * 30,
+            "low": [99.8] * 30, "close": [100.1] * 30, "tick_volume": [100] * 30,
+        })
+        action = tm.evaluate(pos, df_m15=df, df_m5=df)
+        assert action.action == ActionType.TIGHTEN_SL
+        assert action.new_sl == pytest.approx(100.05)   # breakeven + 0.05R
+
+    def test_profit_lock_never_loosens(self):
+        from execution.trade_manager import TradeManager, PositionState, ActionType
+        tm = TradeManager()
+        pos = PositionState(
+            direction=1, entry_price=100.0, initial_sl=99.0,
+            current_sl=100.5, current_tp=103.0, current_price=100.6,
+            bars_elapsed=5, peak_r=0.9,   # SL already better than BE lock
+        )
+        df = pd.DataFrame({
+            "time": range(30), "open": [100.0] * 30, "high": [100.7] * 30,
+            "low": [100.4] * 30, "close": [100.6] * 30, "tick_volume": [100] * 30,
+        })
+        action = tm.evaluate(pos, df_m15=df, df_m5=df)
+        assert not (action.action == ActionType.TIGHTEN_SL
+                    and action.new_sl is not None and action.new_sl < 100.5)
+
     def test_stale_quant_proposal_ignored(self, tmp_path):
         import json as _json, os
         pfile = tmp_path / "quant_lift_proposals.json"
@@ -712,3 +745,4 @@ class TestProbabilityModel:
         os.utime(pfile, (old, old))
         m = self._model(tmp_path)
         assert m._lifts["fvg_present"]["lift"] == pytest.approx(1.30)
+

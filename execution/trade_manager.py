@@ -70,6 +70,7 @@ class PositionState:
     t1_hit:           bool = False    # T1 partial already fired
     h4_bias:          int  = 0        # +1, -1, 0 — from strategy or external H4 compute
     consecutive_waits: int = 0        # incremented each time WAIT fires; reset on any other action
+    peak_r:           float = 0.0     # best R reached this trade (orchestrator-tracked)
 
     @property
     def risk_dist(self) -> float:
@@ -405,6 +406,37 @@ class TradeManager:
                 sweep_risk    = sweep_risk,
                 council_notes = self._council_notes(action, counter, cont, sweep_risk, position, probs),
             )
+
+        # ── Profit-lock ladder ────────────────────────────────────────────────
+        # Live 2026-07-27: winners at 0.5–0.9R round-tripped to full stops
+        # (JP225 gave back 1.5R). Once a trade has worked, the stop follows —
+        # regardless of counter/continuation signals. Never loosens.
+        peak = max(position.peak_r, cur_r)
+        lock_r = None
+        if peak >= 2.0:
+            lock_r = 1.0
+        elif peak >= 1.2:
+            lock_r = 0.5
+        elif peak >= 0.6:
+            lock_r = 0.05   # breakeven + spread buffer
+        if lock_r is not None and position.risk_dist > 0:
+            lock_px = position.entry_price + pos_dir * lock_r * position.risk_dist
+            improves = ((pos_dir == 1 and lock_px > position.current_sl) or
+                        (pos_dir == -1 and lock_px < position.current_sl))
+            if improves:
+                action = ActionType.TIGHTEN_SL
+                return TradeAction(
+                    action        = action,
+                    new_sl        = lock_px,
+                    counter_score = counter,
+                    cont_score    = cont,
+                    reason        = f"PROFIT_LOCK peak={peak:.2f}R → SL locks +{lock_r:.2f}R | {reason}",
+                    probability   = 0.9,
+                    alternatives  = self._top_alternatives(probs, action),
+                    sweep_risk    = sweep_risk,
+                    council_notes = [f"[C07 SRE] Trade reached {peak:.2f}R — stop ratcheted to "
+                                     f"+{lock_r:.2f}R; a worked trade must never round-trip to a full loss."],
+                )
 
         # ── HOLD ─────────────────────────────────────────────────────────────
         action = ActionType.HOLD

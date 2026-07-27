@@ -838,6 +838,7 @@ class TradingEngine(Component):
         self._prob_model:      ProbabilityModel = ProbabilityModel()
         self._open_confluences: Optional[TradeConfluences] = None  # confluences at entry time
         self._scout_regime:    dict = {}   # last cadre_regime_state.json payload
+        self._open_peak_r:     float = 0.0  # best R this trade — profit-lock ladder input
         # Burned targets: (direction, tp) → expiry ts. Blocks re-entering the
         # same idea for 90 min after it traded (audit A3: 4 US30 longs at the
         # same target in 30 min, all losers). Persisted across restarts.
@@ -1104,6 +1105,7 @@ class TradingEngine(Component):
         self._entry_cooldown_until   = 0.0
         self._last_partial_bar       = 0
         self._open_confluences       = None
+        self._open_peak_r            = 0.0
         self._scaled_in              = False
         self._pending_signal    = 0
         self._pending_bars      = 0
@@ -1790,7 +1792,10 @@ class TradingEngine(Component):
             t1_hit             = self._t1_hit,
             h4_bias            = h4_bias,
             consecutive_waits  = self._consecutive_waits,
+            peak_r             = self._open_peak_r,
         )
+        # Ratchet the peak — feeds the TM profit-lock ladder
+        self._open_peak_r = max(self._open_peak_r, pos_state.current_r)
 
         # Portfolio P&L in R units: sum of all open positions' floating P&L
         # divided by the per-trade risk. Protects gains by tightening losers.
@@ -2553,6 +2558,7 @@ class TradingEngine(Component):
                             self._entry_cooldown_until    = time.time() + 60  # 60s grace: block TM exits at bar-open
                             self._last_partial_bar        = 0
                             self._open_confluences        = _confl  # saved for Bayesian update at close
+                            self._open_peak_r             = 0.0
                             if tp:
                                 self._save_burned_target(desired, tp)
                             self._save_position_state()
