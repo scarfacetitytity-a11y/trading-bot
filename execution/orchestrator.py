@@ -2921,6 +2921,19 @@ class Orchestrator:
 
 # ── Entry point ───────────────────────────────────────────────────────────────
 
+def _pid_is_python(pid: int) -> bool:
+    """True if pid is a live python process (Windows tasklist, no deps)."""
+    try:
+        import subprocess
+        out = subprocess.run(
+            ["tasklist", "/FI", f"PID eq {pid}", "/NH"],
+            capture_output=True, text=True, timeout=10,
+        )
+        return "python" in out.stdout.lower()
+    except Exception:
+        return True   # can't verify — fail SAFE: assume it's running
+
+
 def _acquire_pid_lock() -> Path:
     """Ensure only one instance of the bot runs at a time.
 
@@ -2933,15 +2946,17 @@ def _acquire_pid_lock() -> Path:
     if pid_path.exists():
         try:
             existing_pid = int(pid_path.read_text().strip())
-            import psutil
-            if psutil.pid_exists(existing_pid):
-                raise SystemExit(
-                    f"Bot already running (PID {existing_pid}). "
-                    f"Stop the existing instance before starting a new one. "
-                    f"If it crashed, delete logs/bot.pid manually."
-                )
-        except (ValueError, ImportError):
-            pass  # psutil not installed or corrupt file — overwrite
+        except ValueError:
+            existing_pid = None   # corrupt file — overwrite
+        # No psutil dependency: the previous psutil-based check silently
+        # passed on ImportError, which let a second instance start
+        # (2026-07-27 — three instances found trading concurrently).
+        if existing_pid is not None and _pid_is_python(existing_pid):
+            raise SystemExit(
+                f"Bot already running (PID {existing_pid}). "
+                f"Stop the existing instance before starting a new one. "
+                f"If it crashed, delete logs/bot.pid manually."
+            )
     pid_path.write_text(str(os.getpid()))
     return pid_path
 
