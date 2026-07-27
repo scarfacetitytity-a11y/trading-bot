@@ -67,8 +67,9 @@ class PositionState:
     current_tp:    float
     current_price: float           # live mid-price
     bars_elapsed:  int
-    t1_hit:        bool = False    # T1 partial already fired
-    h4_bias:       int  = 0        # +1, -1, 0 — from strategy or external H4 compute
+    t1_hit:           bool = False    # T1 partial already fired
+    h4_bias:          int  = 0        # +1, -1, 0 — from strategy or external H4 compute
+    consecutive_waits: int = 0        # incremented each time WAIT fires; reset on any other action
 
     @property
     def risk_dist(self) -> float:
@@ -291,13 +292,29 @@ class TradeManager:
         # ── EXIT / WAIT ───────────────────────────────────────────────────────
         if counter >= self._exit_thresh and not early_exit_blocked:
             if sweep_risk > self._sweep_thresh:
+                # 3+ consecutive WAITs = sweep isn't clearing; cap exposure via PARTIAL_CLOSE
+                if position.consecutive_waits >= 3:
+                    new_sl = find_structure_sl(df_primary, pos_dir, position.current_sl, atr=atr_m5)
+                    action = ActionType.PARTIAL_CLOSE
+                    return TradeAction(
+                        action        = action,
+                        close_pct     = self._partial_pct,
+                        new_sl        = new_sl,
+                        counter_score = counter,
+                        cont_score    = cont,
+                        reason        = f"PARTIAL(sweep_stuck {position.consecutive_waits}W) counter={counter} | {reason}",
+                        probability   = probs.get(ActionType.PARTIAL_CLOSE, 0.5),
+                        alternatives  = self._top_alternatives(probs, ActionType.PARTIAL_CLOSE),
+                        sweep_risk    = sweep_risk,
+                        council_notes = self._council_notes(action, counter, cont, sweep_risk, position, probs),
+                    )
                 # Stop-hunt sweep likely — wait one bar for confirmation before exiting
                 action = ActionType.WAIT
                 return TradeAction(
                     action        = action,
                     counter_score = counter,
                     cont_score    = cont,
-                    reason        = f"WAIT sweep_risk={sweep_risk:.2f} counter={counter} | {reason}",
+                    reason        = f"WAIT sweep_risk={sweep_risk:.2f} counter={counter} waits={position.consecutive_waits} | {reason}",
                     probability   = probs.get(action, 0.5),
                     alternatives  = self._top_alternatives(probs, action),
                     sweep_risk    = sweep_risk,

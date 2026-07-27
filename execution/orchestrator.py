@@ -841,8 +841,9 @@ class TradingEngine(Component):
         self._last_plan               = None    # last TradePlan from analyze_entry
         self._agent            = TradeAgent()   # per-trade adjudication + tickets
         self._open_score:       int = 0
-        self._t1_hit:           bool = False
-        self._bars_since_entry: int  = 0
+        self._t1_hit:              bool = False
+        self._bars_since_entry:    int  = 0
+        self._consecutive_waits:   int  = 0
         self._block_entry:      bool = False
         self._scaled_in:        bool = False
         self._pending_signal:   int  = 0    # M15 setup waiting for M5 trigger
@@ -1049,6 +1050,7 @@ class TradingEngine(Component):
         self._open_score        = 0
         self._t1_hit            = False
         self._bars_since_entry  = 0
+        self._consecutive_waits = 0
         self._scaled_in         = False
         self._pending_signal    = 0
         self._pending_bars      = 0
@@ -1143,10 +1145,12 @@ class TradingEngine(Component):
             self._block_entry = True
 
         elif action.action == ActionType.WAIT:
-            logger.info("[%s] TM WAIT — sweep_risk=%.2f, holding this bar",
-                        self.name, action.sweep_risk)
+            self._consecutive_waits += 1
+            logger.info("[%s] TM WAIT — sweep_risk=%.2f, holding this bar (consecutive=%d)",
+                        self.name, action.sweep_risk, self._consecutive_waits)
 
         elif action.action == ActionType.PARTIAL_CLOSE:
+            self._consecutive_waits = 0
             if not self._dry_run:
                 trader.partial_close(pos, action.close_pct or 0.30)
                 if action.new_sl is not None:
@@ -1660,15 +1664,16 @@ class TradingEngine(Component):
 
         tm_pos_dir = 1 if pos.type == mt5.ORDER_TYPE_BUY else -1
         pos_state = PositionState(
-            direction     = tm_pos_dir,
-            entry_price   = self._open_entry_price,
-            initial_sl    = self._open_sl,
-            current_sl    = pos.sl,
-            current_tp    = pos.tp,
-            current_price = mid_price,
-            bars_elapsed  = self._bars_since_entry,
-            t1_hit        = self._t1_hit,
-            h4_bias       = h4_bias,
+            direction          = tm_pos_dir,
+            entry_price        = self._open_entry_price,
+            initial_sl         = self._open_sl,
+            current_sl         = pos.sl,
+            current_tp         = pos.tp,
+            current_price      = mid_price,
+            bars_elapsed       = self._bars_since_entry,
+            t1_hit             = self._t1_hit,
+            h4_bias            = h4_bias,
+            consecutive_waits  = self._consecutive_waits,
         )
 
         # Portfolio P&L in R units: sum of all open positions' floating P&L

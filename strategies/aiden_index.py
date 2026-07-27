@@ -1179,6 +1179,10 @@ class AiDENIndexStrategy(Strategy):
                             if (i - fvg["test_bar"]) > self.max_entry_wait:
                                 to_remove.append(fvg)
                             elif cv > fvg_hi and position == 0:
+                                # Hard session gate: FVG can be formed in-session but triggered
+                                # out-of-session hours later. Reject entry if outside window.
+                                if not _active_session(self._symbol, hour):
+                                    to_remove.append(fvg); continue
                                 stop_anchor = fvg["ob_lo"] if fvg["ob_lo"] is not None else fvg_lo
                                 sl   = stop_anchor - self.atr_stop_buffer * atr_val
                                 dist = cv - sl
@@ -1206,6 +1210,10 @@ class AiDENIndexStrategy(Strategy):
                             if (i - fvg["test_bar"]) > self.max_entry_wait:
                                 to_remove.append(fvg)
                             elif cv < fvg_lo and position == 0:
+                                # Hard session gate: FVG can be formed in-session but triggered
+                                # out-of-session hours later. Reject entry if outside window.
+                                if not _active_session(self._symbol, hour):
+                                    to_remove.append(fvg); continue
                                 stop_anchor = fvg["ob_hi"] if fvg["ob_hi"] is not None else fvg_hi
                                 sl   = stop_anchor + self.atr_stop_buffer * atr_val
                                 dist = sl - cv
