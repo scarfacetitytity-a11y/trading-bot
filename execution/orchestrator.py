@@ -844,6 +844,8 @@ class TradingEngine(Component):
         self._t1_hit:              bool = False
         self._bars_since_entry:    int  = 0
         self._consecutive_waits:   int  = 0
+        self._entry_cooldown_until: float = 0.0  # epoch time; TM exits blocked until then
+        self._last_partial_bar:    int   = 0     # bar timestamp of last PARTIAL_CLOSE
         self._block_entry:      bool = False
         self._scaled_in:        bool = False
         self._pending_signal:   int  = 0    # M15 setup waiting for M5 trigger
@@ -1049,9 +1051,11 @@ class TradingEngine(Component):
         self._open_tp           = None
         self._open_score        = 0
         self._t1_hit            = False
-        self._bars_since_entry  = 0
-        self._consecutive_waits = 0
-        self._scaled_in         = False
+        self._bars_since_entry       = 0
+        self._consecutive_waits      = 0
+        self._entry_cooldown_until   = 0.0
+        self._last_partial_bar       = 0
+        self._scaled_in              = False
         self._pending_signal    = 0
         self._pending_bars      = 0
         self._state_file.unlink(missing_ok=True)
@@ -1151,6 +1155,7 @@ class TradingEngine(Component):
 
         elif action.action == ActionType.PARTIAL_CLOSE:
             self._consecutive_waits = 0
+            self._last_partial_bar  = self._last_bar   # dedup: one PARTIAL_CLOSE per bar
             if not self._dry_run:
                 trader.partial_close(pos, action.close_pct or 0.30)
                 if action.new_sl is not None:
@@ -1680,6 +1685,13 @@ class TradingEngine(Component):
         # divided by the per-trade risk. Protects gains by tightening losers.
         portfolio_pnl_r = self._portfolio_pnl_r()
 
+        # Entry cooldown: block TM exits for 60s after entry to absorb bar-open noise
+        _in_cooldown = time.time() < self._entry_cooldown_until
+        if _in_cooldown:
+            logger.debug("[%s] TM skip — entry cooldown (%ds left)",
+                         self.name, int(self._entry_cooldown_until - time.time()))
+            return
+
         action = self._trade_manager.evaluate(
             position           = pos_state,
             df_m15             = df_m15_struct,
@@ -1688,6 +1700,11 @@ class TradingEngine(Component):
             news_confirmed_dir = news_dir,
             portfolio_pnl_r    = portfolio_pnl_r,
         )
+
+        # Dedup PARTIAL_CLOSE: only once per bar (counter signals don't reset intrabar)
+        if action.action == ActionType.PARTIAL_CLOSE and self._last_bar == self._last_partial_bar:
+            logger.debug("[%s] PARTIAL_CLOSE suppressed — already fired this bar", self.name)
+            return
 
         account = trader.get_account()
         equity  = account.get("equity", account.get("balance", 0))
@@ -1784,6 +1801,7 @@ class TradingEngine(Component):
                     except Exception:
                         logger.exception("[%s] Reconcile failed — forcing state reset", self.name)
                     self._reset_position_state()
+                    self._block_entry = True   # don't re-enter on the same bar after external close
                     if self._journal is not None:
                         self._journal._save_open()
 
@@ -2321,9 +2339,11 @@ class TradingEngine(Component):
                                 self._open_entry_price = tick.ask if desired == 1 else tick.bid
                                 self._open_sl          = sl
                                 self._open_tp          = tp
-                            self._open_score        = signal_score
-                            self._t1_hit            = False
-                            self._bars_since_entry  = 0
+                            self._open_score             = signal_score
+                            self._t1_hit                 = False
+                            self._bars_since_entry        = 0
+                            self._entry_cooldown_until    = time.time() + 60  # 60s grace: block TM exits at bar-open
+                            self._last_partial_bar        = 0
                             self._save_position_state()
                             if self._risk_agent is not None:
                                 self._risk_agent.record_entry()
