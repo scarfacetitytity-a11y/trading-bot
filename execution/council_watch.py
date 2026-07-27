@@ -361,38 +361,212 @@ def _handle_critical(key: str, message: str) -> None:
         logger.debug("Cadre async invoke failed: %s", exc)
 
 
+# ── Cadre schedule state ──────────────────────────────────────────────────────
+# Tracks last-run timestamp and trade count so interval-based tasks don't fire
+# every 30 seconds. Persisted to disk so it survives council_watch restarts.
+
+_CADRE_SCHED_STATE = _LOGS / "cadre_schedule_state.json"
+
+# Intervals (seconds)
+_SCOUT_INTERVAL   = 30 * 60    # 30 min
+_QUANT_INTERVAL   = 2 * 60 * 60  # 2 hours (routine)
+_BUILDER_INTERVAL = 60 * 60    # 1 hour (error scan)
+
+
+def _sched_load() -> dict:
+    try:
+        if _CADRE_SCHED_STATE.exists():
+            return json.loads(_CADRE_SCHED_STATE.read_text(encoding="utf-8"))
+    except Exception:
+        pass
+    return {}
+
+
+def _sched_save(state: dict) -> None:
+    try:
+        _LOGS.mkdir(parents=True, exist_ok=True)
+        _CADRE_SCHED_STATE.write_text(json.dumps(state, indent=2), encoding="utf-8")
+    except Exception as exc:
+        logger.debug("Cadre sched state save failed: %s", exc)
+
+
+def _sched_due(state: dict, key: str, interval_secs: float) -> bool:
+    last = state.get(key, 0)
+    return (time.time() - last) >= interval_secs
+
+
+def _sched_mark(state: dict, key: str) -> None:
+    state[key] = time.time()
+
+
+def _fire_cadre(member_id: str, event: str, extra: str = "") -> None:
+    """Launch a Cadre invocation on a daemon thread."""
+    import threading
+    from execution import cadre_invoke
+    threading.Thread(
+        target=cadre_invoke.invoke,
+        args=(member_id, event, extra),
+        daemon=True,
+    ).start()
+
+
+# ── Context builders for scheduled tasks ─────────────────────────────────────
+
+def _ctx_scout() -> str:
+    """Pull session + FTMO state for Scout's regime research task."""
+    parts = []
+    if _FTMO_STATE.exists():
+        try:
+            ftmo = json.loads(_FTMO_STATE.read_text(encoding="utf-8"))
+            parts.append(f"FTMO state: day_pnl={ftmo.get('daily_pnl_pct', 0):.2f}% "
+                         f"total_dd={ftmo.get('total_dd_pct', 0):.2f}% "
+                         f"day={ftmo.get('challenge_day', '?')}/30")
+        except Exception:
+            pass
+    parts.append(
+        "Task: Check DXY direction, active session (Asian/London/NY), upcoming macro events "
+        "in next 4 hours. Score the current market regime (trending/ranging/high_vol/low_vol). "
+        "Output: one JSON block {regime, dxy_bias, session, risk_events[], narrative} followed "
+        "by a brief narrative. Write to Brain vault as Intelligence/regime_YYYYMMDD_HHMM.md."
+    )
+    return "\n\n".join(parts)
+
+
+def _ctx_quant_routine() -> str:
+    """Pull trades.jsonl summary for Quant's periodic performance check."""
+    parts = []
+    trades_file = _LOGS / "trades.jsonl"
+    if trades_file.exists():
+        try:
+            lines = trades_file.read_text(encoding="utf-8").strip().splitlines()
+            recent = lines[-20:]
+            parts.append(f"Last 20 trades (of {len(lines)} total):\n" + "\n".join(recent))
+        except Exception:
+            pass
+    prob_file = _LOGS / "prob_model_state.json"
+    if prob_file.exists():
+        try:
+            parts.append(f"Current Bayesian lift table:\n{prob_file.read_text(encoding='utf-8')}")
+        except Exception:
+            pass
+    parts.append(
+        "Task: Analyse the recent trades. For each confluence (FVG, OB, M5, H4, HTF_level, "
+        "continuation): compute observed win rate, compare to current Bayesian lift, flag any "
+        "lift that is overfit or wrong. Output: updated lift recommendations and a risk finding "
+        "summary. Write to Brain vault as Quant/performance_YYYYMMDD.md."
+    )
+    return "\n\n".join(parts)
+
+
+def _ctx_quant_post_trade(trade_count: int) -> str:
+    """Quant context when a new trade just closed."""
+    trades_file = _LOGS / "trades.jsonl"
+    last_trade  = ""
+    if trades_file.exists():
+        try:
+            lines = trades_file.read_text(encoding="utf-8").strip().splitlines()
+            if lines:
+                last_trade = lines[-1]
+        except Exception:
+            pass
+    return (
+        f"A new trade just closed (total trades: {trade_count}).\n"
+        f"Last trade record: {last_trade}\n\n"
+        "Task: Analyse this trade specifically. Was the entry thesis validated? "
+        "Did the Bayesian model's P(win) estimate match outcome? Which confluences "
+        "were present and which fired correctly? Write a brief post-trade note to "
+        "Brain vault as Quant/post_trade_YYYYMMDD_HHMM.md. If the lift table needs "
+        "updating, state the recommended changes."
+    )
+
+
+def _ctx_builder_error_scan() -> str:
+    """Builder context for routine error log scan."""
+    log_file = _LOGS / "orchestrator.log"
+    errors   = []
+    if log_file.exists():
+        try:
+            lines = log_file.read_text(encoding="utf-8").splitlines()
+            errors = [l for l in lines if "ERROR" in l or "CRITICAL" in l or "Exception" in l][-20:]
+        except Exception:
+            pass
+    if not errors:
+        return ""
+    return (
+        f"Recent errors from orchestrator.log:\n" + "\n".join(errors) + "\n\n"
+        "Task: Review these errors. For each: identify the root cause, determine if "
+        "there is a code fix needed, and if yes — apply the minimal targeted fix to "
+        "C:\\Users\\anton\\Documents\\trading-bot\\. Log what changed to Brain vault "
+        "as Builder/fix_YYYYMMDD.md."
+    )
+
+
 # ── Main loop ─────────────────────────────────────────────────────────────────
 
 def _check_cadre_scheduled() -> None:
-    """Trigger time-based Cadre reviews (Sage weekly, Quant on loss streak)."""
+    """Trigger time-based Cadre reviews on rotating schedules."""
     try:
-        if not _RA_STATE.exists():
-            return
-        ra = json.loads(_RA_STATE.read_text(encoding="utf-8"))
+        state   = _sched_load()
+        now     = _utcnow()
+        ra      = {}
+        if _RA_STATE.exists():
+            try:
+                ra = json.loads(_RA_STATE.read_text(encoding="utf-8"))
+            except Exception:
+                pass
 
-        # Quant: loss streak >= 5
+        # ── Scout: market regime every 30 minutes ─────────────────────────────
+        if _sched_due(state, "scout_regime", _SCOUT_INTERVAL):
+            logger.info("[Council] Scout — market regime research (30-min tick)")
+            _fire_cadre("MEM-004", "market_regime_research", _ctx_scout())
+            _sched_mark(state, "scout_regime")
+
+        # ── Quant: routine performance review every 2 hours ───────────────────
+        if _sched_due(state, "quant_routine", _QUANT_INTERVAL):
+            logger.info("[Council] Quant — routine performance review (2-hour tick)")
+            _fire_cadre("MEM-002", "daily_loss_review", _ctx_quant_routine())
+            _sched_mark(state, "quant_routine")
+
+        # ── Quant: post-trade analysis when trade count increases ─────────────
+        current_trade_count = 0
+        trades_file = _LOGS / "trades.jsonl"
+        if trades_file.exists():
+            try:
+                current_trade_count = trades_file.read_text(encoding="utf-8").count("\n")
+            except Exception:
+                pass
+        last_trade_count = int(state.get("last_trade_count", 0))
+        if current_trade_count > last_trade_count:
+            logger.info("[Council] Quant — new trade closed (%d total), post-trade analysis",
+                        current_trade_count)
+            _fire_cadre("MEM-002", "post_incident_review",
+                        _ctx_quant_post_trade(current_trade_count))
+            state["last_trade_count"] = current_trade_count
+
+        # ── Quant: loss streak ≥ 5 ────────────────────────────────────────────
         consec = ra.get("consecutive_losses", 0)
         if consec >= 5 and _alerts.should_fire("quant_loss_streak"):
-            logger.warning("[Council] Loss streak %d — invoking Quant review", consec)
-            from execution import cadre_invoke
-            import threading
-            threading.Thread(
-                target=cadre_invoke.invoke,
-                args=("MEM-002", "loss_streak_5", f"Consecutive losses: {consec}"),
-                daemon=True,
-            ).start()
+            logger.warning("[Council] Loss streak %d — invoking Quant emergency review", consec)
+            _fire_cadre("MEM-002", "loss_streak_5",
+                        f"Consecutive losses: {consec}\n\n{_ctx_quant_routine()}")
 
-        # Sage: Monday morning weekly review
-        now = _utcnow()
+        # ── Builder: error log scan every hour ───────────────────────────────
+        if _sched_due(state, "builder_error_scan", _BUILDER_INTERVAL):
+            ctx = _ctx_builder_error_scan()
+            if ctx:
+                logger.info("[Council] Builder — new errors detected, invoking fix scan")
+                _fire_cadre("MEM-003", "bot_error_detected", ctx)
+            _sched_mark(state, "builder_error_scan")
+
+        # ── Sage: Monday 07:00 UTC weekly strategy review ─────────────────────
         if now.weekday() == 0 and now.hour == 7 and _alerts.should_fire("sage_weekly"):
-            logger.info("[Council] Monday 07:00 UTC — invoking Sage weekly review")
-            from execution import cadre_invoke
-            import threading
-            threading.Thread(
-                target=cadre_invoke.invoke,
-                args=("MEM-001", "weekly_strategy_review", ""),
-                daemon=True,
-            ).start()
+            logger.info("[Council] Sage — Monday 07:00 UTC weekly strategy review")
+            _fire_cadre("MEM-001", "weekly_strategy_review",
+                        f"Week starting {now.strftime('%Y-%m-%d')}. "
+                        f"FTMO day: {ra.get('challenge_day', '?')}/30.")
+
+        _sched_save(state)
+
     except Exception as exc:
         logger.debug("Cadre scheduled check error: %s", exc)
 
