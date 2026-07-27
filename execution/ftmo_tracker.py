@@ -89,18 +89,37 @@ class FTMOTracker:
             s.trade_days.append(today)
         if equity_close is not None:
             # Anchor today's baseline to the equity carried from the previous
-            # recorded day (its close), NOT to peak equity — peak overstates the
-            # daily loss and corrupts the 1-Step Best Day Rule.
+            # recorded day (its close). If no prior close exists (fresh state
+            # file), fall back to the current live equity — NEVER to
+            # initial_equity, which may be stale after a state re-init and
+            # corrupts every daily-DD calculation (2026-07-27 incident:
+            # anchored to 100k while real equity was 96.5k).
             if s.day_start_date != today:
-                s.day_start_equity = s.last_equity if s.last_equity else s.initial_equity
+                s.day_start_equity = s.last_equity if s.last_equity else equity_close
                 s.day_start_date   = today
             s.daily_pnl[today] = equity_close - s.day_start_equity
             s.last_equity      = equity_close
         self._save()
 
+    def anchor_day(self, live_equity: float) -> None:
+        """Anchor the daily baseline to live equity at the first tick of a new day.
+
+        Called from check() so the anchor exists before any trade closes.
+        FTMO measures daily DD from the day-start equity snapshot; using live
+        equity at day rollover is the closest available proxy.
+        """
+        today = str(date.today())
+        s = self.state
+        if s.day_start_date != today and live_equity > 0:
+            s.day_start_equity = live_equity
+            s.day_start_date   = today
+            s.last_equity      = live_equity
+            self._save()
+
     def check(self, current_equity: float) -> dict:
         """Return structured progress dict. Advances peak equity and saves state."""
         s = self.state
+        self.anchor_day(current_equity)
         if current_equity > s.peak_equity:
             s.peak_equity = current_equity
             self._save()
@@ -116,6 +135,8 @@ class FTMOTracker:
         profit_needed    = max(0.0, s.target_equity - current_equity)
         progress_pct     = min(100.0, profit_pct / rules["profit_target"] * 100)
         total_dd_pct     = (s.peak_equity - current_equity) / s.peak_equity * 100 if s.peak_equity else 0.0
+        daily_dd_pct     = ((s.day_start_equity - current_equity) / s.day_start_equity * 100
+                            if s.day_start_equity else 0.0)
 
         trading_days_met = len(s.trade_days) >= rules["min_days"]
         expired = (remaining == 0 and current_equity < s.target_equity) if window else False
@@ -144,6 +165,8 @@ class FTMOTracker:
             "profit_needed":       profit_needed,
             "progress_pct":        progress_pct,
             "total_dd_pct":        total_dd_pct,
+            "daily_dd_pct":        daily_dd_pct,
+            "day_start_equity":    s.day_start_equity,
             "peak_equity":         s.peak_equity,
             "trade_days_count":    len(s.trade_days),
             "min_days_required":   rules["min_days"],
@@ -225,10 +248,21 @@ class FTMOTracker:
     def _load_or_init(self, initial_equity: float) -> _FTMOState:
         if STATE_FILE.exists():
             try:
-                with open(STATE_FILE) as f:
+                # utf-8-sig: tolerate BOM (PowerShell writes one by default)
+                with open(STATE_FILE, encoding="utf-8-sig") as f:
                     return _FTMOState.from_dict(json.load(f))
             except Exception:
-                pass
+                # NEVER silently discard challenge state — back it up first.
+                # A parse failure overwriting the file destroys DD baselines.
+                backup = STATE_FILE.with_suffix(".json.corrupt")
+                try:
+                    backup.write_bytes(STATE_FILE.read_bytes())
+                except Exception:
+                    pass
+                import logging
+                logging.getLogger(__name__).critical(
+                    "FTMO state file unreadable — backed up to %s and re-initialised. "
+                    "VERIFY day_start_equity manually.", backup)
         state = _FTMOState.new(initial_equity, self.rules["profit_target"])
         STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
         with open(STATE_FILE, "w") as f:

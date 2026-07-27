@@ -838,6 +838,11 @@ class TradingEngine(Component):
         self._prob_model:      ProbabilityModel = ProbabilityModel()
         self._open_confluences: Optional[TradeConfluences] = None  # confluences at entry time
         self._scout_regime:    dict = {}   # last cadre_regime_state.json payload
+        # Burned targets: (direction, tp) → expiry ts. Blocks re-entering the
+        # same idea for 90 min after it traded (audit A3: 4 US30 longs at the
+        # same target in 30 min, all losers). Persisted across restarts.
+        self._burned_targets:  dict = {}
+        self._load_burned_targets()
         self._news_gate:        Optional[ng.NewsGate] = None
         self._event_dir_cache: dict[str, int] = {}
         self._trade_manager:   TradeManager = TradeManager()
@@ -921,6 +926,40 @@ class TradingEngine(Component):
         except Exception:
             pass
 
+    _BURNED_TARGETS_FILE = Path(__file__).resolve().parent.parent / "logs" / "burned_targets.json"
+    _BURN_TTL_SECS = 90 * 60
+
+    def _load_burned_targets(self) -> None:
+        """Load unexpired burned targets for this symbol (survives restarts —
+        the 2026-07-27 revenge loop spanned bot restarts)."""
+        try:
+            if not self._BURNED_TARGETS_FILE.exists():
+                return
+            data = json.loads(self._BURNED_TARGETS_FILE.read_text(encoding="utf-8"))
+            now = time.time()
+            for k, expiry in data.get(self._symbol, {}).items():
+                if expiry > now:
+                    d_str, tp_str = k.split("|")
+                    self._burned_targets[(int(d_str), float(tp_str))] = expiry
+        except Exception:
+            pass
+
+    def _save_burned_target(self, direction: int, tp: float) -> None:
+        expiry = time.time() + self._BURN_TTL_SECS
+        self._burned_targets[(direction, round(tp, 5))] = expiry
+        try:
+            data = {}
+            if self._BURNED_TARGETS_FILE.exists():
+                data = json.loads(self._BURNED_TARGETS_FILE.read_text(encoding="utf-8"))
+            sym = data.setdefault(self._symbol, {})
+            sym[f"{direction}|{round(tp, 5)}"] = expiry
+            now = time.time()
+            for s in list(data.keys()):
+                data[s] = {k: v for k, v in data[s].items() if v > now}
+            self._BURNED_TARGETS_FILE.write_text(json.dumps(data), encoding="utf-8")
+        except Exception:
+            pass
+
     def _size_order(
         self,
         direction: int,
@@ -982,7 +1021,9 @@ class TradingEngine(Component):
             # A suicidally tight stop (e.g. 6pts on US500) gets noise-stopped in
             # minutes AND makes the risk formula spit out a runaway position. The
             # stop must clear a floor of both ATR and % of price, or we don't trade.
-            min_atr  = atr_val * float(self._trade_cfg.get("min_stop_atr_mult", 0.5))
+            # Floor raised 0.5→0.75 ATR after 2026-07-27: two 0.68-ATR stops on
+            # US30 (54 lots each) noise-stopped within 15s — audit finding A4.
+            min_atr  = atr_val * float(self._trade_cfg.get("min_stop_atr_mult", 0.75))
             min_pct  = entry * float(self._trade_cfg.get("min_stop_pct", 0.05)) / 100.0
             min_dist = max(min_atr, min_pct)
             if dist < min_dist:
@@ -2288,6 +2329,12 @@ class TradingEngine(Component):
                         logger.info("[%s] CONTINUATION GATE: score only %d over floor — skipping (need +2)",
                                     self.name, _score_over_floor)
                         continue
+                    # Continuation now 0/7 live: also require entry AT an HTF level.
+                    # Chasing mid-range continuation is where the losses came from.
+                    if _plan_type == "continuation" and not (_mc_ctx and _mc_ctx.at_level):
+                        logger.info("[%s] CONTINUATION GATE: not at an HTF level — skipping "
+                                    "(mid-range continuation banned, 0/7 live)", self.name)
+                        continue
 
                     # ── Bayesian probability model — replaces flat score_mult ──
                     # Build confluence inputs from what's confirmed above.
@@ -2338,6 +2385,13 @@ class TradingEngine(Component):
                     concentration_mult = 2.0 if n_open <= 1 else (1.5 if n_open <= 3 else 1.0)
                     combined_mult = size_mult * score_mult * concentration_mult
 
+                    # NY-open whipsaw guard: 14:00 UTC hour is 0/5 live (-0.40R avg).
+                    # Half size until a 10+ trade sample says otherwise — not a
+                    # blacklist (C12: sample too small to ban an hour outright).
+                    if datetime.now(timezone.utc).hour == 14:
+                        combined_mult *= 0.5
+                        logger.info("[%s] NY-OPEN GUARD: 14:00 UTC hour — size halved", self.name)
+
                     # ── Portfolio risk management (Council #03/#05) ────────────
                     base_risk = float(self._trade_cfg.get("risk_pct", 1.0))
                     max_port  = float(self._trade_cfg.get("max_portfolio_risk_pct", 4.0))
@@ -2380,6 +2434,27 @@ class TradingEngine(Component):
                         continue   # already logged (stop too tight)
                     if sl is None or sl <= 0:
                         logger.warning("[%s] NO STOP — refusing to place a naked order", self.name)
+                        continue
+
+                    # ── Burned-target guard (audit A3) — revenge-loop killer ──
+                    # If this direction+target combo traded in the last 90 min,
+                    # the idea already had its shot. New idea = new target.
+                    _now_ts = time.time()
+                    self._burned_targets = {k: v for k, v in self._burned_targets.items() if v > _now_ts}
+                    if tp and (desired, round(tp, 5)) in self._burned_targets:
+                        logger.warning(
+                            "[%s] BURNED TARGET: dir=%+d tp=%.5f already traded within 90min — skip",
+                            self.name, desired, tp,
+                        )
+                        continue
+
+                    # ── Duplicate guard (audit A2) — never stack a second
+                    # position on a symbol from the entry path.
+                    if not self._dry_run and trader.get_positions(self._symbol):
+                        logger.warning(
+                            "[%s] DUPLICATE GUARD: position already open on %s — skip entry",
+                            self.name, self._symbol,
+                        )
                         continue
 
                     # ── Liquidity thesis gate: no clean draw within reach = no trade ──
@@ -2471,6 +2546,8 @@ class TradingEngine(Component):
                             self._entry_cooldown_until    = time.time() + 60  # 60s grace: block TM exits at bar-open
                             self._last_partial_bar        = 0
                             self._open_confluences        = _confl  # saved for Bayesian update at close
+                            if tp:
+                                self._save_burned_target(desired, tp)
                             self._save_position_state()
                             if self._risk_agent is not None:
                                 self._risk_agent.record_entry()
