@@ -63,7 +63,7 @@ from execution.ftmo_tracker import FTMOTracker
 from execution.trade_journal import TradeJournal
 from execution.portfolio_manager import PortfolioAllocator, PortfolioBook, OpenPos, Trim
 from execution.level_monitor import LevelMonitor
-from execution.order_flow import analyse_order_flow, order_flow_score_modifier
+from execution.order_flow import analyse_order_flow, order_flow_score_modifier, get_dom_key_levels
 from execution import telegram_notify as tg
 from backtests.run_multi_instrument import (
     INSTRUMENTS, OPTIMISED_PARAMS, TRAIL_CONFIGS, BIDIRECTIONAL, M15_PARAMS,
@@ -2040,6 +2040,29 @@ class TradingEngine(Component):
                             signal_score += _of_mod
                             _extra_reasons.append(f"OrderFlow {'+' if _of_mod>0 else ''}{_of_mod}: {_of_snap.summary}")
                             logger.info("[%s] OrderFlow modifier %+d | %s", self.name, _of_mod, _of_snap.summary)
+                    except Exception:
+                        pass
+
+                    # DOM key levels — bookmap equivalent: where large orders cluster
+                    try:
+                        _dom_levels = get_dom_key_levels(self._symbol, mt5)
+                        if _dom_levels:
+                            _tick = mt5.symbol_info_tick(self._symbol)
+                            _mid  = (_tick.bid + _tick.ask) / 2 if _tick else 0.0
+                            for _dl in _dom_levels:
+                                _dist_pts = abs(_dl.price - _mid)
+                                logger.info(
+                                    "[%s] DOM wall: %s @ %.5f | vol=%.0f (%.1fx avg) | dist=%.1f pts",
+                                    self.name, _dl.side.upper(), _dl.price, _dl.volume, _dl.strength, _dist_pts,
+                                )
+                            # Closest DOM wall opposing the trade direction acts as a filter
+                            _opposing_walls = [
+                                d for d in _dom_levels
+                                if (desired == 1 and d.side == "ask") or (desired == -1 and d.side == "bid")
+                            ]
+                            if _opposing_walls:
+                                closest = min(_opposing_walls, key=lambda x: abs(x.price - _mid))
+                                _extra_reasons.append(f"DOM wall {closest.side} @ {closest.price:.1f} ({closest.strength:.1f}x)")
                     except Exception:
                         pass
 

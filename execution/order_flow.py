@@ -130,6 +130,65 @@ def analyse_order_flow(symbol: str, df_m5: pd.DataFrame, mt5=None) -> Optional[O
         return None
 
 
+@dataclass
+class DOMLevel:
+    price:     float
+    volume:    float
+    side:      str    # "bid" | "ask"
+    strength:  float  # volume / avg_volume — how much bigger than normal this level is
+
+
+def get_dom_key_levels(
+    symbol: str,
+    mt5,
+    min_strength: float = 3.0,   # level must be 3x average DOM volume to qualify
+    max_levels:   int   = 5,
+) -> list[DOMLevel]:
+    """Read live DOM and return price levels with unusually large order stacks.
+
+    These are the 'bookmap walls' — where institutions have parked large orders.
+    If 1000 lots sit at a price, that level is a magnet or a wall depending on
+    which side of market it's on.
+
+    Returns empty list if DOM unavailable (broker/symbol restriction).
+    """
+    if mt5 is None:
+        return []
+    try:
+        if not mt5.market_book_add(symbol):
+            return []
+        dom = mt5.market_book_get(symbol)
+        mt5.market_book_release(symbol)
+        if not dom or len(dom) < 2:
+            return []
+
+        bids = [(e.price, e.volume) for e in dom if e.type == mt5.BOOK_TYPE_BUY and e.volume > 0]
+        asks = [(e.price, e.volume) for e in dom if e.type == mt5.BOOK_TYPE_SELL and e.volume > 0]
+
+        if not bids and not asks:
+            return []
+
+        all_vols = [v for _, v in bids + asks]
+        avg_vol  = sum(all_vols) / len(all_vols) if all_vols else 1.0
+
+        levels: list[DOMLevel] = []
+        for price, vol in bids:
+            strength = vol / avg_vol
+            if strength >= min_strength:
+                levels.append(DOMLevel(price=price, volume=vol, side="bid", strength=strength))
+        for price, vol in asks:
+            strength = vol / avg_vol
+            if strength >= min_strength:
+                levels.append(DOMLevel(price=price, volume=vol, side="ask", strength=strength))
+
+        levels.sort(key=lambda x: x.strength, reverse=True)
+        return levels[:max_levels]
+
+    except Exception:
+        logger.debug("[DOM] key level scan failed for %s", symbol)
+        return []
+
+
 def order_flow_score_modifier(snap: Optional[OrderFlowSnapshot], signal_dir: int) -> int:
     """
     Returns a score modifier (-1, 0, +1) based on order flow alignment with signal.
