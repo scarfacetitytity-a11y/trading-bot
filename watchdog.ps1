@@ -1,51 +1,40 @@
-# AiDEN bot watchdog — restarts orchestrator if it dies.
-# Run this in a separate PowerShell window, or schedule it via Task Scheduler.
+# AiDEN watchdog - supervises orchestrator AND council_watch.
+# Checks every 30s; starts whichever is not running; kills duplicate bots.
+# Safe at boot: checks the process table before launching, and the
+# orchestrator itself aborts on a live PID lock.
 # Usage: powershell -ExecutionPolicy Bypass -File watchdog.ps1
 
-$BotDir   = $PSScriptRoot
-$PythonCmd = "python"
-$Module   = "execution.orchestrator"
-$LogFile  = "$BotDir\logs\watchdog.log"
-$MaxRestarts = 20
-$CooldownSec = 30
-
-$restarts = 0
+$BotDir    = $PSScriptRoot
+$PythonCmd = "C:\Python314\python.exe"
+$LogFile   = Join-Path $BotDir "logs\watchdog.log"
+$PollSec   = 30
 
 function Write-Log($msg) {
-    $ts = (Get-Date -Format "yyyy-MM-dd HH:mm:ss")
-    $line = "[$ts] $msg"
-    Write-Host $line
-    Add-Content -Path $LogFile -Value $line
+    $ts = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+    Add-Content -Path $LogFile -Value ("[{0}] {1}" -f $ts, $msg)
 }
 
-Write-Log "Watchdog started. Monitoring AiDEN orchestrator."
+function Get-BotProcess($module) {
+    Get-CimInstance Win32_Process -Filter "Name='python.exe'" |
+        Where-Object { $_.CommandLine -match [regex]::Escape($module) }
+}
 
-while ($restarts -lt $MaxRestarts) {
-    Write-Log "Starting orchestrator (attempt $($restarts + 1)/$MaxRestarts)..."
+Write-Log "Watchdog started - supervising orchestrator + council_watch."
 
-    $proc = Start-Process -FilePath $PythonCmd `
-        -ArgumentList "-m", $Module `
-        -WorkingDirectory $BotDir `
-        -PassThru `
-        -NoNewWindow
-
-    Write-Log "Orchestrator PID $($proc.Id) started."
-    $proc.WaitForExit()
-
-    $exitCode = $proc.ExitCode
-    Write-Log "Orchestrator exited with code $exitCode."
-
-    if ($exitCode -eq 0) {
-        Write-Log "Clean exit (code 0) — watchdog stopping."
-        break
+while ($true) {
+    foreach ($module in @("execution.orchestrator", "execution.council_watch")) {
+        $procs = @(Get-BotProcess $module)
+        if ($procs.Count -eq 0) {
+            Write-Log ("{0} not running - launching." -f $module)
+            Start-Process -FilePath $PythonCmd -ArgumentList "-m", $module -WorkingDirectory $BotDir -WindowStyle Hidden
+        }
+        elseif ($module -eq "execution.orchestrator" -and $procs.Count -gt 1) {
+            Write-Log ("WARNING: {0} orchestrator instances - killing extras." -f $procs.Count)
+            $procs | Sort-Object CreationDate | Select-Object -Skip 1 | ForEach-Object {
+                Write-Log ("Killing duplicate orchestrator PID {0}" -f $_.ProcessId)
+                Stop-Process -Id $_.ProcessId -Force
+            }
+        }
     }
-
-    $restarts++
-    if ($restarts -ge $MaxRestarts) {
-        Write-Log "Max restarts ($MaxRestarts) reached — watchdog giving up. Check logs."
-        break
-    }
-
-    Write-Log "Waiting ${CooldownSec}s before restart..."
-    Start-Sleep -Seconds $CooldownSec
+    Start-Sleep -Seconds $PollSec
 }

@@ -534,3 +534,181 @@ class TestScoreWiredToEngine:
     def test_score_6_lots(self, tmp_path):
         lots = self._lots_for_score(tmp_path, 6)
         assert lots == pytest.approx(0.01 * 1.5, abs=0.005)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 2026-07-27 audit regressions — FTMO day anchoring (A1)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestFTMODayAnchoring:
+    """Daily DD must anchor to live equity, never to stale initial_equity."""
+
+    def _tracker(self, tmp_path, initial=100_000):
+        with patch("execution.ftmo_tracker.STATE_FILE", tmp_path / "ftmo.json"):
+            return FTMOTracker(initial_equity=initial)
+
+    def test_new_day_anchors_to_live_equity(self, tmp_path):
+        ft = self._tracker(tmp_path)
+        # Fresh state, no prior close: first check() anchors to live equity,
+        # NOT to initial_equity (the 2026-07-27 100k-vs-96.5k corruption).
+        with patch("execution.ftmo_tracker.STATE_FILE", tmp_path / "ftmo.json"):
+            r = ft.check(96_524.73)
+        assert r["day_start_equity"] == pytest.approx(96_524.73)
+        assert r["daily_dd_pct"] == pytest.approx(0.0)
+
+    def test_same_day_does_not_reanchor(self, tmp_path):
+        ft = self._tracker(tmp_path)
+        with patch("execution.ftmo_tracker.STATE_FILE", tmp_path / "ftmo.json"):
+            ft.check(96_500.0)
+            r = ft.check(94_400.0)   # intraday loss must NOT move the anchor
+        assert r["day_start_equity"] == pytest.approx(96_500.0)
+        assert r["daily_dd_pct"] == pytest.approx((96_500 - 94_400) / 96_500 * 100)
+
+    def test_record_trade_day_never_falls_back_to_initial(self, tmp_path):
+        ft = self._tracker(tmp_path, initial=100_000)
+        ft.state.last_equity = 0.0          # fresh state, no prior close
+        ft.state.day_start_date = ""        # force new-day branch
+        with patch("execution.ftmo_tracker.STATE_FILE", tmp_path / "ftmo.json"):
+            ft.record_trade_day(equity_close=95_000.0)
+        assert ft.state.day_start_equity == pytest.approx(95_000.0)
+        assert ft.state.day_start_equity != 100_000
+
+    def test_corrupt_state_backed_up_not_destroyed(self, tmp_path):
+        state_file = tmp_path / "ftmo.json"
+        state_file.write_text("﻿{not valid json", encoding="utf-8")
+        with patch("execution.ftmo_tracker.STATE_FILE", state_file):
+            FTMOTracker(initial_equity=100_000)
+        assert (tmp_path / "ftmo.json.corrupt").exists()
+
+    def test_bom_state_file_loads(self, tmp_path):
+        import json as _json
+        state_file = tmp_path / "ftmo.json"
+        payload = {
+            "start_date": "2026-07-22", "initial_equity": 100000,
+            "target_equity": 110000.0, "peak_equity": 100000.0,
+            "trade_days": [], "daily_pnl": {},
+            "day_start_equity": 96524.73, "day_start_date": "2026-07-27",
+            "last_equity": 94400.93,
+        }
+        state_file.write_text("﻿" + _json.dumps(payload), encoding="utf-8")
+        with patch("execution.ftmo_tracker.STATE_FILE", state_file):
+            ft = FTMOTracker(initial_equity=100_000)
+        assert ft.state.day_start_equity == pytest.approx(96_524.73)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 2026-07-27 audit regressions — burned targets (A3) + PID lock (A2)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestBurnedTargets:
+    """A direction+target combo must be blocked for 90 min after entry."""
+
+    def test_burn_and_reload_roundtrip(self, tmp_path):
+        engine, *_ = _engine(tmp_path)
+        with patch.object(TradingEngine, "_BURNED_TARGETS_FILE", tmp_path / "burned.json"):
+            engine._save_burned_target(1, 52531.15)
+            assert (1, 52531.15) in engine._burned_targets
+
+            engine2, *_ = _engine(tmp_path)
+            engine2._burned_targets = {}
+            engine2._load_burned_targets()
+        assert (1, 52531.15) in engine2._burned_targets
+
+    def test_expired_burn_not_loaded(self, tmp_path):
+        import json as _json
+        burn_file = tmp_path / "burned.json"
+        burn_file.write_text(_json.dumps(
+            {"XAUUSD": {"1|52531.15": time.time() - 10}}   # already expired
+        ))
+        with patch.object(TradingEngine, "_BURNED_TARGETS_FILE", burn_file):
+            engine, *_ = _engine(tmp_path)
+            engine._burned_targets = {}
+            engine._load_burned_targets()
+        assert engine._burned_targets == {}
+
+    def test_opposite_direction_not_burned(self, tmp_path):
+        engine, *_ = _engine(tmp_path)
+        with patch.object(TradingEngine, "_BURNED_TARGETS_FILE", tmp_path / "burned.json"):
+            engine._save_burned_target(1, 52531.15)
+        assert (-1, 52531.15) not in engine._burned_targets
+
+
+class TestPidLock:
+    """Second instance must abort — no psutil dependency (2026-07-27: three
+    concurrent instances because psutil ImportError skipped the check)."""
+
+    def test_live_python_pid_detected(self):
+        import os
+        from execution.orchestrator import _pid_is_python
+        assert _pid_is_python(os.getpid()) is True
+
+    def test_dead_pid_not_detected(self):
+        from execution.orchestrator import _pid_is_python
+        # PID 4 is the Windows System process — never python
+        assert _pid_is_python(4) is False
+
+    def test_second_start_aborts(self, tmp_path, monkeypatch):
+        import os
+        from execution.orchestrator import _acquire_pid_lock
+        monkeypatch.chdir(tmp_path)
+        (tmp_path / "logs").mkdir()
+        (tmp_path / "logs" / "bot.pid").write_text(str(os.getpid()))
+        with pytest.raises(SystemExit):
+            _acquire_pid_lock()
+
+    def test_stale_lock_overwritten(self, tmp_path, monkeypatch):
+        import os
+        from execution.orchestrator import _acquire_pid_lock
+        monkeypatch.chdir(tmp_path)
+        (tmp_path / "logs").mkdir()
+        (tmp_path / "logs" / "bot.pid").write_text("4")   # System pid, not python
+        pid_path = _acquire_pid_lock()
+        assert pid_path.read_text().strip() == str(os.getpid())
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 2026-07-27 audit regressions — probability model + Quant proposals
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestProbabilityModel:
+    def _model(self, tmp_path):
+        from execution.probability_model import ProbabilityModel
+        return ProbabilityModel(state_file=tmp_path / "prob.json")
+
+    def test_continuation_penalised(self, tmp_path):
+        from execution.probability_model import TradeConfluences
+        m = self._model(tmp_path)
+        base = m.estimate(TradeConfluences(fvg_present=True, trade_type="breakout"))
+        cont = m.estimate(TradeConfluences(fvg_present=True, trade_type="continuation"))
+        assert cont.p_win < base.p_win
+
+    def test_low_probability_rejected(self, tmp_path):
+        from execution.probability_model import TradeConfluences
+        m = self._model(tmp_path)
+        # Continuation with nothing else going for it → below MIN_P_TO_TRADE
+        est = m.estimate(TradeConfluences(
+            fvg_present=False, trade_type="continuation", rr=1.0))
+        assert est.take_trade is False
+
+    def test_quant_proposal_applied_within_bounds(self, tmp_path):
+        import json as _json
+        (tmp_path / "quant_lift_proposals.json").write_text(
+            _json.dumps({"confluences": {"fvg_present": 1.40}}))
+        m = self._model(tmp_path)
+        assert m._lifts["fvg_present"]["lift"] == pytest.approx(1.40)
+
+    def test_quant_proposal_out_of_bounds_rejected(self, tmp_path):
+        import json as _json
+        (tmp_path / "quant_lift_proposals.json").write_text(
+            _json.dumps({"confluences": {"fvg_present": 9.9}}))   # typo guard
+        m = self._model(tmp_path)
+        assert m._lifts["fvg_present"]["lift"] == pytest.approx(1.30)
+
+    def test_stale_quant_proposal_ignored(self, tmp_path):
+        import json as _json, os
+        pfile = tmp_path / "quant_lift_proposals.json"
+        pfile.write_text(_json.dumps({"confluences": {"fvg_present": 1.40}}))
+        old = time.time() - 5 * 3600
+        os.utime(pfile, (old, old))
+        m = self._model(tmp_path)
+        assert m._lifts["fvg_present"]["lift"] == pytest.approx(1.30)
