@@ -63,6 +63,7 @@ from execution.ftmo_tracker import FTMOTracker
 from execution.trade_journal import TradeJournal
 from execution.portfolio_manager import PortfolioAllocator, PortfolioBook, OpenPos, Trim
 from execution.level_monitor import LevelMonitor
+from execution.order_flow import analyse_order_flow, order_flow_score_modifier
 from execution import telegram_notify as tg
 from backtests.run_multi_instrument import (
     INSTRUMENTS, OPTIMISED_PARAMS, TRAIL_CONFIGS, BIDIRECTIONAL, M15_PARAMS,
@@ -2024,6 +2025,18 @@ class TradingEngine(Component):
                         signal_score += 1
                         _extra_reasons.append("M5 structure confirmed")
                         logger.info("[%s] M5 confirmed — +1 score → %d", self.name, signal_score)
+
+                    # Order flow confluence: checks delta + imbalance + DOM alignment
+                    try:
+                        _df_m5 = self._strategy._m5_df if hasattr(self._strategy, "_m5_df") else None
+                        _of_snap = analyse_order_flow(self._symbol, _df_m5, mt5=mt5)
+                        _of_mod  = order_flow_score_modifier(_of_snap, desired)
+                        if _of_mod != 0 and _of_snap is not None:
+                            signal_score += _of_mod
+                            _extra_reasons.append(f"OrderFlow {'+' if _of_mod>0 else ''}{_of_mod}: {_of_snap.summary}")
+                            logger.info("[%s] OrderFlow modifier %+d | %s", self.name, _of_mod, _of_snap.summary)
+                    except Exception:
+                        pass
 
                     # News gate: price-confirmed direction preferred; consensus as fallback
                     # Amplifier only — never penalises

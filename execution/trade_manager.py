@@ -278,8 +278,18 @@ class TradeManager:
 
         probs = self._compute_action_probabilities(counter, cont, sweep_risk, cur_r)
 
+        # ── Minimum hold guard ────────────────────────────────────────────────
+        # Never exit within the first 3 bars (45 min on M15) unless the trade
+        # is already in loss beyond 0.5R — early counter signals are almost
+        # always noise before the move has had room to develop.
+        MIN_HOLD_BARS = 3
+        early_exit_blocked = (
+            position.bars_elapsed < MIN_HOLD_BARS
+            and cur_r > -0.5
+        )
+
         # ── EXIT / WAIT ───────────────────────────────────────────────────────
-        if counter >= self._exit_thresh:
+        if counter >= self._exit_thresh and not early_exit_blocked:
             if sweep_risk > self._sweep_thresh:
                 # Stop-hunt sweep likely — wait one bar for confirmation before exiting
                 action = ActionType.WAIT
@@ -307,7 +317,7 @@ class TradeManager:
                 )
 
         # ── PARTIAL_CLOSE: significant counter, reduce + tighten ──────────────
-        if counter >= self._partial_thresh:
+        if counter >= self._partial_thresh and not early_exit_blocked:
             new_sl = find_structure_sl(df_primary, pos_dir, position.current_sl, atr=atr_m5)
             action = ActionType.PARTIAL_CLOSE
             return TradeAction(
