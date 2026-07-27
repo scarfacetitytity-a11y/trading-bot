@@ -127,7 +127,13 @@ def invoke(member_id: str, event: str, extra_context: str = "") -> int:
         claude_cmd = "claude"
 
     model = member.get("model", "haiku")
-    cmd = [claude_cmd, "-p", prompt, "--model", model]
+    # Headless -p runs get no permission prompts — without explicit tool
+    # grants the agent cannot write its output files and the feedback loop
+    # silently dies at the last step.
+    cmd = [
+        claude_cmd, "-p", prompt, "--model", model,
+        "--allowedTools", "Read,Write,Edit,Glob,Grep,Bash,WebSearch,WebFetch",
+    ]
 
     logger.info("[Cadre] Invoking %s (%s) for event: %s", member["name"], member_id, event)
 
@@ -136,7 +142,7 @@ def invoke(member_id: str, event: str, extra_context: str = "") -> int:
             cmd,
             capture_output=True,
             text=True,
-            timeout=120,
+            timeout=300,
             cwd=str(_BOT_ROOT),
         )
         if result.returncode == 0:
