@@ -601,6 +601,30 @@ def _check_cadre_scheduled() -> None:
         logger.debug("Cadre scheduled check error: %s", exc)
 
 
+# Warnings that persist unresolved get escalated — 2026-07-26 incident:
+# baseline_drift warned for a day while every DD calculation ran off a
+# wrong anchor. Escalation = critical dispatch + Quant investigation.
+_ESCALATE_AFTER_SECS = 2 * 3600
+_issue_first_seen: dict[str, float] = {}
+
+
+def _check_stale_warnings(all_issues: dict[str, str]) -> None:
+    now = time.time()
+    for key in list(_issue_first_seen.keys()):
+        if key not in all_issues:
+            del _issue_first_seen[key]
+    for key, message in all_issues.items():
+        first = _issue_first_seen.setdefault(key, now)
+        if (now - first) > _ESCALATE_AFTER_SECS and _alerts.should_fire(f"escalated_{key}"):
+            age_h = (now - first) / 3600
+            esc_msg = f"UNRESOLVED {age_h:.1f}h: {message}"
+            logger.critical("[Council] ESCALATION — %s", esc_msg)
+            _dispatch(f"escalated_{key}", esc_msg, severity="critical")
+            _fire_cadre("MEM-002", "post_incident_review",
+                        f"Warning '{key}' has been active and unresolved for {age_h:.1f} hours: "
+                        f"{message}\n\nInvestigate root cause and state what must change.")
+
+
 def run_once() -> dict[str, str]:
     _clear_halt_if_new_day()
 
@@ -610,6 +634,7 @@ def run_once() -> dict[str, str]:
     all_issues.update(_check_open_trades())
     all_issues.update(_check_ftmo_challenge())
     _check_cadre_scheduled()
+    _check_stale_warnings(all_issues)
 
     for key, message in all_issues.items():
         if "hard" in key or "breach" in key.lower():

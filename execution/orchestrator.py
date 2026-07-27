@@ -2179,6 +2179,7 @@ class TradingEngine(Component):
                         pass
 
                     # DOM key levels — bookmap equivalent: where large orders cluster
+                    _dom_supporting = False   # wall stacked on OUR side of the trade
                     try:
                         _dom_levels = get_dom_key_levels(self._symbol, mt5)
                         if _dom_levels:
@@ -2198,6 +2199,12 @@ class TradingEngine(Component):
                             if _opposing_walls:
                                 closest = min(_opposing_walls, key=lambda x: abs(x.price - _mid))
                                 _extra_reasons.append(f"DOM wall {closest.side} @ {closest.price:.1f} ({closest.strength:.1f}x)")
+                            # Supporting wall: bid stack under a long / ask stack over
+                            # a short — institutions parked with us. Feeds dom_aligned.
+                            _dom_supporting = any(
+                                (desired == 1 and d.side == "bid") or (desired == -1 and d.side == "ask")
+                                for d in _dom_levels
+                            )
                     except Exception:
                         pass
 
@@ -2361,7 +2368,7 @@ class TradingEngine(Component):
                         at_htf_level       = bool(_mc_ctx and _mc_ctx.at_level),
                         level_strength     = _mc_ctx.level_strength if _mc_ctx else 0.0,
                         order_flow_aligned = _of_aligned or _scout_aligned,
-                        dom_aligned        = False,   # DOM data populated via separate path
+                        dom_aligned        = _dom_supporting,
                         news_aligned       = news_dir == desired if news_dir != 0 else False,
                         trade_type         = _plan_type,
                         rr                 = _plan_rr,

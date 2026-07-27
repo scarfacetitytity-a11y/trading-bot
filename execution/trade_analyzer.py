@@ -569,10 +569,12 @@ def analyze_exit(
     hit_target = ((direction == 1 and path_high >= target) or
                   (direction == -1 and path_low <= target))
 
-    # Thesis valid if price moved at least 0.3R in the right direction.
+    # Thesis valid if price moved at least 0.25R in the right direction.
     # Using 1.0R caused every early-exited trade to show thesis_valid=False even
     # when direction was correct — exit bugs were masking real thesis quality.
-    thesis_valid = mfe_R >= 0.3
+    # 0.3 flagged a 0.28-mfe trade as invalid (boundary noise) — 0.25 keeps the
+    # binary honest until graded thesis quality replaces it.
+    thesis_valid = mfe_R >= 0.25
 
     notes = []
     if mfe_R >= 2.0 and exit_R < 1.0:
