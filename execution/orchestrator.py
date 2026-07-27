@@ -837,6 +837,7 @@ class TradingEngine(Component):
         self._mc_agent:        Optional[MarketContextAgent] = None
         self._prob_model:      ProbabilityModel = ProbabilityModel()
         self._open_confluences: Optional[TradeConfluences] = None  # confluences at entry time
+        self._scout_regime:    dict = {}   # last cadre_regime_state.json payload
         self._news_gate:        Optional[ng.NewsGate] = None
         self._event_dir_cache: dict[str, int] = {}
         self._trade_manager:   TradeManager = TradeManager()
@@ -1283,6 +1284,49 @@ class TradingEngine(Component):
             return daily_room, total_room
         except Exception:
             return MAX_DAILY_LOSS_PCT, SOFT_DD_HALT_PCT
+
+    @staticmethod
+    def _read_scout_regime() -> dict:
+        """Load Scout's latest regime assessment from cadre_regime_state.json.
+
+        Scout writes this file every 30 min. We treat it as stale if > 35 min old
+        so we never block on a missing Scout run.
+        Returns empty dict if unavailable or stale.
+        """
+        regime_file = Path(__file__).parent.parent / "logs" / "cadre_regime_state.json"
+        if not regime_file.exists():
+            return {}
+        try:
+            age = time.time() - regime_file.stat().st_mtime
+            if age > 35 * 60:
+                return {}
+            return json.loads(regime_file.read_text(encoding="utf-8"))
+        except Exception:
+            return {}
+
+    # DXY directional impact per instrument:
+    # +1 DXY bullish (USD strong): EURUSD -1, GBPUSD -1, XAUUSD -1, US30 +1, US100 +1
+    _DXY_INSTRUMENT_BIAS: dict[str, int] = {
+        "EURUSD": -1, "GBPUSD": -1, "USDJPY": +1, "USDCHF": +1,
+        "XAUUSD": -1, "XAGUSD": -1,
+        "US30": +1, "US100": +1, "US500": +1, "US2000": +1,
+        "JP225": -1,
+    }
+
+    def _scout_regime_aligned(self, symbol: str, direction: int) -> bool:
+        """True if Scout's DXY bias aligns with the proposed trade direction."""
+        regime = self._scout_regime
+        dxy_bias = regime.get("dxy_bias", 0)
+        if dxy_bias == 0:
+            return False
+        # Find the instrument's DXY relationship
+        sym_base = symbol.upper().replace("_SB", "").replace(".", "")
+        instr_dxy_dir = self._DXY_INSTRUMENT_BIAS.get(sym_base, 0)
+        if instr_dxy_dir == 0:
+            return False
+        # Aligned if: DXY bias * instrument_direction == proposed_direction
+        expected_dir = dxy_bias * instr_dxy_dir
+        return expected_dir == direction
 
     def _fetch_dxy_bias(self) -> int:
         """H4 EMA bias of DXY index. Returns +1 (USD strong), -1 (USD weak), 0 (unavailable).
@@ -2247,7 +2291,21 @@ class TradingEngine(Component):
 
                     # ── Bayesian probability model — replaces flat score_mult ──
                     # Build confluence inputs from what's confirmed above.
-                    _plan_rr   = self._last_plan.rr if self._last_plan else 2.5
+                    _plan_rr = self._last_plan.rr if self._last_plan else 2.5
+
+                    # Scout regime: load every entry (cached file, negligible I/O)
+                    self._scout_regime = self._read_scout_regime()
+                    _scout_aligned = self._scout_regime_aligned(self._symbol, desired)
+                    if self._scout_regime:
+                        logger.info(
+                            "[%s] Scout regime: %s | dxy_bias=%s | scout_aligned=%s",
+                            self.name,
+                            self._scout_regime.get("narrative", "?"),
+                            self._scout_regime.get("dxy_bias", "?"),
+                            _scout_aligned,
+                        )
+
+                    _of_aligned = bool(_of_mod > 0) if "_of_mod" in dir() else False
                     _confl = TradeConfluences(
                         fvg_present        = True,        # strategy fires on FVG detection
                         ob_present         = _score_over_floor >= 1,
@@ -2255,7 +2313,7 @@ class TradingEngine(Component):
                         h4_aligned         = getattr(self._strategy, "_last_h4_bias", 0) == desired,
                         at_htf_level       = bool(_mc_ctx and _mc_ctx.at_level),
                         level_strength     = _mc_ctx.level_strength if _mc_ctx else 0.0,
-                        order_flow_aligned = bool(_of_mod > 0) if "_of_mod" in dir() else False,
+                        order_flow_aligned = _of_aligned or _scout_aligned,
                         dom_aligned        = False,   # DOM data populated via separate path
                         news_aligned       = news_dir == desired if news_dir != 0 else False,
                         trade_type         = _plan_type,

@@ -227,6 +227,15 @@ class ProbabilityModel:
 
     # ── Persistence ───────────────────────────────────────────────────────────
 
+    def confidence_report(self) -> str:
+        """Log how many observations back each lift — prior vs data dominated."""
+        lines = []
+        for k, v in self._lifts.items():
+            n   = v["n_obs"]
+            dom = "DATA" if n >= 20 else ("BLENDED" if n >= 5 else "PRIOR")
+            lines.append(f"  {k:<22} lift={v['lift']:.3f}  n={n:>3}  [{dom}]")
+        return "Bayesian lift confidence:\n" + "\n".join(lines)
+
     def _load_state(self) -> None:
         try:
             if self._state_file.exists():
@@ -236,6 +245,43 @@ class ProbabilityModel:
                         self._lifts[k].update(v)
         except Exception as e:
             logger.debug("[ProbModel] state load failed: %s", e)
+        self._apply_quant_proposals()
+
+    def _apply_quant_proposals(self) -> None:
+        """Apply Quant-written lift proposals if fresh (< 4 hours old).
+
+        Quant writes logs/quant_lift_proposals.json after each analysis.
+        Format: {"confluences": {"fvg_present": 1.28, ...}, "ts": "2026-07-27T..."}
+        Only applies if the file is newer than the current state — prevents
+        stale proposals overwriting live Bayesian updates.
+        """
+        proposals_file = self._state_file.parent / "quant_lift_proposals.json"
+        if not proposals_file.exists():
+            return
+        try:
+            age_secs = (
+                __import__("time").time() - proposals_file.stat().st_mtime
+            )
+            if age_secs > 4 * 3600:
+                return   # stale — ignore
+            data = json.loads(proposals_file.read_text())
+            updated = []
+            for key, proposed_lift in data.get("confluences", {}).items():
+                if key not in self._lifts:
+                    continue
+                if not isinstance(proposed_lift, (int, float)):
+                    continue
+                proposed_lift = float(proposed_lift)
+                # Only apply if Quant's proposal is within ±50% of current lift
+                # — prevents typos from crashing the model
+                current = self._lifts[key]["lift"]
+                if 0.5 * current <= proposed_lift <= 2.0 * current:
+                    self._lifts[key]["lift"] = proposed_lift
+                    updated.append(f"{key}={proposed_lift:.3f}")
+            if updated:
+                logger.info("[ProbModel] Applied Quant lift proposals: %s", ", ".join(updated))
+        except Exception as e:
+            logger.debug("[ProbModel] quant proposals load failed: %s", e)
 
     def _save_state(self) -> None:
         try:

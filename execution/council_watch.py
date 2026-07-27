@@ -414,6 +414,8 @@ def _fire_cadre(member_id: str, event: str, extra: str = "") -> None:
 
 def _ctx_scout() -> str:
     """Pull session + FTMO state for Scout's regime research task."""
+    from datetime import datetime, timezone
+    now_str = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M")
     parts = []
     if _FTMO_STATE.exists():
         try:
@@ -424,16 +426,27 @@ def _ctx_scout() -> str:
         except Exception:
             pass
     parts.append(
-        "Task: Check DXY direction, active session (Asian/London/NY), upcoming macro events "
-        "in next 4 hours. Score the current market regime (trending/ranging/high_vol/low_vol). "
-        "Output: one JSON block {regime, dxy_bias, session, risk_events[], narrative} followed "
-        "by a brief narrative. Write to Brain vault as Intelligence/regime_YYYYMMDD_HHMM.md."
+        f"Task: Research the current market regime. Assess DXY direction (H4 EMA trend: +1 bullish "
+        f"USD, -1 bearish USD, 0 neutral), active session (Asian/London/NY), and any macro risk "
+        f"events in the next 4 hours (NFP, FOMC, CPI etc.). "
+        f"Score overall regime: trending_bull / trending_bear / ranging / high_vol.\n\n"
+        f"REQUIRED OUTPUT (two parts, both mandatory):\n"
+        f"1. Write a JSON file to EXACTLY this path: "
+        f"C:\\Users\\anton\\Documents\\trading-bot\\logs\\cadre_regime_state.json\n"
+        f"   Format: {{\"regime\": \"ranging\", \"dxy_bias\": 0, \"session\": \"London\", "
+        f"\"risk_events\": [], \"narrative\": \"one sentence\", \"ts_utc\": \"ISO timestamp\"}}\n"
+        f"   dxy_bias must be +1, -1, or 0. This file is machine-read by the trading bot.\n\n"
+        f"2. Write a markdown note to Brain vault: "
+        f"C:\\Users\\anton\\OneDrive\\Desktop\\Aiden\\AiDEN\\Brain\\Intelligence\\regime_{now_str}.md\n"
+        f"   Use MOP frontmatter (type: note, status: active, tags: [regime, scout])."
     )
     return "\n\n".join(parts)
 
 
 def _ctx_quant_routine() -> str:
     """Pull trades.jsonl summary for Quant's periodic performance check."""
+    from datetime import datetime, timezone
+    now_str = datetime.now(timezone.utc).strftime("%Y%m%d")
     parts = []
     trades_file = _LOGS / "trades.jsonl"
     if trades_file.exists():
@@ -450,10 +463,20 @@ def _ctx_quant_routine() -> str:
         except Exception:
             pass
     parts.append(
-        "Task: Analyse the recent trades. For each confluence (FVG, OB, M5, H4, HTF_level, "
-        "continuation): compute observed win rate, compare to current Bayesian lift, flag any "
-        "lift that is overfit or wrong. Output: updated lift recommendations and a risk finding "
-        "summary. Write to Brain vault as Quant/performance_YYYYMMDD.md."
+        f"Task: Analyse the recent trades. For each confluence key (fvg_present, ob_present, "
+        f"m5_confirmed, h4_aligned, at_htf_level, order_flow_aligned, continuation_type): "
+        f"compute observed win rate from the trade data above, compare to the current lift in "
+        f"prob_model_state.json, and recommend an adjusted lift where the data justifies it.\n\n"
+        f"REQUIRED OUTPUT (two parts, both mandatory):\n"
+        f"1. Write a JSON file to EXACTLY this path: "
+        f"C:\\Users\\anton\\Documents\\trading-bot\\logs\\quant_lift_proposals.json\n"
+        f"   Format: {{\"confluences\": {{\"fvg_present\": 1.28, \"ob_present\": 1.20, ...}}, "
+        f"\"ts\": \"ISO timestamp\", \"n_trades_analysed\": N}}\n"
+        f"   Only include keys where observed WR meaningfully differs from current lift. "
+        f"This file is machine-read by the trading bot.\n\n"
+        f"2. Write a markdown analysis to Brain vault: "
+        f"C:\\Users\\anton\\OneDrive\\Desktop\\Aiden\\AiDEN\\Brain\\Quant\\performance_{now_str}.md\n"
+        f"   Include: WR table per confluence, lift recommendations, risk findings."
     )
     return "\n\n".join(parts)
 
@@ -524,6 +547,13 @@ def _check_cadre_scheduled() -> None:
         # ── Quant: routine performance review every 2 hours ───────────────────
         if _sched_due(state, "quant_routine", _QUANT_INTERVAL):
             logger.info("[Council] Quant — routine performance review (2-hour tick)")
+            # Log current model confidence before invoking Quant
+            try:
+                from execution.probability_model import ProbabilityModel
+                _pm = ProbabilityModel()
+                logger.info("[Council] %s", _pm.confidence_report())
+            except Exception:
+                pass
             _fire_cadre("MEM-002", "daily_loss_review", _ctx_quant_routine())
             _sched_mark(state, "quant_routine")
 
