@@ -1,120 +1,82 @@
-# Trading Bot (Forex/Indices) — Backtesting First
+# AiDEN Trading Bot — FTMO Prop-Firm Execution System
 
-Status: project skeleton only. No strategy, data, or execution logic yet.
+Autonomous Python/MT5 trading system for FTMO challenges. FVG + Order Block
+confluence on M15/H1, fully bidirectional across forex, metals, and index CFDs,
+governed by a Bayesian probability model, an active market-context agent, and
+an always-on compliance daemon.
 
-## Project layout
+**Demo accounts only.** `trading.allow_real_account: false` is a hard invariant.
+
+## Architecture
 
 ```
 trading-bot/
-├── data/
-│   ├── raw/          # untouched historical exports from MT5 (gitignored)
-│   └── processed/    # cleaned/validated data used by the backtester (gitignored)
-├── strategies/        # strategy logic (signal generation)
-├── backtests/         # backtesting engine + run scripts
-├── execution/         # order execution / broker connectivity (MT5) - live phase
-├── logs/              # runtime logs (gitignored)
-├── config/
-│   ├── config.example.yaml  # template - copy to config.yaml
-│   └── config.yaml          # your local settings (gitignored, not yet created)
-├── tests/             # unit/integration tests
-├── .env.example       # template for MT5 credentials - copy to .env
-├── requirements.txt
-└── venv/              # Python virtual environment (gitignored)
+├── execution/
+│   ├── orchestrator.py          # main daemon: per-symbol engines, RiskGuard, reconciler
+│   ├── probability_model.py     # Bayesian P(win) + quarter-Kelly sizing, live-updated lifts
+│   ├── market_context_agent.py  # HTF level intelligence: blocks entries fighting key levels
+│   ├── trade_analyzer.py        # structural stops/targets, post-trade thesis validation
+│   ├── trade_manager.py         # in-trade management (trail, partials, counter-signals)
+│   ├── risk_agent.py            # per-trade risk config + circuit breakers
+│   ├── ftmo_tracker.py          # challenge progress, daily/total DD anchored to live equity
+│   ├── council_watch.py         # standalone enforcement daemon + Cadre agent scheduler
+│   ├── cadre_invoke.py          # Sage/Quant/Builder/Scout headless invocations (claude -p)
+│   ├── level_monitor.py         # weekly/daily/session key levels
+│   ├── order_flow.py            # tick-volume delta, DOM walls (bookmap-lite)
+│   └── news_gate.py             # macro event windows
+├── strategies/                  # AiDEN Index v2 (FVG+OB confluence scoring)
+├── backtests/                   # engine + multi-instrument runners
+├── tests/                       # pytest suite (gates, tracker, risk, portfolio)
+├── config/config.example.yaml   # template — copy to config.yaml (gitignored)
+└── scripts/                     # setup, VPS bootstrap, watchdog, utilities
 ```
 
-## Setup
+## Entry defense layers
+
+Every entry passes ~14 sequential gates: council halt flag → DD circuit breakers
+→ FTMO limits → market-context block → continuation gates → Bayesian EV gate →
+portfolio risk cap → min-stop floor (0.75 ATR) → no naked orders → burned-target
+guard (90 min) → duplicate guard → liquidity thesis (NO-DRAW) → per-trade agent
+verdict → optional Telegram approval. Sizing is quarter-Kelly from P(win),
+scaled by context lift and concentration, bounded by a 4% portfolio cap.
+
+## Cadre agent loops (autonomous)
+
+| Agent | Cadence | Output |
+|-------|---------|--------|
+| Scout | 30 min | `logs/cadre_regime_state.json` → DXY/regime alignment into entry confluences |
+| Quant | 2 h + every trade close | `logs/quant_lift_proposals.json` → Bayesian lift corrections |
+| Builder | hourly error scan | targeted code fixes on new ERROR/CRITICAL log entries |
+| Sage | Mon 07:00 UTC | weekly strategy/regime review |
+
+## Running
 
 ```powershell
-# Activate the virtual environment
 .\venv\Scripts\Activate.ps1
-
-# Install dependencies
 pip install -r requirements.txt
+copy config\config.example.yaml config\config.yaml   # then fill in MT5 details
 
-# Create your local config from the templates
-copy config\config.example.yaml config\config.yaml
-copy .env.example .env
-```
+# Main bot (PID-locked — refuses to double-start):
+python -m execution.orchestrator
 
-Then edit `config.yaml` (symbols, timeframe, MT5 terminal path) and `.env`
-(MT5 login/password/server) with your real values. Neither file is committed
-to version control.
+# Compliance daemon (run beside the bot, separate process):
+python -m execution.council_watch          # or --once for a single health check
 
-## Running the data pipeline
-
-```powershell
-# Activate venv first, then:
-python -m data.pipeline
-
-# Re-process existing raw files without hitting MT5 again:
-python -m data.pipeline --skip-fetch
-
-# Validate processed output:
+# Tests:
 pytest
 ```
 
-## Full comparison (all strategies × all symbols × all years)
+## Backtesting
 
 ```powershell
-# Print ranked results table in the terminal:
-python -m backtests.run_compare
-
-# Single symbol only:
-python -m backtests.run_compare --symbol XAUUSD
-
-# Save CSV report + comparison charts:
-python -m backtests.run_compare --save --charts
+python -m backtests.run_compare                    # all strategies × symbols × years
+python -m backtests.run_multi_instrument           # FTMO multi-engine simulation
 ```
 
-The output ranks every strategy per symbol per year by return, then prints a
-"Best strategy" summary at the end showing the winner for each symbol/year.
+## Key runtime state (logs/, gitignored)
 
-## Running a single backtest
-
-```powershell
-# Run one strategy against all configured symbols:
-python -m backtests.run_backtest --strategy sma_crossover
-python -m backtests.run_backtest --strategy rsi
-python -m backtests.run_backtest --strategy macd
-python -m backtests.run_backtest --strategy bollinger_bands
-
-# Run all strategies on one symbol and compare on a chart:
-python -m backtests.run_backtest --strategy all --symbol XAUUSD --compare --chart
-
-# Save charts to logs/reports/:
-python -m backtests.run_backtest --strategy all --symbol US30 --compare --save-charts
-
-# Custom capital / commission:
-python -m backtests.run_backtest --capital 50000 --commission 0.00005
-```
-
-Available strategies: `sma_crossover`, `rsi`, `macd`, `bollinger_bands`
-
-## Live trading
-
-Make sure MT5 is open and logged into your account first.
-
-```powershell
-# Dry run — logs signals, places no real orders (always start here):
-python -m execution.live_runner --dry-run
-
-# Live on a single symbol:
-python -m execution.live_runner --symbol XAUUSD --strategy rsi
-
-# Live on all configured symbols simultaneously (one thread per symbol):
-python -m execution.live_runner --strategy macd
-
-# Stop: Ctrl+C — open positions are left as-is (bot doesn't force-close on exit)
-```
-
-> **Safety**: the bot blocks trading on real accounts unless you explicitly set
-> `trading.allow_real_account: true` in `config.yaml`. Always test on demo first.
-
-## Roadmap
-
-1. [x] Project skeleton
-2. [x] Historical data loader/validator (MT5 -> data/raw -> data/processed)
-3. [x] Backtesting engine
-4. [x] Strategies: SMA crossover, RSI, MACD, Bollinger Bands
-5. [x] Performance reporting (equity curve + drawdown charts, comparison overlay)
-6. [x] Live execution via MT5
+- `ftmo_tracker_state.json` — challenge progress; `day_start_equity` anchors daily DD
+- `prob_model_state.json` — live Bayesian lift table
+- `burned_targets.json` — 90-min re-entry blocks per direction+target
+- `council_halt.flag` — external halt; orchestrator refuses new entries while present
+- `trades.jsonl` — full trade journal with thesis validation and lessons
