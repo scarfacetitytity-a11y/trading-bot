@@ -24,7 +24,21 @@ from typing import Optional
 
 logger = logging.getLogger(__name__)
 
-VAULT = Path(r"C:\Users\anton\OneDrive\Desktop\Aiden")
+
+def _get_vault() -> Path:
+    """Resolve vault path from config, with fallback to local default."""
+    try:
+        from config.settings import load_config
+        cfg = load_config()
+        vp = cfg.get("obsidian", {}).get("vault_path")
+        if vp:
+            return Path(vp)
+    except Exception:
+        pass
+    return Path(r"C:\Users\anton\OneDrive\Desktop\Aiden")
+
+
+VAULT = _get_vault()
 AIDEN = VAULT / "AiDEN"
 
 

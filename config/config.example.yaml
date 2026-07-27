@@ -6,6 +6,11 @@ mt5:
   # Path to terminal64.exe. Update this to match your installed MT5 terminal.
   terminal_path: "C:/Program Files/MetaTrader 5/terminal64.exe"
 
+obsidian:
+  # Path to the Obsidian vault root. Override in config.yaml for your machine.
+  # VPS example: "C:/aiden-vault" (set up OneDrive sync there, or use a local path)
+  vault_path: "C:/Users/YOUR_USERNAME/OneDrive/Desktop/Aiden"
+
 data:
   symbols:
     - XAUUSD
