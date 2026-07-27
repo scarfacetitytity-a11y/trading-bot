@@ -29,6 +29,7 @@ import argparse
 import json
 import logging
 import math
+import os
 import sys
 import time
 import threading
@@ -63,6 +64,8 @@ from execution.ftmo_tracker import FTMOTracker
 from execution.trade_journal import TradeJournal
 from execution.portfolio_manager import PortfolioAllocator, PortfolioBook, OpenPos, Trim
 from execution.level_monitor import LevelMonitor
+from execution.market_context_agent import MarketContextAgent, MarketContext
+from execution.probability_model import ProbabilityModel, TradeConfluences
 from execution.order_flow import analyse_order_flow, order_flow_score_modifier, get_dom_key_levels
 from execution import telegram_notify as tg
 from backtests.run_multi_instrument import (
@@ -831,6 +834,9 @@ class TradingEngine(Component):
         self._adaptive_port    = bool(trade_cfg.get("adaptive_portfolio", False))
         self._lookback         = trade_cfg.get("lookback_bars", 500)
         self._level_monitor:   Optional[LevelMonitor] = None
+        self._mc_agent:        Optional[MarketContextAgent] = None
+        self._prob_model:      ProbabilityModel = ProbabilityModel()
+        self._open_confluences: Optional[TradeConfluences] = None  # confluences at entry time
         self._news_gate:        Optional[ng.NewsGate] = None
         self._event_dir_cache: dict[str, int] = {}
         self._trade_manager:   TradeManager = TradeManager()
@@ -1055,6 +1061,7 @@ class TradingEngine(Component):
         self._consecutive_waits      = 0
         self._entry_cooldown_until   = 0.0
         self._last_partial_bar       = 0
+        self._open_confluences       = None
         self._scaled_in              = False
         self._pending_signal    = 0
         self._pending_bars      = 0
@@ -1142,6 +1149,25 @@ class TradingEngine(Component):
                 logger.info("[%s] Council: %s", self.name, note)
 
         if action.action == ActionType.EXIT:
+            # Bayesian update: did this trade win? Feed outcome back to probability model.
+            _exit_r = action.counter_score   # counter_score used as proxy; reconciler computes real R
+            _won = pos.profit > 0 if hasattr(pos, "profit") else False
+            if self._open_confluences is not None:
+                try:
+                    _confl_dict = {
+                        "fvg_present":        self._open_confluences.fvg_present,
+                        "ob_present":         self._open_confluences.ob_present,
+                        "m5_confirmed":       self._open_confluences.m5_confirmed,
+                        "h4_aligned":         self._open_confluences.h4_aligned,
+                        "at_htf_level":       self._open_confluences.at_htf_level,
+                        "order_flow_aligned": self._open_confluences.order_flow_aligned,
+                        "dom_aligned":        self._open_confluences.dom_aligned,
+                        "news_aligned":       self._open_confluences.news_aligned,
+                        "continuation_type":  self._open_confluences.trade_type == "continuation",
+                    }
+                    self._prob_model.update_from_outcome(_confl_dict, _won)
+                except Exception:
+                    pass
             if not self._dry_run:
                 trader.close_all(self._symbol)
                 self._record_close_now()   # prompt, deduped accounting
@@ -2197,46 +2223,62 @@ class TradingEngine(Component):
                                     "counter-trend" if against_trend else "with-trend")
                         continue
 
-                    # Quality-scaled risk (JP mentor): size scales DOWN for borderline setups.
-                    # A soldier executes on strategy; he doesn't double-down on a shaky setup.
-                    # 99% of prop account blowups = oversized trades that weren't that great.
-                    _score_over_floor = signal_score - needed
-                    if _score_over_floor <= 0:
-                        score_mult = 0.25   # floor entry — borderline
-                    elif _score_over_floor == 1:
-                        score_mult = 0.50   # decent setup
-                    elif _score_over_floor == 2:
-                        score_mult = 1.00   # solid setup — full risk
-                    elif _score_over_floor == 3:
-                        score_mult = 1.50   # high conviction
-                    else:
-                        score_mult = 2.00   # exceptional — 4+ over floor
+                    # ── MarketContextAgent — structural environment check ──────
+                    # Consult the active level-intelligence agent before sizing.
+                    # It tells us: are we AT a level? Fighting one? What direction?
+                    _mc_ctx: Optional[MarketContext] = None
+                    if self._mc_agent is not None and df is not None:
+                        _mc_ctx = self._mc_agent.assess(self._symbol, df, atr_entry or 1.0, desired)
+                        if _mc_ctx.council_notes:
+                            for _cn in _mc_ctx.council_notes:
+                                logger.info("[%s] %s", self.name, _cn)
+                        if _mc_ctx.entry_block:
+                            logger.info("[%s] MCAgent BLOCK: %s", self.name, _mc_ctx.narrative)
+                            continue
 
                     # Continuation trades have 0% live WR — require 2 extra score points
                     # above floor before allowing. At floor+0 or floor+1 = skip, not reduce.
                     _plan_type = self._last_plan.trade_type if self._last_plan else "breakout"
+                    _score_over_floor = signal_score - needed
                     if _plan_type == "continuation" and _score_over_floor < 2:
                         logger.info("[%s] CONTINUATION GATE: score only %d over floor — skipping (need +2)",
                                     self.name, _score_over_floor)
                         continue
 
-                    # RR bonus: scale up when reward is large relative to risk.
-                    # Mentor logic: 1:10 RR clean trade = bigger position, not the same as 1:2.5.
-                    _plan_rr = self._last_plan.rr if self._last_plan else 0.0
-                    if _plan_rr >= 8.0:
-                        rr_mult = 2.0
-                    elif _plan_rr >= 5.0:
-                        rr_mult = 1.5
-                    elif _plan_rr >= 3.5:
-                        rr_mult = 1.2
-                    else:
-                        rr_mult = 1.0
+                    # ── Bayesian probability model — replaces flat score_mult ──
+                    # Build confluence inputs from what's confirmed above.
+                    _plan_rr   = self._last_plan.rr if self._last_plan else 2.5
+                    _confl = TradeConfluences(
+                        fvg_present        = True,        # strategy fires on FVG detection
+                        ob_present         = _score_over_floor >= 1,
+                        m5_confirmed       = m5_confirmed,
+                        h4_aligned         = getattr(self._strategy, "_last_h4_bias", 0) == desired,
+                        at_htf_level       = bool(_mc_ctx and _mc_ctx.at_level),
+                        level_strength     = _mc_ctx.level_strength if _mc_ctx else 0.0,
+                        order_flow_aligned = bool(_of_mod > 0) if "_of_mod" in dir() else False,
+                        dom_aligned        = False,   # DOM data populated via separate path
+                        news_aligned       = news_dir == desired if news_dir != 0 else False,
+                        trade_type         = _plan_type,
+                        rr                 = _plan_rr,
+                    )
+                    _prob = self._prob_model.estimate(_confl)
+
+                    if not _prob.take_trade:
+                        logger.info("[%s] PROB MODEL skip: %s", self.name, _prob.note)
+                        continue
+
+                    # score_mult driven by probability model output
+                    score_mult = _prob.size_mult
+
+                    # Apply MarketContextAgent probability lift on top
+                    if _mc_ctx is not None:
+                        score_mult *= _mc_ctx.probability_lift
 
                     # Concentration mult: fewer concurrent positions = more size per trade
                     # 0-1 open → 2x  |  2-3 open → 1.5x  |  4+ open → 1x
                     n_open = len(trader.get_all_positions())   # magic-filtered (H3)
                     concentration_mult = 2.0 if n_open <= 1 else (1.5 if n_open <= 3 else 1.0)
-                    combined_mult = size_mult * score_mult * rr_mult * concentration_mult
+                    combined_mult = size_mult * score_mult * concentration_mult
 
                     # ── Portfolio risk management (Council #03/#05) ────────────
                     base_risk = float(self._trade_cfg.get("risk_pct", 1.0))
@@ -2370,6 +2412,7 @@ class TradingEngine(Component):
                             self._bars_since_entry        = 0
                             self._entry_cooldown_until    = time.time() + 60  # 60s grace: block TM exits at bar-open
                             self._last_partial_bar        = 0
+                            self._open_confluences        = _confl  # saved for Bayesian update at close
                             self._save_position_state()
                             if self._risk_agent is not None:
                                 self._risk_agent.record_entry()
@@ -2596,6 +2639,7 @@ class Orchestrator:
             )
             engine._news_gate     = self._news_gate
             engine._level_monitor = level_monitor
+            engine._mc_agent      = MarketContextAgent(level_monitor)
             engine._cousin_router = cousin_router
             components.append(engine)
 
@@ -2735,6 +2779,31 @@ class Orchestrator:
 
 # ── Entry point ───────────────────────────────────────────────────────────────
 
+def _acquire_pid_lock() -> Path:
+    """Ensure only one instance of the bot runs at a time.
+
+    Writes our PID to logs/bot.pid. If a prior PID file exists and the
+    process is still alive, aborts immediately. This prevents the double-entry
+    bug where two instances trade the same instruments and fight each other.
+    """
+    pid_path = Path("logs/bot.pid")
+    pid_path.parent.mkdir(parents=True, exist_ok=True)
+    if pid_path.exists():
+        try:
+            existing_pid = int(pid_path.read_text().strip())
+            import psutil
+            if psutil.pid_exists(existing_pid):
+                raise SystemExit(
+                    f"Bot already running (PID {existing_pid}). "
+                    f"Stop the existing instance before starting a new one. "
+                    f"If it crashed, delete logs/bot.pid manually."
+                )
+        except (ValueError, ImportError):
+            pass  # psutil not installed or corrupt file — overwrite
+    pid_path.write_text(str(os.getpid()))
+    return pid_path
+
+
 def main():
     parser = argparse.ArgumentParser(description="Trading bot orchestrator.")
     parser.add_argument("--dry-run", action="store_true",
@@ -2744,17 +2813,21 @@ def main():
     parser.add_argument("--config", default=None)
     args = parser.parse_args()
 
-    cfg     = load_config(*([args.config] if args.config else []))
-    log_cfg = cfg.get("logging", {})
-    setup_logger(
-        "",
-        log_dir=log_cfg.get("log_dir", "logs"),
-        log_file="orchestrator.log",
-        level=log_cfg.get("level", "INFO"),
-    )
+    pid_path = _acquire_pid_lock()
+    try:
+        cfg     = load_config(*([args.config] if args.config else []))
+        log_cfg = cfg.get("logging", {})
+        setup_logger(
+            "",
+            log_dir=log_cfg.get("log_dir", "logs"),
+            log_file="orchestrator.log",
+            level=log_cfg.get("level", "INFO"),
+        )
 
-    orch = Orchestrator(cfg, dry_run=args.dry_run, symbol_override=args.symbol)
-    orch.start()
+        orch = Orchestrator(cfg, dry_run=args.dry_run, symbol_override=args.symbol)
+        orch.start()
+    finally:
+        pid_path.unlink(missing_ok=True)
 
 
 if __name__ == "__main__":

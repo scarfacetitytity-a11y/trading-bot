@@ -34,7 +34,7 @@ from execution.signal_detectors import _swing_highs, _swing_lows
 
 # ── Tunables ──────────────────────────────────────────────────────────────────
 MIN_RR_TRADEABLE   = 1.2    # below this, the draw is too close to be worth the risk
-MAX_REACH_ATR      = 8.0    # a target beyond this many ATR is not "in reach" this session
+MAX_REACH_ATR      = 5.0    # a target beyond this many ATR is not reachable this session
 EQ_TOLERANCE_ATR   = 0.15   # equal-high/low cluster tolerance
 MIN_BEYOND_ATR     = 0.5    # target must sit at least this far beyond entry to count
 SWING_ORDER        = 3
@@ -569,25 +569,36 @@ def analyze_exit(
     hit_target = ((direction == 1 and path_high >= target) or
                   (direction == -1 and path_low <= target))
 
-    # Thesis valid if the trade paid at least +1R of favourable movement.
-    thesis_valid = mfe_R >= 1.0
+    # Thesis valid if price moved at least 0.3R in the right direction.
+    # Using 1.0R caused every early-exited trade to show thesis_valid=False even
+    # when direction was correct — exit bugs were masking real thesis quality.
+    thesis_valid = mfe_R >= 0.3
 
     notes = []
     if mfe_R >= 2.0 and exit_R < 1.0:
         notes.append(f"gave back a {mfe_R:.1f}R winner — exit/trail too loose")
-    if not thesis_valid and reason == "SL":
-        notes.append("stopped with <1R favourable — entry too early or wrong draw")
-    if hit_target:
-        notes.append("reached liquidity target — thesis confirmed")
     if mae_R < -0.9 and exit_R > 0:
         notes.append(f"dipped to {mae_R:.1f}R before working — stop was well placed")
-
     if hit_target:
-        lesson = "target hit — repeat this setup profile"
+        notes.append("reached liquidity target — thesis confirmed")
+    if not thesis_valid and reason == "SL":
+        notes.append("never moved in our direction — entry or draw was wrong")
+    if thesis_valid and not hit_target and exit_R < 0:
+        notes.append("right direction but exit cut it short — management issue not thesis")
+
+    # Specific, contextual lessons — not one static string
+    if hit_target:
+        lesson = "target hit — repeat this setup profile; same level/structure quality"
+    elif thesis_valid and mfe_R >= 1.5:
+        lesson = f"trade worked to {mfe_R:.1f}R then exited at {exit_R:.1f}R — tighten trail or extend TP earlier"
+    elif thesis_valid and mfe_R >= 0.5:
+        lesson = f"correct direction ({mfe_R:.1f}R MFE), early exit killed it — management or entry-cooldown bug"
     elif thesis_valid:
-        lesson = "right direction, exit management left R on the table"
+        lesson = f"directionally correct but only {mfe_R:.1f}R — entry was too early or level was too weak"
+    elif mae_R < -0.7:
+        lesson = f"never worked: dipped straight to {mae_R:.1f}R — draw/target read wrong or entry against HTF level"
     else:
-        lesson = "thesis failed — draw/target read was wrong, review entry context"
+        lesson = f"flat/neutral from entry (MFE {mfe_R:.1f}R, MAE {mae_R:.1f}R) — no thesis, skip this setup profile"
 
     return TradeReview(
         hit_target=hit_target, exit_R=round(exit_R, 2),
