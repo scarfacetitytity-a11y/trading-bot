@@ -76,7 +76,13 @@ from backtests.run_multi_instrument import (
 logger = logging.getLogger(__name__)
 
 # ── Risk limits (Council of 12 — tighter than FTMO stated limits) ────────────
-MAX_DAILY_LOSS_PCT  = 2.0   # circuit breaker: halt all new entries (FTMO limit 5%)
+# Daily DD: tiered gating, not a flat halt. Score floor rises as loss grows.
+# Tiers: 1.5% → +1 score, 2.5% → +2 score, 3.5% → +3 score, 4.0% → hard halt.
+# Preserves 1% buffer to FTMO's 5% daily limit.
+MAX_DAILY_LOSS_PCT  = 4.0   # hard daily halt (FTMO limit 5%) — was 2.0 flat block
+DAILY_DD_TIER1_PCT  = 1.5   # score floor +1
+DAILY_DD_TIER2_PCT  = 2.5   # score floor +2
+DAILY_DD_TIER3_PCT  = 3.5   # score floor +3
 SOFT_DD_HALT_PCT    = 7.0   # soft halt: no new entries, let open trades run (FTMO limit 10%)
 MAX_TOTAL_LOSS_PCT  = 9.5   # hard kill switch: emergency close all (FTMO 10% hard floor)
 MAX_RECONNECT_TRIES = 5
@@ -557,9 +563,9 @@ class RiskGuard(Component):
             msg = (f"eq={equity:.2f} daily={daily_pct:+.2f}% total={total_pct:+.2f}%"
                    f"{' [SOFT-HALT]' if self._soft_halt.is_set() else ''}")
 
-            # Tier 1: daily circuit breaker — halt new entries for rest of server day
+            # Tier 1: daily hard halt at 4% — score tiers (1.5/2.5/3.5%) gate entries before this
             if daily_pct <= -self._daily_halt_pct and not self._soft_halt.is_set():
-                logger.critical("[RiskGuard] DAILY CIRCUIT BREAKER: %.2f%% — no new entries today", daily_pct)
+                logger.critical("[RiskGuard] DAILY HARD HALT: %.2f%% — no new entries today", daily_pct)
                 self._soft_halt.set()
                 self._halt_cause = "daily"
                 self._save_state()
@@ -2045,10 +2051,9 @@ class TradingEngine(Component):
                         except Exception:
                             pass
 
-                    # Soft halt check (2% daily or 7% cumulative DD).
-                    # Also compute inline — RiskGuard background thread ticks every 60s
-                    # so a loss that breaches the daily limit may not have set the flag
-                    # yet. Engines recheck equity directly so no trade slips through.
+                    # Hard halt check (4% daily or 7% cumulative DD).
+                    # RiskGuard sets soft_halt at those limits; engines also check inline
+                    # since the background thread ticks every 60s.
                     if self._soft_halt is not None and self._soft_halt.is_set():
                         logger.warning("[%s] SOFT HALT active — blocking new entry", self.name)
                         continue
@@ -2061,12 +2066,27 @@ class TradingEngine(Component):
                             _inline_daily_dd = (_rg_day_eq - equity) / _rg_day_eq * 100
                             if _inline_daily_dd >= _rg_daily_limit:
                                 logger.critical(
-                                    "[%s] INLINE DAILY DD GATE: %.2f%% >= %.2f%% limit — blocking entry, "
+                                    "[%s] INLINE DAILY DD GATE: %.2f%% >= %.2f%% hard limit — blocking entry, "
                                     "setting soft halt", self.name, _inline_daily_dd, _rg_daily_limit
                                 )
                                 if self._soft_halt is not None:
                                     self._soft_halt.set()
                                 continue
+                            # Tiered daily DD score boost — gates marginal trades before hard halt
+                            _daily_boost = 0
+                            if _inline_daily_dd >= DAILY_DD_TIER3_PCT:
+                                _daily_boost = 3
+                            elif _inline_daily_dd >= DAILY_DD_TIER2_PCT:
+                                _daily_boost = 2
+                            elif _inline_daily_dd >= DAILY_DD_TIER1_PCT:
+                                _daily_boost = 1
+                            if _daily_boost:
+                                old_needed = needed
+                                needed = needed + _daily_boost
+                                logger.info(
+                                    "[%s] Daily DD tier (%.2f%%) — score floor %d→%d (+%d)",
+                                    self.name, _inline_daily_dd, old_needed, needed, _daily_boost,
+                                )
                         if _rg_init_eq and _rg_init_eq > 0:
                             _inline_total_dd = (_rg_init_eq - equity) / _rg_init_eq * 100
                             if _inline_total_dd >= _rg_soft_limit:
