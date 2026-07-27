@@ -27,6 +27,7 @@ logger = logging.getLogger("cadre_invoke")
 CADRE_SCOPE = {
     "MEM-001": {  # Sage — Strategist
         "name": "Sage",
+        "model": "claude-fable-5",   # strategy reasoning needs the top model
         "triggers": ["weekly_strategy_review", "regime_shift", "strategy_evolution"],
         "prompt_template": (
             "You are Sage (MEM-001), AiDEN's Strategist. Your role: high-level trading strategy, "
@@ -52,6 +53,7 @@ CADRE_SCOPE = {
     },
     "MEM-003": {  # Builder — Engineer
         "name": "Builder",
+        "model": "sonnet",   # autonomous code edits need more than haiku
         "triggers": ["code_fix_needed", "bot_error_detected", "performance_issue"],
         "prompt_template": (
             "You are Builder (MEM-003), AiDEN's Engineer. Your role: bot code, execution logic, "
@@ -124,7 +126,8 @@ def invoke(member_id: str, event: str, extra_context: str = "") -> int:
         # Try PATH
         claude_cmd = "claude"
 
-    cmd = [claude_cmd, "-p", prompt, "--model", "haiku"]
+    model = member.get("model", "haiku")
+    cmd = [claude_cmd, "-p", prompt, "--model", model]
 
     logger.info("[Cadre] Invoking %s (%s) for event: %s", member["name"], member_id, event)
 
