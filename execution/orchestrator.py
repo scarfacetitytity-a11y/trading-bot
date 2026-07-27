@@ -1948,11 +1948,7 @@ class TradingEngine(Component):
                             .rolling(14).mean().iloc[-1]
                         )
                     m5_confirmed = detect_m5_entry_trigger(df_m5_entry, desired, atr=atr_entry)
-                    if m5_confirmed:
-                        signal_score += 1   # M5 structure break = extra confluence
-                        _extra_reasons.append("M5 structure confirmed")
-                        logger.info("[%s] M5 confirmed — +1 score → %d", self.name, signal_score)
-                    else:
+                    if not m5_confirmed:
                         logger.info("[%s] M5 not confirmed — entering anyway (confluence only)", self.name)
 
                     # ── Accumulation / distribution gate ─────────────────────
@@ -2023,7 +2019,11 @@ class TradingEngine(Component):
                     # Score-based sizing: psychology_mult * score_mult * concentration_mult
                     _sc          = getattr(self._strategy, "_scores", None)
                     signal_score = int(_sc.iloc[-1]) if _sc is not None else 0
-                    # _extra_reasons already initialised in M5 block above
+                    # M5 confluence bonus applied here after base score is loaded
+                    if m5_confirmed:
+                        signal_score += 1
+                        _extra_reasons.append("M5 structure confirmed")
+                        logger.info("[%s] M5 confirmed — +1 score → %d", self.name, signal_score)
 
                     # News gate: price-confirmed direction preferred; consensus as fallback
                     # Amplifier only — never penalises
