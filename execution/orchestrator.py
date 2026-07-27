@@ -2340,6 +2340,28 @@ class TradingEngine(Component):
                                     "counter-trend" if against_trend else "with-trend")
                         continue
 
+                    # ── M1 structural confirmation ─────────────────────────────
+                    # Require the last completed M1 candle to break above/below the
+                    # prior candle's high/low in the trade direction. Filters entries
+                    # where price hasn't shown any intent — the "never worked" class.
+                    _df_m1c = self._fetch_ltf_bars("M1", count=10)
+                    if _df_m1c is not None and len(_df_m1c) >= 3:
+                        _m1_close = float(_df_m1c["close"].iloc[-2])   # last completed bar
+                        _m1_open  = float(_df_m1c["open"].iloc[-2])
+                        _m1_phigh = float(_df_m1c["high"].iloc[-3])    # prior bar
+                        _m1_plow  = float(_df_m1c["low"].iloc[-3])
+                        _m1_bull  = _m1_close > _m1_open and _m1_close > _m1_phigh
+                        _m1_bear  = _m1_close < _m1_open and _m1_close < _m1_plow
+                        _m1_ok    = _m1_bull if desired == 1 else _m1_bear
+                        if not _m1_ok:
+                            logger.info(
+                                "[%s] M1 CONFIRM GATE: no %s structural break — skip "
+                                "(close=%.5f phigh=%.5f plow=%.5f)",
+                                self.name, "bull" if desired == 1 else "bear",
+                                _m1_close, _m1_phigh, _m1_plow,
+                            )
+                            continue
+
                     # ── MarketContextAgent — structural environment check ──────
                     # Consult the active level-intelligence agent before sizing.
                     # It tells us: are we AT a level? Fighting one? What direction?
