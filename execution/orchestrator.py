@@ -1973,7 +1973,13 @@ class TradingEngine(Component):
                         )
                     m5_confirmed = detect_m5_entry_trigger(df_m5_entry, desired, atr=atr_entry)
                     if not m5_confirmed:
-                        logger.info("[%s] M5 not confirmed — entering anyway (confluence only)", self.name)
+                        # Route to pending M5 trigger — never enter without LTF confirmation.
+                        # "entering anyway" produced 0 wins across live testing.
+                        logger.info("[%s] M5 not confirmed — queuing pending trigger (not entering blind)", self.name)
+                        if self._pending_signal == 0:
+                            self._pending_signal = desired
+                            self._pending_bars   = 0
+                        continue
 
                     # ── Accumulation / distribution gate ─────────────────────
                     accum_risk = detect_accumulation(
@@ -2206,11 +2212,31 @@ class TradingEngine(Component):
                     else:
                         score_mult = 2.00   # exceptional — 4+ over floor
 
+                    # Continuation trades have 0% live WR — require 2 extra score points
+                    # above floor before allowing. At floor+0 or floor+1 = skip, not reduce.
+                    _plan_type = self._last_plan.trade_type if self._last_plan else "breakout"
+                    if _plan_type == "continuation" and _score_over_floor < 2:
+                        logger.info("[%s] CONTINUATION GATE: score only %d over floor — skipping (need +2)",
+                                    self.name, _score_over_floor)
+                        continue
+
+                    # RR bonus: scale up when reward is large relative to risk.
+                    # Mentor logic: 1:10 RR clean trade = bigger position, not the same as 1:2.5.
+                    _plan_rr = self._last_plan.rr if self._last_plan else 0.0
+                    if _plan_rr >= 8.0:
+                        rr_mult = 2.0
+                    elif _plan_rr >= 5.0:
+                        rr_mult = 1.5
+                    elif _plan_rr >= 3.5:
+                        rr_mult = 1.2
+                    else:
+                        rr_mult = 1.0
+
                     # Concentration mult: fewer concurrent positions = more size per trade
                     # 0-1 open → 2x  |  2-3 open → 1.5x  |  4+ open → 1x
                     n_open = len(trader.get_all_positions())   # magic-filtered (H3)
                     concentration_mult = 2.0 if n_open <= 1 else (1.5 if n_open <= 3 else 1.0)
-                    combined_mult = size_mult * score_mult * concentration_mult
+                    combined_mult = size_mult * score_mult * rr_mult * concentration_mult
 
                     # ── Portfolio risk management (Council #03/#05) ────────────
                     base_risk = float(self._trade_cfg.get("risk_pct", 1.0))
