@@ -54,6 +54,7 @@ from execution.signal_detectors import (
     detect_m5_entry_trigger, detect_accumulation, detect_liquidity_draw,
 )
 from execution.trade_analyzer import analyze_entry, manage_trade as analyze_manage
+from execution.regime_classifier import classify_regime, entry_gate as regime_entry_gate, size_mult as regime_size_mult
 from execution.trade_agent import TradeAgent
 from strategies.sniper import SniperStrategy
 from strategies.london_breakout import LondonBreakoutStrategy
@@ -2362,6 +2363,27 @@ class TradingEngine(Component):
                             )
                             continue
 
+                    # ── Z-score regime gate (ruflo/neural-trader classifier) ──
+                    # Classifies the symbol's statistical volatility regime from
+                    # M15 closes. Flatline = no edge (skip). Oscillation +
+                    # continuation = ranging context mismatch (skip). Spike = half
+                    # size (extreme event, unpredictable direction).
+                    _plan_type_pre = self._last_plan.trade_type if self._last_plan else "breakout"
+                    _regime_result = None
+                    if df is not None and len(df) >= 20:
+                        import numpy as _np
+                        _regime_result = classify_regime(_np.array(df["close"].values, dtype=float))
+                        _rg_allow, _rg_reason = regime_entry_gate(_regime_result, desired, _plan_type_pre)
+                        if not _rg_allow:
+                            logger.info("[%s] REGIME GATE: %s", self.name, _rg_reason)
+                            continue
+                        if _regime_result:
+                            logger.info(
+                                "[%s] Regime: %s (maxZ=%.2f lastZ=%.2f highPct=%.0f%%)",
+                                self.name, _regime_result.regime, _regime_result.max_z,
+                                _regime_result.last_z, _regime_result.high_count_pct * 100,
+                            )
+
                     # ── MarketContextAgent — structural environment check ──────
                     # Consult the active level-intelligence agent before sizing.
                     # It tells us: are we AT a level? Fighting one? What direction?
@@ -2438,6 +2460,13 @@ class TradingEngine(Component):
                     n_open = len(trader.get_all_positions())   # magic-filtered (H3)
                     concentration_mult = 2.0 if n_open <= 1 else (1.5 if n_open <= 3 else 1.0)
                     combined_mult = size_mult * score_mult * concentration_mult
+
+                    # Spike regime: halve size — extreme Z-score event, direction uncertain
+                    _rg_mult = regime_size_mult(_regime_result)
+                    if _rg_mult < 1.0:
+                        combined_mult *= _rg_mult
+                        logger.info("[%s] REGIME spike — size halved (maxZ=%.2f)",
+                                    self.name, _regime_result.max_z if _regime_result else 0)
 
                     # NY-open whipsaw guard: 14:00 UTC hour is 0/5 live (-0.40R avg).
                     # Half size until a 10+ trade sample says otherwise — not a
