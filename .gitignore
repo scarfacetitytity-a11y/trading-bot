@@ -39,3 +39,6 @@ research/run.log
 # Temp files
 *.b64
 
+
+# Graph exports (regenerated)
+graphify-out/

@@ -109,7 +109,14 @@ def invoke(member_id: str, event: str, extra_context: str = "") -> int:
     if extra_context:
         context = extra_context + "\n\n" + context
 
-    prompt = member["prompt_template"].format(event=event, context=context[:3000])
+    prompt = member["prompt_template"].format(event=event, context=context[:6000])
+    # Scout's persona idles ("ready for work") unless told the task IS this
+    # invocation — observed 2026-07-27: task in Context: block was ignored.
+    prompt += (
+        "\n\nIMPORTANT: The task above is assigned to THIS invocation. Execute it NOW — "
+        "do not report 'ready' or wait for a queued task. Write every required output "
+        "file to the exact paths given before finishing."
+    )
 
     # Find claude CLI
     claude_candidates = [
@@ -130,8 +137,11 @@ def invoke(member_id: str, event: str, extra_context: str = "") -> int:
     # Headless -p runs get no permission prompts — without explicit tool
     # grants the agent cannot write its output files and the feedback loop
     # silently dies at the last step.
+    # Prompt goes via stdin: claude.cmd routes through cmd.exe on Windows,
+    # which truncates multi-line argv — Scout was only seeing line 1 of its
+    # persona and idling with "ready for work".
     cmd = [
-        claude_cmd, "-p", prompt, "--model", model,
+        claude_cmd, "-p", "--model", model,
         "--allowedTools", "Read,Write,Edit,Glob,Grep,Bash,WebSearch,WebFetch",
     ]
 
@@ -140,8 +150,10 @@ def invoke(member_id: str, event: str, extra_context: str = "") -> int:
     try:
         result = subprocess.run(
             cmd,
+            input=prompt,
             capture_output=True,
             text=True,
+            encoding="utf-8",
             timeout=300,
             cwd=str(_BOT_ROOT),
         )
