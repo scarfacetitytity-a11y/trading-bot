@@ -124,7 +124,7 @@ class MarketContextAgent:
                                  "price in open range — neutral, no level context")
 
         at_level   = best_dist_r <= PROXIMITY_STRONG
-        lv_strength = LEVEL_STRENGTH.get(best_level.timeframe, 1.0)
+        lv_strength = LEVEL_STRENGTH.get(best_level.source_tf, 1.0)
 
         # ── Direction bias from the level ──────────────────────────────────────
         # A resistance level above price → favor shorts (bias = -1)
@@ -172,7 +172,7 @@ class MarketContextAgent:
         # ── Council notes ──────────────────────────────────────────────────────
         council = []
         dist_str = f"{best_dist_r:.1f} ATR"
-        lv_str   = f"{best_level.name} @ {best_level.price:.5g}"
+        lv_str   = f"{best_level.label} @ {best_level.price:.5g}"
 
         if fighting_level:
             council.append(
@@ -198,7 +198,7 @@ class MarketContextAgent:
             )
             council.append(
                 f"[C06 App Engineer] prob_lift={prob_lift:.2f} — size up proportionally. "
-                f"Being at a {best_level.timeframe} level is the edge; respect it."
+                f"Being at a {best_level.source_tf} level is the edge; respect it."
             )
         elif approaching_against:
             council.append(
@@ -210,7 +210,7 @@ class MarketContextAgent:
         position = "AT" if at_level else f"{dist_str} from"
         if fighting_level:
             narrative = (f"BLOCKED — {position} {best_level.name} "
-                         f"({best_level.timeframe} {_dir_name(best_level.direction)}), "
+                         f"({best_level.source_tf} {_dir_name(best_level.direction)}), "
                          f"proposed {_dir_name(direction)} fights it")
         elif at_level and level_bias == direction:
             narrative = (f"CLEAN ENTRY — {position} {best_level.name} "
@@ -232,7 +232,7 @@ class MarketContextAgent:
             entry_block      = fighting_level,
             probability_lift = prob_lift,
             at_level         = at_level,
-            level_name       = best_level.name,
+            level_name       = best_level.label,
             level_strength   = lv_strength,
             narrative        = narrative,
             council_notes    = council,
