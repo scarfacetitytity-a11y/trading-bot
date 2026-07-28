@@ -1,0 +1,71 @@
+mt5:
+  terminal_path: "C:/Program Files/MetaTrader 5/terminal64.exe"
+
+data:
+  symbols:
+    - GBPUSD
+    - EURUSD
+    - USDJPY
+    - XAUUSD
+    - US100.cash
+    - US30.cash
+    - US500.cash
+    - US2000.cash
+    - UK100.cash
+    - JP225.cash
+    - XAGUSD
+
+  timeframe: M15
+  start_date: null
+  end_date: null
+  num_bars: 50000
+
+logging:
+  level: INFO
+  log_dir: logs
+  log_file: data_pipeline.log
+
+trading:
+  strategy: aiden_index
+  initial_equity: 100000
+  ftmo_challenge: 2step-p1
+  magic: 234001
+  lookback_bars: 500
+
+  risk_mode: risk_pct
+  risk_pct: 0.75
+  allow_real_account: false
+
+  adaptive_portfolio: true
+  max_portfolio_risk_pct: 4.0
+  realloc_score_edge: 1
+  min_trade_risk_pct: 0.5
+  ftmo_daily_limit_pct: 5.0
+  daily_guard_buffer_pct: 0.75
+  bank_tp_r: 2.5
+  prevent_weekend_entries: false
+
+  min_entry_score: 5
+  min_entry_score_counter: 6
+  dd_score_boost: 2
+  dd_score_boost_threshold: 1.5
+  min_stop_atr_mult: 0.5
+  min_stop_pct: 0.05
+  max_notional_x: 30
+
+  sessions:
+    GBPUSD:      {start: 7,  end: 21}
+    EURUSD:      {start: 7,  end: 21}
+    USDJPY:      {start: 0,  end: 21}
+    XAUUSD:      {start: 7,  end: 21}
+    US100.cash:  {start: 12, end: 21}
+    US30.cash:   {start: 12, end: 21}
+    US500.cash:  {start: 12, end: 21}
+    US2000.cash: {start: 12, end: 21}
+    UK100.cash:  {start: 7,  end: 17}
+    JP225.cash:  {start: 0,  end: 9}
+    XAGUSD:      {start: 12, end: 21}
+
+  daily_halt_pct:   4.0
+  soft_dd_halt_pct: 9.0
+  total_kill_pct:   9.5
