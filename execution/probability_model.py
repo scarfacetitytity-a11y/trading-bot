@@ -76,6 +76,9 @@ class TradeConfluences:
     trade_type:        str   = "breakout"   # breakout | continuation | sweep_reversal
     # Execution
     rr:                float = 2.5
+    # ICT / JP methodology
+    in_ict_macro:      bool  = False   # bar inside an ICT algorithm delivery window
+    ipda_aligned:      bool  = False   # direction aligns with 20/40/60-day IPDA delivery
 
 
 @dataclass
@@ -116,6 +119,8 @@ class ProbabilityModel:
             "dom_aligned":        {"lift": 1.15, "n_obs": 0, "n_win": 0},
             "news_aligned":       {"lift": 1.20, "n_obs": 0, "n_win": 0},
             "continuation_type":  {"lift": 0.75, "n_obs": 0, "n_win": 0},  # live: 0% WR → strong prior penalty
+            "in_ict_macro":       {"lift": 1.15, "n_obs": 0, "n_win": 0},  # ICT delivery window — modest prior, unvalidated live
+            "ipda_aligned":       {"lift": 1.20, "n_obs": 0, "n_win": 0},  # price at IPDA extreme, delivery toward target
         }
         self._load_state()
 
@@ -166,6 +171,14 @@ class ProbabilityModel:
         if c.trade_type == "continuation":
             log_odds += math.log(self._lifts["continuation_type"]["lift"])
             lifts_applied.append(f"Continuation(x{self._lifts['continuation_type']['lift']:.2f})")
+
+        if c.in_ict_macro:
+            log_odds += math.log(self._lifts["in_ict_macro"]["lift"])
+            lifts_applied.append(f"ICT_Macro(x{self._lifts['in_ict_macro']['lift']:.2f})")
+
+        if c.ipda_aligned:
+            log_odds += math.log(self._lifts["ipda_aligned"]["lift"])
+            lifts_applied.append(f"IPDA(x{self._lifts['ipda_aligned']['lift']:.2f})")
 
         # Convert log-odds back to probability
         p_win = 1.0 / (1.0 + math.exp(-log_odds))

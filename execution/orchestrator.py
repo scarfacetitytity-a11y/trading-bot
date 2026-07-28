@@ -92,6 +92,64 @@ MAX_RESTARTS        = 10
 MONITOR_INTERVAL    = 60    # seconds between orchestrator health checks
 # ─────────────────────────────────────────────────────────────────────────────
 
+# ── ICT / JP methodology helpers ─────────────────────────────────────────────
+
+def _in_ict_macro(dt: "pd.Timestamp") -> bool:
+    """True if the bar falls inside an ICT algorithm delivery macro window (UTC).
+
+    ICT Macro windows are 15-20 minute periods where the market maker algorithm
+    delivers price efficiently. A bar inside these windows has higher probability
+    of following through on the setup direction.
+
+    Times are UTC. Verified from standard ICT teaching; JP-specific refinements
+    applied when video transcripts are available.
+    """
+    t = dt.hour * 60 + dt.minute
+    _WINDOWS = [
+        (2*60+33, 3*60),        # 02:33-03:00 — Pre-London CBDR macro
+        (4*60+3,  4*60+30),     # 04:03-04:30 — Early London build
+        (8*60+50, 9*60+10),     # 08:50-09:10 — London open kill zone
+        (9*60+50, 10*60+10),    # 09:50-10:10 — Mid-London
+        (10*60+50, 11*60+10),   # 10:50-11:10 — Late London
+        (11*60+50, 12*60+10),   # 11:50-12:10 — Pre-NY
+        (13*60+10, 13*60+40),   # 13:10-13:40 — NY open kill zone
+        (14*60+50, 15*60+10),   # 14:50-15:10 — PM session open
+        (15*60+15, 15*60+45),   # 15:15-15:45 — PM afternoon macro
+    ]
+    return any(lo <= t < hi for lo, hi in _WINDOWS)
+
+
+def _ipda_aligned(df: "pd.DataFrame", direction: int, price: float) -> bool:
+    """True if trade direction aligns with IPDA 20/40/60-day delivery.
+
+    IPDA (Interbank Price Delivery Algorithm): price tends to deliver from one
+    range extreme to the other over 20/40/60 trading days. If price is at the
+    low of the 20-day range (discount), the IPDA target is the 20-day high →
+    favor longs. If at the high (premium), favor shorts.
+
+    Uses 20-day range as primary signal; falls back neutral if insufficient data.
+    """
+    try:
+        times = pd.to_datetime(df["time"])
+        tmp   = df[["high", "low", "close"]].copy()
+        tmp.index = times
+        d1 = tmp.resample("1D", closed="left", label="left").agg(
+            {"high": "max", "low": "min", "close": "last"}
+        ).dropna()
+        if len(d1) < 20:
+            return False
+        recent = d1.tail(20)
+        hi20 = float(recent["high"].max())
+        lo20 = float(recent["low"].min())
+        rng  = hi20 - lo20
+        if rng <= 0:
+            return False
+        pos = (price - lo20) / rng  # 0=at low, 1=at high
+        return (pos < 0.30 and direction == 1) or (pos > 0.70 and direction == -1)
+    except Exception:
+        return False
+
+
 _TF_SECONDS = {
     "M1": 60, "M5": 300, "M15": 900, "M30": 1800,
     "H1": 3600, "H4": 14400, "D1": 86400,
@@ -1217,6 +1275,8 @@ class TradingEngine(Component):
                         "dom_aligned":        self._open_confluences.dom_aligned,
                         "news_aligned":       self._open_confluences.news_aligned,
                         "continuation_type":  self._open_confluences.trade_type == "continuation",
+                        "in_ict_macro":       self._open_confluences.in_ict_macro,
+                        "ipda_aligned":       self._open_confluences.ipda_aligned,
                     }
                     self._prob_model.update_from_outcome(_confl_dict, _won)
                 except Exception:
@@ -2454,6 +2514,8 @@ class TradingEngine(Component):
                         )
 
                     _of_aligned = bool(_of_mod > 0) if "_of_mod" in dir() else False
+                    _bar_time   = pd.to_datetime(df["time"].iloc[-1]) if df is not None and len(df) > 0 else None
+                    _bar_price  = float(df["close"].iloc[-1]) if df is not None and len(df) > 0 else 0.0
                     _confl = TradeConfluences(
                         fvg_present        = True,        # strategy fires on FVG detection
                         ob_present         = _score_over_floor >= 1,
@@ -2466,6 +2528,8 @@ class TradingEngine(Component):
                         news_aligned       = news_dir == desired if news_dir != 0 else False,
                         trade_type         = _plan_type,
                         rr                 = _plan_rr,
+                        in_ict_macro       = _in_ict_macro(_bar_time) if _bar_time is not None else False,
+                        ipda_aligned       = _ipda_aligned(df, desired, _bar_price) if df is not None else False,
                     )
                     _prob = self._prob_model.estimate(_confl)
 
