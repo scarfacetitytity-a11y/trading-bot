@@ -26,9 +26,11 @@ STATE_FILE = Path(__file__).resolve().parent.parent / "logs" / "risk_agent_state
 
 @dataclass
 class RiskConfig:
-    # Consecutive loss circuit breaker
-    max_consecutive_losses: int   = 3       # halt after this many losses in a row
-    consecutive_loss_cooldown_h: int = 24   # hours to pause after hitting limit
+    # Consecutive loss size scaling — graduated, not a halt
+    # 3 losses → 0.5x size, 5 losses → 0.25x size, 7+ → 0.1x (minimum)
+    # Agent manages risk, it doesn't stop trading.
+    max_consecutive_losses: int   = 7       # only halt at extreme (7 in a row)
+    consecutive_loss_cooldown_h: int = 4    # short cooldown if 7-loss extreme hit
 
     # Daily loss limit (% of account balance at day start)
     max_daily_loss_pct: float     = 0.02    # 2% — Council circuit breaker (FTMO limit is 5%)
@@ -189,19 +191,31 @@ class RiskAgent:
                         f"protecting floor {cfg.daily_profit_floor_pct*100:.1f}%"
                     )
 
-        # 7. Rolling win rate check
+        # 7. Graduated consecutive-loss size scaling
+        # Agent manages risk by shrinking size — never shuts down except at extreme.
         size_mult = 1.0
         reason    = "OK"
+        cl = s.consecutive_losses
+        if cl >= 5:
+            size_mult = 0.25
+            reason = f"{cl} consecutive losses — 0.25x size"
+        elif cl >= 3:
+            size_mult = 0.5
+            reason = f"{cl} consecutive losses — 0.5x size"
+        elif cl >= 1:
+            size_mult = 0.75
+            reason = f"{cl} consecutive loss — 0.75x size"
+
+        # 8. Rolling win rate — additional scale-down on sustained poor WR
         if len(s.recent_trades) >= cfg.wr_lookback_trades:
             recent = s.recent_trades[-cfg.wr_lookback_trades:]
             wr = sum(1 for r in recent if r > 0) / len(recent)
             if wr <= cfg.wr_halt_threshold:
-                return False, 0.0, (
-                    f"Rolling WR {wr*100:.0f}% <= {cfg.wr_halt_threshold*100:.0f}% — pause"
-                )
-            if wr <= cfg.wr_scale_threshold:
-                size_mult = 0.5
-                reason = f"Rolling WR {wr*100:.0f}% — trading at half size"
+                size_mult = min(size_mult, 0.25)
+                reason = f"Rolling WR {wr*100:.0f}% — 0.25x size (sustained poor form)"
+            elif wr <= cfg.wr_scale_threshold:
+                size_mult = min(size_mult, 0.5)
+                reason = f"Rolling WR {wr*100:.0f}% — 0.5x size"
 
         self._save_state()
         return True, size_mult, reason
