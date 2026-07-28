@@ -108,6 +108,16 @@ def _active_session(symbol: str, hour: int) -> bool:
     return any(s <= hour < e for s, e in _DEFAULT_SESSION)
 
 
+# Index CFDs have genuine liquidity gaps outside exchange hours — hard session gate
+# remains active for these. Forex/metals trade near-24h so score alone decides.
+_LIQUIDITY_GATED = {"US30", "US100", "US500", "US2000", "UK100", "JP225", "HK50"}
+
+
+def _needs_session_gate(symbol: str) -> bool:
+    key = symbol.replace(".cash", "").replace(".fx", "").upper()
+    return any(key.startswith(s) for s in _LIQUIDITY_GATED)
+
+
 def _resample_d1(df: pd.DataFrame) -> pd.DataFrame:
     times = pd.to_datetime(df["time"])
     tmp   = df[["open", "high", "low", "close"]].copy()
@@ -1481,9 +1491,7 @@ class AiDENIndexStrategy(Strategy):
                             if (i - fvg["test_bar"]) > self.max_entry_wait:
                                 to_remove.append(fvg)
                             elif cv > fvg_hi and position == 0:
-                                # Hard session gate: FVG can be formed in-session but triggered
-                                # out-of-session hours later. Reject entry if outside window.
-                                if not _active_session(self._symbol, hour):
+                                if _needs_session_gate(self._symbol) and not _active_session(self._symbol, hour):
                                     to_remove.append(fvg); continue
                                 stop_anchor = fvg["ob_lo"] if fvg["ob_lo"] is not None else fvg_lo
                                 sl   = stop_anchor - self.atr_stop_buffer * atr_val
@@ -1512,9 +1520,7 @@ class AiDENIndexStrategy(Strategy):
                             if (i - fvg["test_bar"]) > self.max_entry_wait:
                                 to_remove.append(fvg)
                             elif cv < fvg_lo and position == 0:
-                                # Hard session gate: FVG can be formed in-session but triggered
-                                # out-of-session hours later. Reject entry if outside window.
-                                if not _active_session(self._symbol, hour):
+                                if _needs_session_gate(self._symbol) and not _active_session(self._symbol, hour):
                                     to_remove.append(fvg); continue
                                 stop_anchor = fvg["ob_hi"] if fvg["ob_hi"] is not None else fvg_hi
                                 sl   = stop_anchor + self.atr_stop_buffer * atr_val
