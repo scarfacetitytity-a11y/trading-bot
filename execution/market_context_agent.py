@@ -209,17 +209,17 @@ class MarketContextAgent:
         # ── Narrative ─────────────────────────────────────────────────────────
         position = "AT" if at_level else f"{dist_str} from"
         if fighting_level:
-            narrative = (f"BLOCKED — {position} {best_level.name} "
+            narrative = (f"BLOCKED — {position} {best_level.label} "
                          f"({best_level.source_tf} {_dir_name(best_level.direction)}), "
                          f"proposed {_dir_name(direction)} fights it")
         elif at_level and level_bias == direction:
-            narrative = (f"CLEAN ENTRY — {position} {best_level.name} "
+            narrative = (f"CLEAN ENTRY — {position} {best_level.label} "
                          f"with structural bias {_dir_name(direction)}")
         elif approaching_against:
-            narrative = (f"CAUTION — {position} {best_level.name}, "
+            narrative = (f"CAUTION — {position} {best_level.label}, "
                          f"approaching {_dir_name(direction)} into resistance")
         else:
-            narrative = (f"{position} {best_level.name} — "
+            narrative = (f"{position} {best_level.label} — "
                          f"{'aligned' if level_bias == direction else 'neutral'}")
 
         logger.info("[MCAgent] %s | %s | lift=%.2f | block=%s",
