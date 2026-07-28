@@ -2153,6 +2153,24 @@ class TradingEngine(Component):
                     if self._correlation_cluster_cap(desired):
                         continue
 
+                    # ── Weekend new-entry guard (FTMO compliance) ─────────────
+                    # Standard (non-swing) accounts must not open trades that
+                    # carry over the weekend gap. Disabled by default; enable
+                    # when account type is confirmed as standard.
+                    if self._trade_cfg.get("prevent_weekend_entries", False):
+                        _now_utc = datetime.utcnow()
+                        _wd = _now_utc.weekday()  # 0=Mon … 4=Fri, 5=Sat, 6=Sun
+                        _weekend_blocked = (
+                            (_wd == 4 and _now_utc.hour >= 20)  # Fri after 20:00 UTC
+                            or _wd >= 5                          # Sat or Sun
+                        )
+                        if _weekend_blocked:
+                            logger.info(
+                                "[%s] Weekend gate: no new entries Fri≥20:00 UTC or Sat/Sun",
+                                self.name,
+                            )
+                            continue
+
                     open_count = len(trader.get_all_positions())   # magic-filtered (H3)
                     can_trade, size_mult, reason = self._risk_agent.pre_trade_check(
                         equity, open_count
@@ -2358,8 +2376,8 @@ class TradingEngine(Component):
                         _m1_open  = float(_df_m1c["open"].iloc[-2])
                         _m1_phigh = float(_df_m1c["high"].iloc[-3])    # prior bar
                         _m1_plow  = float(_df_m1c["low"].iloc[-3])
-                        _m1_bull  = _m1_close > _m1_open and _m1_close > _m1_phigh
-                        _m1_bear  = _m1_close < _m1_open and _m1_close < _m1_plow
+                        _m1_bull  = _m1_close > _m1_open
+                        _m1_bear  = _m1_close < _m1_open
                         _m1_ok    = _m1_bull if desired == 1 else _m1_bear
                         if not _m1_ok:
                             logger.info(

@@ -344,6 +344,80 @@ def _liq_swept_high(high: pd.Series, i: int, lookback: int) -> bool:
     return any(high.iloc[j] > swing_high for j in range(max(0, i - 5), i))
 
 
+def _sweep_reversal_bull(
+    close: pd.Series, low: pd.Series, i: int, lookback: int
+) -> tuple:
+    """Wick below prior swing low then close back above (bullish sweep reversal).
+
+    Returns (swept_level, actual_wick_low) or (None, None).
+    swept_level is the prior swing low that was taken.
+    actual_wick_low is the extreme wick (used for SL placement).
+    """
+    if i < lookback + 3:
+        return None, None
+    prior_swing_lo = float(low.iloc[i - lookback:i - 1].min())
+    swept = any(float(low.iloc[j]) < prior_swing_lo for j in range(max(0, i - 3), i))
+    if not swept:
+        return None, None
+    if float(close.iloc[i]) <= prior_swing_lo:
+        return None, None
+    actual_lo = min(float(low.iloc[j]) for j in range(max(0, i - 3), i))
+    return prior_swing_lo, actual_lo
+
+
+def _sweep_reversal_bear(
+    close: pd.Series, high: pd.Series, i: int, lookback: int
+) -> tuple:
+    """Wick above prior swing high then close back below (bearish sweep reversal).
+
+    Returns (swept_level, actual_wick_high) or (None, None).
+    """
+    if i < lookback + 3:
+        return None, None
+    prior_swing_hi = float(high.iloc[i - lookback:i - 1].max())
+    swept = any(float(high.iloc[j]) > prior_swing_hi for j in range(max(0, i - 3), i))
+    if not swept:
+        return None, None
+    if float(close.iloc[i]) >= prior_swing_hi:
+        return None, None
+    actual_hi = max(float(high.iloc[j]) for j in range(max(0, i - 3), i))
+    return prior_swing_hi, actual_hi
+
+
+def _bos_bull(high: pd.Series, close: pd.Series, i: int, lookback: int = 20) -> tuple:
+    """Break of structure long: close above prior N-bar swing high.
+
+    Returns (swing_high, True) or (None, False).
+    """
+    if i < lookback + 2:
+        return None, False
+    swing_hi = float(high.iloc[i - lookback:i - 1].max())
+    if float(close.iloc[i]) > swing_hi:
+        return swing_hi, True
+    return None, False
+
+
+def _bos_bear(low: pd.Series, close: pd.Series, i: int, lookback: int = 20) -> tuple:
+    """Break of structure short: close below prior N-bar swing low.
+
+    Returns (swing_low, True) or (None, False).
+    """
+    if i < lookback + 2:
+        return None, False
+    swing_lo = float(low.iloc[i - lookback:i - 1].min())
+    if float(close.iloc[i]) < swing_lo:
+        return swing_lo, True
+    return None, False
+
+
+def _alt_dup(active_fvgs: list, fvg_dir: str, anchor: float, atr_val: float) -> bool:
+    """True if an equivalent alt setup already in queue (suppresses bar-by-bar re-add)."""
+    return any(
+        f["dir"] == fvg_dir and abs(f["fvg_lo"] - anchor) < 0.5 * atr_val
+        for f in active_fvgs
+    )
+
+
 # ── Strategy ──────────────────────────────────────────────────────────────────
 
 class AiDENIndexStrategy(Strategy):
@@ -1152,6 +1226,234 @@ class AiDENIndexStrategy(Strategy):
                                 "tested":   False,
                                 "test_bar": None,
                                 "model3":   is_model3,
+                                "trend_s":  trend_strength,
+                            })
+
+                # ── Alt setups: liquidity sweep reversal + BOS ────────────────
+                # Fire when no clean FVG exists but structure/liquidity confirms.
+                # Pushed into active_fvgs with tested=True for fast entry.
+                _alt_cdh_i = _cdh[i]; _alt_cdl_i = _cdl[i]
+                _alt_pdh_i = _pdh[i]; _alt_pdl_i = _pdl[i]
+
+                if htf_bias == 1:
+                    # ── Sweep reversal long ───────────────────────────────────
+                    _swept_lo, _sl_lo = _sweep_reversal_bull(close, low, i, self.liq_lookback * 2)
+                    if _swept_lo is not None and not _alt_dup(active_fvgs, "bull", _sl_lo, atr_val):
+                        _sc = 2; _rs = ["H4 bias +2"]
+                        _sc += 2; _rs.append("Liq sweep reversal +2")
+
+                        if not np.isnan(swing_hi) and swing_hi > swing_lo:
+                            _mid = swing_lo + (swing_hi - swing_lo) * self.discount_pct
+                            if cv < _mid:
+                                _sc += 1; _rs.append("Discount zone")
+                            _h4r = swing_hi - swing_lo
+                            if _h4r > 0 and abs(cv - _mid) <= 0.10 * _h4r:
+                                _sc += 1; _rs.append("H4 impulse 50%")
+
+                        if in_session:
+                            _sc += 1; _rs.append("Session")
+                        if in_prime and self.use_prime_bonus:
+                            _sc += 1; _rs.append("Prime window")
+                        if self.use_rsi and not np.isnan(rsi_val):
+                            if self.rsi_long_lo <= rsi_val <= self.rsi_long_hi:
+                                _sc += 1; _rs.append("RSI zone")
+                        if strongly_trending:
+                            _sc += 1; _rs.append("Trend regime")
+                        if _manipulation_m(high, low, i, lookback=min(20, i)):
+                            _sc -= 1; _rs.append("-Opposing Manip M")
+                        if self.use_rsi and rsi_s is not None:
+                            _rn = float(rsi_s.iloc[i])
+                            if not np.isnan(_rn) and _rn > 75.0:
+                                _sc -= 1; _rs.append("-RSI overbought")
+                        if (not np.isnan(_alt_pdh_i) and not np.isnan(_alt_pdl_i)
+                                and _alt_pdh_i > _alt_pdl_i):
+                            _dr = _alt_pdh_i - _alt_pdl_i
+                            if _dr > 0 and 0.40 <= (cv - _alt_pdl_i) / _dr <= 0.60:
+                                _sc -= 1; _rs.append("-Mid daily range")
+                        if self._uj_h4_bias == 1:
+                            _sc -= 1; _rs.append("-UJ macro headwind (long)")
+                        elif self._uj_h4_bias == -1:
+                            _sc += 1; _rs.append("UJ macro tailwind (long)")
+
+                        if _sc >= self.min_score:
+                            active_fvgs.append({
+                                "dir":      "bull",
+                                "fvg_lo":   _sl_lo,
+                                "fvg_hi":   _swept_lo + 0.3 * atr_val,
+                                "fvg_ce":   _swept_lo + 0.15 * atr_val,
+                                "ob_lo":    _sl_lo,
+                                "ob_hi":    None,
+                                "score":    _sc,
+                                "reasons":  _rs,
+                                "formed":   i,
+                                "tested":   True,
+                                "test_bar": i,
+                                "model3":   False,
+                                "trend_s":  trend_strength,
+                            })
+
+                    # ── BOS long ──────────────────────────────────────────────
+                    _bos_level, _bos_hit = _bos_bull(high, close, i, self.ob_lookback)
+                    if _bos_hit and _bos_level is not None and not _alt_dup(active_fvgs, "bull", _bos_level, atr_val):
+                        _sc = 2; _rs = ["H4 bias +2"]
+                        _sc += 1; _rs.append("BOS (structure break)")
+
+                        if _liq_swept_low(low, i, self.liq_lookback):
+                            _sc += 1; _rs.append("Liquidity sweep")
+                        else:
+                            _sc -= 1; _rs.append("-No sweep")
+
+                        if not np.isnan(swing_hi) and swing_hi > swing_lo:
+                            _mid = swing_lo + (swing_hi - swing_lo) * self.discount_pct
+                            if cv < _mid:
+                                _sc += 1; _rs.append("Discount zone")
+
+                        if in_session:
+                            _sc += 1; _rs.append("Session")
+                        if in_prime and self.use_prime_bonus:
+                            _sc += 1; _rs.append("Prime window")
+                        if self.use_rsi and not np.isnan(rsi_val):
+                            if self.rsi_long_lo <= rsi_val <= self.rsi_long_hi:
+                                _sc += 1; _rs.append("RSI zone")
+                        if strongly_trending:
+                            _sc += 1; _rs.append("Trend regime")
+                        if _manipulation_m(high, low, i, lookback=min(20, i)):
+                            _sc -= 1; _rs.append("-Opposing Manip M")
+                        if (not np.isnan(_alt_pdh_i) and not np.isnan(_alt_pdl_i)
+                                and _alt_pdh_i > _alt_pdl_i):
+                            _dr = _alt_pdh_i - _alt_pdl_i
+                            if _dr > 0 and 0.40 <= (cv - _alt_pdl_i) / _dr <= 0.60:
+                                _sc -= 1; _rs.append("-Mid daily range")
+                        if self._uj_h4_bias == 1:
+                            _sc -= 1; _rs.append("-UJ macro headwind (long)")
+                        elif self._uj_h4_bias == -1:
+                            _sc += 1; _rs.append("UJ macro tailwind (long)")
+
+                        if _sc >= self.min_score:
+                            active_fvgs.append({
+                                "dir":      "bull",
+                                "fvg_lo":   _bos_level,
+                                "fvg_hi":   _bos_level + 0.5 * atr_val,
+                                "fvg_ce":   _bos_level + 0.25 * atr_val,
+                                "ob_lo":    float(low.iloc[i]),
+                                "ob_hi":    None,
+                                "score":    _sc,
+                                "reasons":  _rs,
+                                "formed":   i,
+                                "tested":   True,
+                                "test_bar": i,
+                                "model3":   False,
+                                "trend_s":  trend_strength,
+                            })
+
+                if htf_bias == -1 and not self.long_only:
+                    # ── Sweep reversal short ──────────────────────────────────
+                    _swept_hi, _sl_hi = _sweep_reversal_bear(close, high, i, self.liq_lookback * 2)
+                    if _swept_hi is not None and not _alt_dup(active_fvgs, "bear", _sl_hi, atr_val):
+                        _sc = 2; _rs = ["H4 bias +2"]
+                        _sc += 2; _rs.append("Liq sweep reversal +2")
+
+                        if not np.isnan(swing_hi) and swing_hi > swing_lo:
+                            _mid = swing_lo + (swing_hi - swing_lo) * self.discount_pct
+                            if cv > _mid:
+                                _sc += 1; _rs.append("Premium zone")
+                            _h4r = swing_hi - swing_lo
+                            if _h4r > 0 and abs(cv - _mid) <= 0.10 * _h4r:
+                                _sc += 1; _rs.append("H4 impulse 50%")
+
+                        if in_session:
+                            _sc += 1; _rs.append("Session")
+                        if in_prime and self.use_prime_bonus:
+                            _sc += 1; _rs.append("Prime window")
+                        if self.use_rsi and not np.isnan(rsi_val):
+                            if self.rsi_short_lo <= rsi_val <= self.rsi_short_hi:
+                                _sc += 1; _rs.append("RSI zone")
+                        if strongly_trending:
+                            _sc += 1; _rs.append("Trend regime")
+                        if _manipulation_w(high, low, i, lookback=min(20, i)):
+                            _sc -= 1; _rs.append("-Opposing Manip W")
+                        if self.use_rsi and rsi_s is not None:
+                            _rn = float(rsi_s.iloc[i])
+                            if not np.isnan(_rn) and _rn < 25.0:
+                                _sc -= 1; _rs.append("-RSI oversold")
+                        if (not np.isnan(_alt_pdh_i) and not np.isnan(_alt_pdl_i)
+                                and _alt_pdh_i > _alt_pdl_i):
+                            _dr = _alt_pdh_i - _alt_pdl_i
+                            if _dr > 0 and 0.40 <= (cv - _alt_pdl_i) / _dr <= 0.60:
+                                _sc -= 1; _rs.append("-Mid daily range")
+                        if self._uj_h4_bias == 1:
+                            _sc += 1; _rs.append("UJ macro tailwind (short)")
+                        elif self._uj_h4_bias == -1:
+                            _sc -= 1; _rs.append("-UJ macro headwind (short)")
+
+                        if _sc >= self.min_score:
+                            active_fvgs.append({
+                                "dir":      "bear",
+                                "fvg_lo":   _swept_hi - 0.3 * atr_val,
+                                "fvg_hi":   _sl_hi,
+                                "fvg_ce":   _swept_hi - 0.15 * atr_val,
+                                "ob_lo":    None,
+                                "ob_hi":    _sl_hi,
+                                "score":    _sc,
+                                "reasons":  _rs,
+                                "formed":   i,
+                                "tested":   True,
+                                "test_bar": i,
+                                "model3":   False,
+                                "trend_s":  trend_strength,
+                            })
+
+                    # ── BOS short ─────────────────────────────────────────────
+                    _bos_level, _bos_hit = _bos_bear(low, close, i, self.ob_lookback)
+                    if _bos_hit and _bos_level is not None and not _alt_dup(active_fvgs, "bear", _bos_level - 0.5 * atr_val, atr_val):
+                        _sc = 2; _rs = ["H4 bias +2"]
+                        _sc += 1; _rs.append("BOS (structure break)")
+
+                        if _liq_swept_high(high, i, self.liq_lookback):
+                            _sc += 1; _rs.append("Liquidity sweep")
+                        else:
+                            _sc -= 1; _rs.append("-No sweep")
+
+                        if not np.isnan(swing_hi) and swing_hi > swing_lo:
+                            _mid = swing_lo + (swing_hi - swing_lo) * self.discount_pct
+                            if cv > _mid:
+                                _sc += 1; _rs.append("Premium zone")
+
+                        if in_session:
+                            _sc += 1; _rs.append("Session")
+                        if in_prime and self.use_prime_bonus:
+                            _sc += 1; _rs.append("Prime window")
+                        if self.use_rsi and not np.isnan(rsi_val):
+                            if self.rsi_short_lo <= rsi_val <= self.rsi_short_hi:
+                                _sc += 1; _rs.append("RSI zone")
+                        if strongly_trending:
+                            _sc += 1; _rs.append("Trend regime")
+                        if _manipulation_w(high, low, i, lookback=min(20, i)):
+                            _sc -= 1; _rs.append("-Opposing Manip W")
+                        if (not np.isnan(_alt_pdh_i) and not np.isnan(_alt_pdl_i)
+                                and _alt_pdh_i > _alt_pdl_i):
+                            _dr = _alt_pdh_i - _alt_pdl_i
+                            if _dr > 0 and 0.40 <= (cv - _alt_pdl_i) / _dr <= 0.60:
+                                _sc -= 1; _rs.append("-Mid daily range")
+                        if self._uj_h4_bias == 1:
+                            _sc += 1; _rs.append("UJ macro tailwind (short)")
+                        elif self._uj_h4_bias == -1:
+                            _sc -= 1; _rs.append("-UJ macro headwind (short)")
+
+                        if _sc >= self.min_score:
+                            active_fvgs.append({
+                                "dir":      "bear",
+                                "fvg_lo":   _bos_level - 0.5 * atr_val,
+                                "fvg_hi":   _bos_level,
+                                "fvg_ce":   _bos_level - 0.25 * atr_val,
+                                "ob_lo":    None,
+                                "ob_hi":    float(high.iloc[i]),
+                                "score":    _sc,
+                                "reasons":  _rs,
+                                "formed":   i,
+                                "tested":   True,
+                                "test_bar": i,
+                                "model3":   False,
                                 "trend_s":  trend_strength,
                             })
 

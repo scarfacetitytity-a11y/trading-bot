@@ -128,7 +128,10 @@ def entry_gate(result: Optional[RegimeResult], desired: int, trade_type: str) ->
 
     r = result.regime
 
-    if r in _REGIME_BLOCK:
+    # Only block truly flat conditions — maxZ < 0.5 means no movement at all.
+    # The "flatline" label is a classifier catch-all (else branch); maxZ up to ~2
+    # can land there for slow directional grinds that are perfectly tradeable.
+    if r in _REGIME_BLOCK and result.max_z < _FLATLINE_Z:
         return False, f"regime=flatline (maxZ={result.max_z:.2f}) — no statistical edge"
 
     if r in _REGIME_RANGING and trade_type == "continuation":
