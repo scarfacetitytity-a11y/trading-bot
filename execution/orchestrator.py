@@ -55,6 +55,7 @@ from execution.signal_detectors import (
 )
 from execution.trade_analyzer import analyze_entry, manage_trade as analyze_manage
 from execution.regime_classifier import classify_regime, entry_gate as regime_entry_gate, size_mult as regime_size_mult
+from execution.portfolio_optimizer import CorrelationMatrix, var_cvar
 from execution.trade_agent import TradeAgent
 from strategies.sniper import SniperStrategy
 from strategies.london_breakout import LondonBreakoutStrategy
@@ -842,6 +843,7 @@ class TradingEngine(Component):
         self._lookback         = trade_cfg.get("lookback_bars", 500)
         self._level_monitor:   Optional[LevelMonitor] = None
         self._mc_agent:        Optional[MarketContextAgent] = None
+        self._corr_matrix:     Optional[CorrelationMatrix] = None
         self._prob_model:      ProbabilityModel = ProbabilityModel()
         self._open_confluences: Optional[TradeConfluences] = None  # confluences at entry time
         self._scout_regime:    dict = {}   # last cadre_regime_state.json payload
@@ -1901,6 +1903,11 @@ class TradingEngine(Component):
                 desired = int(signals.iloc[-1])
                 current = trader.get_position_direction(self._symbol)
 
+                # Update shared correlation matrix with this bar's closes
+                if self._corr_matrix is not None and df is not None and len(df) >= 2:
+                    import numpy as _np_corr
+                    self._corr_matrix.update(self._symbol, _np_corr.array(df["close"].values))
+
                 # ── White-blood-cell: reconcile internal state vs MT5 reality ──
                 # If we think we're in a trade but MT5 shows flat, someone closed
                 # it externally (manual close, broker action, SL/TP hit outside loop).
@@ -2468,6 +2475,33 @@ class TradingEngine(Component):
                         logger.info("[%s] REGIME spike — size halved (maxZ=%.2f)",
                                     self.name, _regime_result.max_z if _regime_result else 0)
 
+                    # Correlation-aware sizing (ruflo RiskDecision portfolioCorrelation)
+                    # Reduce size when adding correlated exposure to open positions.
+                    if self._corr_matrix is not None:
+                        _open_pos = trader.get_all_positions()
+                        _open_syms = [(p.symbol, (1 if p.type == 0 else -1))
+                                      for p in _open_pos if p.symbol != self._symbol]
+                        _corr_mult, _corr_reason = self._corr_matrix.correlated_size_mult(
+                            self._symbol, _open_syms
+                        )
+                        if _corr_mult == 0.0:
+                            logger.info("[%s] CORRELATION BLOCK: %s", self.name, _corr_reason)
+                            continue
+                        if _corr_mult < 1.0:
+                            combined_mult *= _corr_mult
+                            logger.info("[%s] CORRELATION size adj %.2fx: %s",
+                                        self.name, _corr_mult, _corr_reason)
+
+                    # VaR/CVaR logging — risk metrics for this entry
+                    _p_win   = getattr(_prob, "p_win", 0.4) if "_prob" in dir() else 0.4
+                    _risk_pc = float(self._trade_cfg.get("risk_pct", 0.75)) / 100
+                    _vm      = var_cvar(_p_win, _risk_pc * combined_mult)
+                    logger.info(
+                        "[%s] VaR(95)=%.3f%% CVaR(95)=%.3f%% EV=%.4f (p_win=%.0f%%)",
+                        self.name, _vm.var_95 * 100, _vm.cvar_95 * 100,
+                        _vm.ev, _p_win * 100,
+                    )
+
                     # NY-open whipsaw guard: 14:00 UTC hour is 0/5 live (-0.40R avg).
                     # Half size until a 10+ trade sample says otherwise — not a
                     # blacklist (C12: sample too small to ban an hour outright).
@@ -2736,9 +2770,11 @@ class Orchestrator:
                 max_weekly_dd_pct=float(trade_cfg.get("soft_dd_halt_pct", 9.0)) / 100,
             ),
         )
-        self._ftmo_tracker = FTMOTracker(initial_equity=initial_equity, challenge=challenge_type)
-        log_cfg            = cfg.get("logging", {})
-        self._journal      = TradeJournal(log_dir=log_cfg.get("log_dir", "logs"))
+        self._ftmo_tracker  = FTMOTracker(initial_equity=initial_equity, challenge=challenge_type)
+        log_cfg             = cfg.get("logging", {})
+        self._journal       = TradeJournal(log_dir=log_cfg.get("log_dir", "logs"))
+        # Shared correlation matrix — updated each bar, read by all engines at entry
+        self._corr_matrix   = CorrelationMatrix(lookback=100)
 
     # ── Startup ──────────────────────────────────────────────────────────────
 
@@ -2860,6 +2896,7 @@ class Orchestrator:
             engine._level_monitor = level_monitor
             engine._mc_agent      = MarketContextAgent(level_monitor)
             engine._cousin_router = cousin_router
+            engine._corr_matrix   = self._corr_matrix
             components.append(engine)
 
         self._components = components

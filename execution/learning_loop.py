@@ -27,6 +27,31 @@ from typing import Optional
 LOG_DIR   = Path(__file__).resolve().parent.parent / "logs"
 PROPOSALS = LOG_DIR / "learning_proposals.md"
 
+# Statistical significance threshold (ruflo backtest quality gate: p < 0.05)
+_SIG_P_VALUE = 0.05
+_SIG_MIN_TRADES = 30   # Devil's Advocate: no conclusions below this
+
+
+def _binomial_cdf(k: int, n: int, p: float) -> float:
+    """P(X <= k) for Binomial(n, p) — pure Python, no scipy required."""
+    from math import comb
+    total = 0.0
+    for i in range(k + 1):
+        total += comb(n, i) * (p ** i) * ((1.0 - p) ** (n - i))
+    return min(total, 1.0)
+
+
+def _is_significant(wins: int, n: int, baseline_wr: float = _BASELINE_WR) -> tuple[bool, float]:
+    """Return (significant, p_value) — two-tailed binomial test vs baseline WR."""
+    if n < 10:
+        return False, 1.0
+    # Lower tail: worse than baseline
+    p_lower = _binomial_cdf(wins, n, baseline_wr)
+    # Upper tail: better than baseline
+    p_upper = 1.0 - _binomial_cdf(wins - 1, n, baseline_wr)
+    p_val = 2.0 * min(p_lower, p_upper)   # two-tailed
+    return p_val < _SIG_P_VALUE, round(p_val, 4)
+
 # Additional log directories from other accounts. Add paths here when a second
 # or third account bot install exists. The learning loop merges all trade records.
 _EXTRA_LOG_DIRS: list[Path] = [
@@ -257,16 +282,18 @@ def _council_09(trades: list) -> list:
     r_vals = [_r(t) for t in trades]
     avg_r  = sum(r_vals) / len(r_vals) if r_vals else 0.0
 
+    sig, p_val = _is_significant(len(wins), len(trades))
+    sig_tag = f" [p={p_val:.3f}, {'SIGNIFICANT' if sig else 'NOT significant'}]"
     if wr < _WR_FLOOR:
         obs.append(_obs("09", "Test Engineer",
-            f"Live WR {wr*100:.1f}% below floor {_WR_FLOOR*100:.0f}% ({len(trades)} trades)",
+            f"Live WR {wr*100:.1f}% below floor {_WR_FLOOR*100:.0f}% ({len(trades)} trades){sig_tag}",
             f"Baseline {_BASELINE_WR*100:.1f}% WR; live {wr*100:.1f}%; floor {_WR_FLOOR*100:.0f}%",
             "Live win rate is significantly below backtest baseline. Either market regime has "
             "changed, the entry model is degraded, or new negative confluences are over-filtering "
             "setups that previously would have won.",
             "Review last 20 losses for common patterns. Check if new negative confluences "
             "(-Both Asian H+L swept, -Mid daily range) are blocking too many valid setups.",
-            "high"))
+            "high" if sig else "medium"))
 
     if avg_r < _AVG_R_FLOOR:
         obs.append(_obs("09", "Test Engineer",

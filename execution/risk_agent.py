@@ -247,8 +247,10 @@ class RiskAgent:
 
         self._save_state()
 
-    def status_report(self, current_equity: float) -> str:
+    def status_report(self, current_equity: float, p_win: float = 0.4,
+                      risk_pct: float = 0.01) -> str:
         """Human-readable status string for dashboard / logs."""
+        from execution.portfolio_optimizer import var_cvar as _var_cvar
         s   = self.state
         cfg = self.config
         self._refresh_daily_weekly(current_equity)
@@ -259,6 +261,9 @@ class RiskAgent:
         recent     = s.recent_trades[-cfg.wr_lookback_trades:] if s.recent_trades else []
         wr         = sum(1 for r in recent if r > 0) / len(recent) * 100 if recent else 0
 
+        # VaR/CVaR for next potential trade at current risk settings
+        vm = _var_cvar(p_win, risk_pct)
+
         lines = [
             f"  Equity        : ${current_equity:,.2f}  (peak ${s.peak_equity:,.2f})",
             f"  Account DD    : {account_dd:.1f}% (limit {cfg.max_account_dd_pct*100:.0f}%)",
@@ -266,6 +271,7 @@ class RiskAgent:
             f"  Weekly P&L    : ${weekly_pnl:+,.2f} ({weekly_pnl/s.weekly_start_equity*100:+.1f}%)",
             f"  Consec losses : {s.consecutive_losses}/{cfg.max_consecutive_losses}",
             f"  Rolling WR    : {wr:.0f}% (last {len(recent)} trades)",
+            f"  VaR(95)/trade : {vm.var_95*100:+.3f}%  CVaR(95): {vm.cvar_95*100:+.3f}%  EV: {vm.ev*100:+.4f}%",
             f"  Paused until  : {s.pause_until or 'N/A'}",
         ]
         return "\n".join(lines)
