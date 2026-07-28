@@ -110,7 +110,7 @@ class MarketContextAgent:
             dist_atr = abs(lv.price - price) / atr
             if dist_atr > PROXIMITY_NEAR:
                 continue
-            type_weight = LEVEL_STRENGTH.get(lv.timeframe, 1.0)
+            type_weight = LEVEL_STRENGTH.get(lv.source_tf, 1.0)
             # proximity score: 1.0 at exact level, 0 at PROXIMITY_NEAR boundary
             prox_score = max(0.0, 1.0 - dist_atr / PROXIMITY_NEAR)
             total = prox_score * type_weight
