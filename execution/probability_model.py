@@ -79,6 +79,7 @@ class TradeConfluences:
     # ICT / JP methodology
     in_ict_macro:      bool  = False   # bar inside an ICT algorithm delivery window
     ipda_aligned:      bool  = False   # direction aligns with 20/40/60-day IPDA delivery
+    smt_divergence:    bool  = False   # cousin pair (EU/GU, XAU/XAG) NOT confirming new extreme
 
 
 @dataclass
@@ -121,6 +122,7 @@ class ProbabilityModel:
             "continuation_type":  {"lift": 0.75, "n_obs": 0, "n_win": 0},  # live: 0% WR → strong prior penalty
             "in_ict_macro":       {"lift": 1.15, "n_obs": 0, "n_win": 0},  # ICT delivery window — modest prior, unvalidated live
             "ipda_aligned":       {"lift": 1.20, "n_obs": 0, "n_win": 0},  # price at IPDA extreme, delivery toward target
+            "smt_divergence":     {"lift": 1.25, "n_obs": 0, "n_win": 0},  # cousin pair not confirming new extreme = fake move
         }
         self._load_state()
 
@@ -179,6 +181,10 @@ class ProbabilityModel:
         if c.ipda_aligned:
             log_odds += math.log(self._lifts["ipda_aligned"]["lift"])
             lifts_applied.append(f"IPDA(x{self._lifts['ipda_aligned']['lift']:.2f})")
+
+        if c.smt_divergence:
+            log_odds += math.log(self._lifts["smt_divergence"]["lift"])
+            lifts_applied.append(f"SMT(x{self._lifts['smt_divergence']['lift']:.2f})")
 
         # Convert log-odds back to probability
         p_win = 1.0 / (1.0 + math.exp(-log_odds))

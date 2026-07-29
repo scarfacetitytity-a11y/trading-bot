@@ -150,6 +150,71 @@ def _ipda_aligned(df: "pd.DataFrame", direction: int, price: float) -> bool:
         return False
 
 
+# ── SMT divergence (JP mentor: "cousin pairs") ───────────────────────────────
+# When EURUSD sweeps its Asian low but GBPUSD does NOT make a new low simultaneously,
+# the EU move is a fake trap. The divergence signals the real direction.
+# Cache stores last 20-bar swing for each symbol, updated per bar.
+
+_smt_cache: dict[str, dict] = {}   # {symbol: {"lo": float, "hi": float}}
+
+_SMT_COUSINS: dict[str, str] = {
+    "EURUSD": "GBPUSD",   "GBPUSD": "EURUSD",
+    "XAUUSD": "XAGUSD",   "XAGUSD": "XAUUSD",
+    "US30":   "US100",    "US100":  "US30",
+    "US500":  "US100",
+}
+
+_SMT_WINDOW = 20   # bars to look back for swing extreme comparison
+
+
+def _smt_divergence_present(symbol: str, df: "pd.DataFrame", direction: int) -> bool:
+    """True when our symbol swept a new swing extreme but the cousin pair did NOT.
+
+    JP mentor (TR3,4,5,8): "GU is EU's ugly cousin. When EU takes Asian lows
+    and GU hasn't, that divergence is your signal."
+    """
+    sym_key = symbol.replace(".cash", "").replace(".fx", "").upper()
+    cousin  = _SMT_COUSINS.get(sym_key)
+    if cousin is None or cousin not in _smt_cache:
+        return False
+    try:
+        window = min(_SMT_WINDOW, len(df))
+        if window < 5:
+            return False
+        our_lo = float(df["low"].tail(window).min())
+        our_hi = float(df["high"].tail(window).max())
+        cousin_data = _smt_cache[cousin]
+        if direction == 1:
+            # Long: our symbol swept to new 20-bar low; cousin did NOT also make new low
+            prior_lo = float(df["low"].tail(window + 5).min())
+            swept_new_low = our_lo <= prior_lo * 1.001
+            cousin_also_low = cousin_data["lo"] <= cousin_data.get("prior_lo", cousin_data["lo"]) * 1.001
+            return swept_new_low and not cousin_also_low
+        else:
+            # Short: our symbol swept to new high; cousin did NOT
+            prior_hi = float(df["high"].tail(window + 5).max())
+            swept_new_hi = our_hi >= prior_hi * 0.999
+            cousin_also_hi = cousin_data["hi"] >= cousin_data.get("prior_hi", cousin_data["hi"]) * 0.999
+            return swept_new_hi and not cousin_also_hi
+    except Exception:
+        return False
+
+
+def _update_smt_cache(symbol: str, df: "pd.DataFrame") -> None:
+    """Update swing cache for this symbol. Called once per bar per engine."""
+    try:
+        w = min(_SMT_WINDOW, len(df))
+        pw = min(_SMT_WINDOW + 5, len(df))
+        _smt_cache[symbol.replace(".cash","").replace(".fx","").upper()] = {
+            "lo":       float(df["low"].tail(w).min()),
+            "hi":       float(df["high"].tail(w).max()),
+            "prior_lo": float(df["low"].tail(pw).min()),
+            "prior_hi": float(df["high"].tail(pw).max()),
+        }
+    except Exception:
+        pass
+
+
 _TF_SECONDS = {
     "M1": 60, "M5": 300, "M15": 900, "M30": 1800,
     "H1": 3600, "H4": 14400, "D1": 86400,
@@ -1277,6 +1342,7 @@ class TradingEngine(Component):
                         "continuation_type":  self._open_confluences.trade_type == "continuation",
                         "in_ict_macro":       self._open_confluences.in_ict_macro,
                         "ipda_aligned":       self._open_confluences.ipda_aligned,
+                        "smt_divergence":     self._open_confluences.smt_divergence,
                     }
                     self._prob_model.update_from_outcome(_confl_dict, _won)
                 except Exception:
@@ -2516,6 +2582,9 @@ class TradingEngine(Component):
                     _of_aligned = bool(_of_mod > 0) if "_of_mod" in dir() else False
                     _bar_time   = pd.to_datetime(df["time"].iloc[-1]) if df is not None and len(df) > 0 else None
                     _bar_price  = float(df["close"].iloc[-1]) if df is not None and len(df) > 0 else 0.0
+                    if df is not None:
+                        _update_smt_cache(self._symbol, df)
+                    _smt_div    = _smt_divergence_present(self._symbol, df, desired) if df is not None else False
                     _confl = TradeConfluences(
                         fvg_present        = True,        # strategy fires on FVG detection
                         ob_present         = _score_over_floor >= 1,
@@ -2530,6 +2599,7 @@ class TradingEngine(Component):
                         rr                 = _plan_rr,
                         in_ict_macro       = _in_ict_macro(_bar_time) if _bar_time is not None else False,
                         ipda_aligned       = _ipda_aligned(df, desired, _bar_price) if df is not None else False,
+                        smt_divergence     = _smt_div,
                     )
                     _prob = self._prob_model.estimate(_confl)
 
