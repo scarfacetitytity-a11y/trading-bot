@@ -2216,6 +2216,7 @@ class TradingEngine(Component):
                     if self._soft_halt is not None and self._soft_halt.is_set():
                         logger.warning("[%s] SOFT HALT active — blocking new entry", self.name)
                         continue
+                    _daily_boost = 0
                     if self._risk_guard is not None:
                         _rg_day_eq  = getattr(self._risk_guard, "_day_start_equity", None)
                         _rg_init_eq = getattr(self._risk_guard, "_initial_equity", None)
@@ -2231,21 +2232,13 @@ class TradingEngine(Component):
                                 if self._soft_halt is not None:
                                     self._soft_halt.set()
                                 continue
-                            # Tiered daily DD score boost — gates marginal trades before hard halt
-                            _daily_boost = 0
+                            # Compute tiered daily DD boost — applied to score floor after needed is set
                             if _inline_daily_dd >= DAILY_DD_TIER3_PCT:
                                 _daily_boost = 3
                             elif _inline_daily_dd >= DAILY_DD_TIER2_PCT:
                                 _daily_boost = 2
                             elif _inline_daily_dd >= DAILY_DD_TIER1_PCT:
                                 _daily_boost = 1
-                            if _daily_boost:
-                                old_needed = needed
-                                needed = needed + _daily_boost
-                                logger.info(
-                                    "[%s] Daily DD tier (%.2f%%) — score floor %d→%d (+%d)",
-                                    self.name, _inline_daily_dd, old_needed, needed, _daily_boost,
-                                )
                         if _rg_init_eq and _rg_init_eq > 0:
                             _inline_total_dd = (_rg_init_eq - equity) / _rg_init_eq * 100
                             if _inline_total_dd >= _rg_soft_limit:
@@ -2471,6 +2464,13 @@ class TradingEngine(Component):
                         h4_bias = 0
                     against_trend = (h4_bias != 0 and desired != h4_bias)
                     needed = counter_min if against_trend else base_min
+                    if _daily_boost:
+                        old_needed = needed
+                        needed += _daily_boost
+                        logger.info(
+                            "[%s] Daily DD tier (%.2f%%) — score floor %d→%d (+%d)",
+                            self.name, _inline_daily_dd, old_needed, needed, _daily_boost,
+                        )
 
                     # ── DD-aware score boost ───────────────────────────────────
                     # When equity is deep in drawdown (within dd_score_boost_threshold %
