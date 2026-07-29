@@ -5,6 +5,7 @@ terminal and reports its status. It never places trades and never attempts
 to log in with credentials.
 """
 import logging
+import os
 from typing import Optional
 
 import MetaTrader5 as mt5
@@ -33,6 +34,23 @@ def connect(terminal_path: Optional[str] = None) -> bool:
             "'terminal_path' in config.yaml correct? Logged into an account?"
         )
         return False
+
+    # If MT5_LOGIN is set in the environment, ensure the terminal is on that
+    # account — switch via mt5.login() when it isn't.
+    _env_login = os.environ.get("MT5_LOGIN")
+    if _env_login:
+        _acct = mt5.account_info()
+        if _acct is None or str(_acct.login) != str(_env_login):
+            _ok = mt5.login(
+                int(_env_login),
+                password=os.environ.get("MT5_PASSWORD", ""),
+                server=os.environ.get("MT5_SERVER", ""),
+            )
+            if not _ok:
+                logger.error("MT5 login(%s) failed: %s", _env_login, mt5.last_error())
+                mt5.shutdown()
+                return False
+            logger.info("Switched MT5 terminal to account %s", _env_login)
 
     terminal = mt5.terminal_info()
     if terminal is None:
