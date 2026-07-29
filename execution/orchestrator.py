@@ -2972,6 +2972,14 @@ class TradingEngine(Component):
                                     self.name, direction_str, lots, sl, tp,
                                     signal_score, combined_mult, reason)
                     else:
+                        # Pre-order price snapshot for slippage measurement
+                        _pre_tick = mt5.symbol_info_tick(self._symbol)
+                        _intended_px = (
+                            _pre_tick.ask if desired == 1 else _pre_tick.bid
+                        ) if _pre_tick else None
+                        _pre_spread = (
+                            _pre_tick.ask - _pre_tick.bid
+                        ) if _pre_tick else None
                         ok = trader.place_order(self._symbol, desired, lots, sl=sl, tp=tp)
                         if ok:
                             # Read confirmed fill from MT5 — price_open/sl/tp reflect the
@@ -2985,10 +2993,36 @@ class TradingEngine(Component):
                                 sl = self._open_sl    # use confirmed values downstream
                                 tp = self._open_tp
                             else:
-                                tick = mt5.symbol_info_tick(self._symbol)
-                                self._open_entry_price = tick.ask if desired == 1 else tick.bid
+                                _pre_tick2 = mt5.symbol_info_tick(self._symbol)
+                                self._open_entry_price = (
+                                    _pre_tick2.ask if desired == 1 else _pre_tick2.bid
+                                ) if _pre_tick2 else (_intended_px or 0.0)
                                 self._open_sl          = sl
                                 self._open_tp          = tp
+                            # Execution quality log — slippage/spread per fill
+                            try:
+                                _eq_log = Path("logs") / "execution_quality.jsonl"
+                                _eq_log.parent.mkdir(parents=True, exist_ok=True)
+                                _slip = (
+                                    (self._open_entry_price - _intended_px) * (1 if desired == 1 else -1)
+                                ) if _intended_px else None
+                                _eq_row = {
+                                    "ts":         datetime.now(timezone.utc).isoformat(),
+                                    "symbol":     self._symbol,
+                                    "direction":  desired,
+                                    "lots":       lots,
+                                    "score":      signal_score,
+                                    "intended":   _intended_px,
+                                    "fill":       self._open_entry_price,
+                                    "slippage":   round(_slip, 6) if _slip is not None else None,
+                                    "spread":     round(_pre_spread, 6) if _pre_spread is not None else None,
+                                    "sl":         self._open_sl,
+                                    "tp":         self._open_tp,
+                                }
+                                with _eq_log.open("a", encoding="utf-8") as _ef:
+                                    _ef.write(json.dumps(_eq_row) + "\n")
+                            except Exception:
+                                pass
                             self._open_score             = signal_score
                             self._t1_hit                 = False
                             self._bars_since_entry        = 0
