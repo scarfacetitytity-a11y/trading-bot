@@ -420,15 +420,19 @@ def detect_m5_entry_trigger(
     lookback: int = 30,
     order: int = 2,
     atr: float = 0.0,
+    impulse_bars: int = 3,
 ) -> bool:
-    """Return True when M5 has broken structure in signal_dir.
+    """Return True when M5 confirms the signal direction.
 
-    Used as the LTF entry trigger after an M15 setup fires. Requires a genuine
-    BOS on M5 — not just price moving in direction, but actually taking out a
-    prior swing high (long) or swing low (short).
+    Two confirmation paths — whichever fires first:
 
-    order=2: swing confirmed with 2 bars each side — fast enough to catch
-    a fresh 5-minute BOS within the same M15 candle it forms.
+    1. BOS path: close breaks below/above a confirmed M5 swing low/high (order=2).
+       Catches structured moves with clear swing points.
+
+    2. Impulse path: last `impulse_bars` M5 closes are all bearish/bullish AND
+       each close is lower/higher than the previous close (consecutive momentum).
+       Catches impulsive NY-session moves where price dumps/pumps without forming
+       textbook swing structure before moving.
     """
     if df is None or len(df) < lookback:
         return True  # no M5 data — don't block the entry
@@ -436,17 +440,37 @@ def detect_m5_entry_trigger(
     highs  = df["high"].iloc[-lookback:]
     lows   = df["low"].iloc[-lookback:]
     closes = df["close"].iloc[-lookback:]
+    opens  = df["open"].iloc[-lookback:]
 
-    if signal_dir == 1:  # looking to buy — need M5 to break above a swing high
+    # ── Impulse read ──────────────────────────────────────────────────────────
+    # If the last N bars are all moving in signal direction with each close
+    # extending lower/higher, the market is telling us clearly where it's going.
+    recent_closes = closes.iloc[-impulse_bars:]
+    recent_opens  = opens.iloc[-impulse_bars:]
+    if signal_dir == -1:  # short impulse: all bars bearish + consecutive lower closes
+        all_bearish   = all(c < o for c, o in zip(recent_closes, recent_opens))
+        making_lows   = all(recent_closes.iloc[i] < recent_closes.iloc[i - 1]
+                            for i in range(1, impulse_bars))
+        if all_bearish and making_lows:
+            return True
+    else:  # long impulse: all bars bullish + consecutive higher closes
+        all_bullish   = all(c > o for c, o in zip(recent_closes, recent_opens))
+        making_highs  = all(recent_closes.iloc[i] > recent_closes.iloc[i - 1]
+                            for i in range(1, impulse_bars))
+        if all_bullish and making_highs:
+            return True
+
+    # ── BOS path ─────────────────────────────────────────────────────────────
+    if signal_dir == 1:
         sh = _swing_highs(highs, order=order)
-        valid = highs[sh].iloc[:-1]  # exclude most recent forming bar
+        valid = highs[sh].iloc[:-1]
         if valid.empty:
             return True
         last_swing_high = valid.iloc[-1]
         min_break = last_swing_high + (0.02 * atr if atr > 0 else 0)
         return float(closes.iloc[-1]) > min_break
 
-    else:  # looking to sell — need M5 to break below a swing low
+    else:
         sl = _swing_lows(lows, order=order)
         valid = lows[sl].iloc[:-1]
         if valid.empty:
