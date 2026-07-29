@@ -74,6 +74,7 @@ from backtests.run_multi_instrument import (
     INSTRUMENTS, OPTIMISED_PARAMS, TRAIL_CONFIGS, BIDIRECTIONAL, M15_PARAMS,
     _size_mult_from_score,
 )
+from core.instrument_profile import PROFILES, build_strategy_kwargs
 
 logger = logging.getLogger(__name__)
 
@@ -324,46 +325,15 @@ STRATEGY_MAP = {
 
 
 def _build_aiden_strategy(symbol: str) -> AiDENIndexStrategy:
-    """Build a per-symbol AiDENIndexStrategy with correct live params."""
-    cfg   = INSTRUMENTS.get(symbol, {})
-    tf_p  = M15_PARAMS.copy()
-    v2    = dict(
-        long_only=(symbol not in BIDIRECTIONAL),
-        h4_bias_gate=(symbol not in {"XAUUSD", "XAGUSD"}),  # sniper mode: no H4 trend gate for metals
-        rr_model3_bonus=0.5, rr_trend_bonus=0.5, rr_trend_threshold=0.003, rr_max=5.0,
-        session_prime_start=13, session_prime_end=15,
-        use_rsi=True, rsi_period=56,
-        rsi_long_lo=25.0, rsi_long_hi=55.0, rsi_short_lo=45.0, rsi_short_hi=75.0,
-        trail_to_be=symbol in TRAIL_CONFIGS,
-        trail_be_r=TRAIL_CONFIGS[symbol].get("trail_be_r", 1.0) if symbol in TRAIL_CONFIGS else 1.0,
-        trail_lock_r=TRAIL_CONFIGS[symbol].get("trail_lock_r", 2.0) if symbol in TRAIL_CONFIGS else 2.0,
-        t1_r=TRAIL_CONFIGS[symbol].get("t1_r", 0.0) if symbol in TRAIL_CONFIGS else 0.0,
-        t1_partial_pct=TRAIL_CONFIGS[symbol].get("t1_partial_pct", 0.5) if symbol in TRAIL_CONFIGS else 0.5,
-        time_stop_bars=TRAIL_CONFIGS[symbol].get("time_stop_bars", 0) if symbol in TRAIL_CONFIGS else 0,
-    )
-    if symbol in OPTIMISED_PARAMS:
-        opt  = OPTIMISED_PARAMS[symbol].copy()
-        bias = opt.pop("h4_bias_method", tf_p.pop("h4_bias_method", "ema"))
-        stop = opt.pop("atr_stop_buffer", tf_p.pop("atr_stop_buffer", 0.5))
-        return AiDENIndexStrategy(
-            min_score=opt.get("min_score", 4),
-            min_fvg_atr=opt.get("min_fvg_atr", 0.10),
-            rr_target=opt.get("rr_target", 2.5),
-            session_start=opt.get("session_start", cfg.get("session_start", 7)),
-            session_end=opt.get("session_end", cfg.get("session_end", 21)),
-            h4_bias_method=bias, atr_stop_buffer=stop,
-            **{k: v for k, v in tf_p.items() if k not in ("h4_bias_method", "atr_stop_buffer")},
-            **v2,
-        )
-    bias = tf_p.pop("h4_bias_method", "ema")
-    stop = tf_p.pop("atr_stop_buffer", 0.5)
-    return AiDENIndexStrategy(
-        min_score=4, min_fvg_atr=0.10, rr_target=2.5,
-        session_start=cfg.get("session_start", 7),
-        session_end=cfg.get("session_end", 21),
-        h4_bias_method=bias, atr_stop_buffer=stop,
-        **tf_p, **v2,
-    )
+    """Build a per-symbol AiDENIndexStrategy with correct live params.
+
+    Phase 0: params now come from core.instrument_profile.PROFILES, whose
+    strategy_kwargs replicate the previous inline assembly exactly. Unknown
+    symbols fall back to build_strategy_kwargs (same defaults as before).
+    """
+    if symbol in PROFILES:
+        return AiDENIndexStrategy(**PROFILES[symbol].strategy_kwargs)
+    return AiDENIndexStrategy(**build_strategy_kwargs(symbol))
 
 
 # ── Status enum ──────────────────────────────────────────────────────────────
