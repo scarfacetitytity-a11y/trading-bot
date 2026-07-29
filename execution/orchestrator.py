@@ -2025,18 +2025,37 @@ class TradingEngine(Component):
 
                 if hasattr(self._strategy, "_symbol"):
                     self._strategy._symbol = self._symbol
-                signals = self._strategy.generate_signals(df)
-                desired = int(signals.iloc[-1])
-                current = trader.get_position_direction(self._symbol)
+                _az      = getattr(self, "_analyzer", None)
+                _v3_mode = getattr(self, "_v3_mode", False)
 
-                # Phase 3: feed shadow AnalyzerEngine (dry-run, never places orders)
-                _az = getattr(self, "_analyzer", None)
-                if _az is not None:
+                if _v3_mode and _az is not None:
+                    # Phase 4 live: AnalyzerEngine drives the signal
                     try:
                         _df_m5_az = self._fetch_ltf_bars("M5", count=40)
                         _az.update(df, _df_m5_az)
-                    except Exception:
-                        pass
+                        desired = _az.get_armed_direction()
+                        # Use stack score as signal_score proxy for downstream sizing
+                        _az_score = _az.get_armed_score()
+                        # Inject into strategy's _scores so downstream sizing picks it up
+                        if hasattr(self._strategy, "_scores") and self._strategy._scores is not None and len(self._strategy._scores) > 0:
+                            self._strategy._scores.iloc[-1] = int(_az_score / 10)  # normalize 0-100 → 0-10 scale
+                    except Exception as _v3e:
+                        logger.warning("[%s] V3 mode error — falling back to v2 signal: %s", self.name, _v3e)
+                        signals = self._strategy.generate_signals(df)
+                        desired = int(signals.iloc[-1])
+                else:
+                    # Phase 0-3: old gate cascade generates signal
+                    signals = self._strategy.generate_signals(df)
+                    desired = int(signals.iloc[-1])
+                    # Shadow AnalyzerEngine update (dry-run only)
+                    if _az is not None:
+                        try:
+                            _df_m5_az = self._fetch_ltf_bars("M5", count=40)
+                            _az.update(df, _df_m5_az)
+                        except Exception:
+                            pass
+
+                current = trader.get_position_direction(self._symbol)
 
                 # Update shared correlation matrix with this bar's closes
                 if self._corr_matrix is not None and df is not None and len(df) >= 2:
@@ -2892,6 +2911,12 @@ class TradingEngine(Component):
                         self._cousin_router.cleanup(bar_time)
 
                     _shad.fired = True; _shadow_logger.record(_shad)
+                    # V3: consume the armed candidate so lifecycle advances to FIRED
+                    if _v3_mode and _az is not None:
+                        try:
+                            _az.consume_armed(desired)
+                        except Exception:
+                            pass
                     if self._dry_run:
                         logger.info("[%s] DRY RUN: %s %.2f lots SL=%s TP=%s | score=%d x%.2f | %s",
                                     self.name, direction_str, lots, sl, tp,
@@ -3160,12 +3185,30 @@ class Orchestrator:
             engine._corr_matrix   = self._corr_matrix
             components.append(engine)
 
-            # Phase 3: shadow AnalyzerEngine runs dry-run v3 logic alongside live engine
+            # Phase 3/4: AnalyzerEngine runs alongside every live engine.
+            # Shadow mode (Phase 3): just logs. Live mode (Phase 4): drives signal.
+            _v3_cfg    = self._cfg.get("v3_cutover", {})
+            _v3_live   = set(_v3_cfg.get("live", []))
+            _v3_min_samples = int(_v3_cfg.get("go_no_go_min_samples", 50))
+            _born_thr  = float(_v3_cfg.get("born_threshold", 35.0))
             try:
                 _az = AnalyzerEngine(symbol, self._strategies[symbol])
-                engine._analyzer = _az   # live engine can call _analyzer.update() per bar
+                _az._BORN_THRESHOLD = _born_thr
+                if symbol in _v3_live:
+                    _shadow_path = Path(__file__).parent.parent / "logs" / "shadow_stack.jsonl"
+                    _ok, _msg = AnalyzerEngine.validate_cutover_ready(symbol, _shadow_path, _v3_min_samples)
+                    if _ok:
+                        engine._v3_mode = True
+                        logger.info("[V3 CUTOVER] %s → LIVE on v3 stack. %s", symbol, _msg)
+                    else:
+                        engine._v3_mode = False
+                        logger.warning("[V3 CUTOVER] %s blocked: %s", symbol, _msg)
+                else:
+                    engine._v3_mode = False
+                engine._analyzer = _az
             except Exception as _ae:
                 logger.warning("AnalyzerEngine init failed for %s: %s", symbol, _ae)
+                engine._v3_mode = False
 
         self._components = components
 

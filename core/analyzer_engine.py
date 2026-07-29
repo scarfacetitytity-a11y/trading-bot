@@ -221,6 +221,53 @@ class AnalyzerEngine:
             self._state.live_zones = len(self._reader.get_live_zones())
             self.beat(f"bar={bar_time[-5:]} | signal={desired:+d} | zones={self._state.live_zones}")
 
+    # ── V3 live mode interface ────────────────────────────────────────────────
+
+    def get_armed_direction(self) -> int:
+        """Return the direction (+1/-1) of the highest-scoring ARMED candidate, or 0."""
+        with self._lock:
+            armed = [c for c in self._slm.all_candidates() if c.state.value == "armed"]
+            if not armed:
+                return 0
+            best = max(armed, key=lambda c: c.stack_score)
+            threshold = self._profile.entry_threshold if self._profile else 65
+            return best.direction if best.stack_score >= threshold else 0
+
+    def get_armed_score(self) -> float:
+        """Return the stack score of the best ARMED candidate, or 0."""
+        with self._lock:
+            armed = [c for c in self._slm.all_candidates() if c.state.value == "armed"]
+            if not armed:
+                return 0.0
+            return max(c.stack_score for c in armed)
+
+    def consume_armed(self, direction: int) -> None:
+        """Mark ARMED candidates in direction as FIRED (called by TradingEngine on trade fire)."""
+        with self._lock:
+            self._slm.mark_fired(direction)
+            self._state.fired_count += 1
+
+    @staticmethod
+    def validate_cutover_ready(symbol: str, shadow_log_path: Path, min_samples: int = 50) -> tuple[bool, str]:
+        """Check shadow_stack.jsonl for minimum signal samples before allowing live cutover."""
+        try:
+            count = 0
+            with shadow_log_path.open("r", encoding="utf-8") as fh:
+                for line in fh:
+                    try:
+                        row = json.loads(line)
+                        if row.get("symbol") == symbol:
+                            count += 1
+                    except Exception:
+                        pass
+            if count >= min_samples:
+                return True, f"{symbol}: {count} samples ≥ {min_samples} — cutover ready"
+            return False, f"{symbol}: only {count}/{min_samples} shadow samples — run longer before cutover"
+        except FileNotFoundError:
+            return False, f"shadow_stack.jsonl not found — Phase 1 must run first"
+        except Exception as e:
+            return False, f"validation error: {e}"
+
     def status(self) -> dict:
         with self._lock:
             active_cands = self._slm.active()
@@ -232,4 +279,5 @@ class AnalyzerEngine:
                 "active_candidates": len(active_cands),
                 "total_candidates":  self._state.total_candidates,
                 "armed_count": self._state.armed_count,
+                "fired_count": self._state.fired_count,
             }
