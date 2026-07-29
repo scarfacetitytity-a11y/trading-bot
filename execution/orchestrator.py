@@ -76,6 +76,7 @@ from backtests.run_multi_instrument import (
 )
 from core.instrument_profile import PROFILES, build_strategy_kwargs
 from core.probability_stack import StackInput, shadow_logger as _shadow_logger
+from core.analyzer_engine import AnalyzerEngine
 from news.news_intelligence import NewsIntelligence, NewsSignal
 
 logger = logging.getLogger(__name__)
@@ -2028,6 +2029,15 @@ class TradingEngine(Component):
                 desired = int(signals.iloc[-1])
                 current = trader.get_position_direction(self._symbol)
 
+                # Phase 3: feed shadow AnalyzerEngine (dry-run, never places orders)
+                _az = getattr(self, "_analyzer", None)
+                if _az is not None:
+                    try:
+                        _df_m5_az = self._fetch_ltf_bars("M5", count=40)
+                        _az.update(df, _df_m5_az)
+                    except Exception:
+                        pass
+
                 # Update shared correlation matrix with this bar's closes
                 if self._corr_matrix is not None and df is not None and len(df) >= 2:
                     import numpy as _np_corr
@@ -3149,6 +3159,13 @@ class Orchestrator:
             engine._cousin_router = cousin_router
             engine._corr_matrix   = self._corr_matrix
             components.append(engine)
+
+            # Phase 3: shadow AnalyzerEngine runs dry-run v3 logic alongside live engine
+            try:
+                _az = AnalyzerEngine(symbol, self._strategies[symbol])
+                engine._analyzer = _az   # live engine can call _analyzer.update() per bar
+            except Exception as _ae:
+                logger.warning("AnalyzerEngine init failed for %s: %s", symbol, _ae)
 
         self._components = components
 
