@@ -101,8 +101,8 @@ def _in_ict_macro(dt: "pd.Timestamp") -> bool:
     delivers price efficiently. A bar inside these windows has higher probability
     of following through on the setup direction.
 
-    Times are UTC. Verified from standard ICT teaching; JP-specific refinements
-    applied when video transcripts are available.
+    Times are UTC. Provisional — sourced from ICT community teaching; not yet
+    verified against JP transcripts or confirmed on live data.
     """
     t = dt.hour * 60 + dt.minute
     _WINDOWS = [
@@ -146,6 +146,28 @@ def _ipda_aligned(df: "pd.DataFrame", direction: int, price: float) -> bool:
             return False
         pos = (price - lo20) / rng  # 0=at low, 1=at high
         return (pos < 0.30 and direction == 1) or (pos > 0.70 and direction == -1)
+    except Exception:
+        return False
+
+
+def _inside_day(df: "pd.DataFrame") -> bool:
+    """True if today's daily range is inside yesterday's — JP: 'no daily sweep expected'.
+
+    Resamples M15 bars to D1 and checks whether the current day's high/low
+    is contained within the prior day's high/low (inside bar pattern).
+    """
+    try:
+        times = pd.to_datetime(df["time"])
+        tmp   = df[["high", "low"]].copy()
+        tmp.index = times
+        d1 = tmp.resample("1D", closed="left", label="left").agg(
+            {"high": "max", "low": "min"}
+        ).dropna()
+        if len(d1) < 2:
+            return False
+        prev = d1.iloc[-2]
+        curr = d1.iloc[-1]
+        return bool(curr["high"] < prev["high"] and curr["low"] > prev["low"])
     except Exception:
         return False
 
@@ -1343,6 +1365,9 @@ class TradingEngine(Component):
                         "in_ict_macro":       self._open_confluences.in_ict_macro,
                         "ipda_aligned":       self._open_confluences.ipda_aligned,
                         "smt_divergence":     self._open_confluences.smt_divergence,
+                        "eq_liq_cluster":     self._open_confluences.eq_liq_cluster,
+                        "early_leakage":      self._open_confluences.early_leakage,
+                        "inside_day":         self._open_confluences.inside_day,
                     }
                     self._prob_model.update_from_outcome(_confl_dict, _won)
                 except Exception:
@@ -1812,7 +1837,7 @@ class TradingEngine(Component):
             _asian_50: Optional[float] = None
             if self._level_monitor is not None:
                 for _lv in self._level_monitor.get_levels(self._symbol):
-                    if _lv.name == "Asian 50% Mid":
+                    if _lv.label == "Asian 50% Mid":
                         _asian_50 = _lv.price
                         break
             _t1_price: Optional[float] = (
@@ -2585,6 +2610,25 @@ class TradingEngine(Component):
                     if df is not None:
                         _update_smt_cache(self._symbol, df)
                     _smt_div    = _smt_divergence_present(self._symbol, df, desired) if df is not None else False
+                    _sr_now     = getattr(self._strategy, "_score_reasons", None)
+                    _cur_rsns   = list(_sr_now.iloc[-1]) if _sr_now is not None and len(_sr_now) > 0 else []
+                    _eq_liq     = any("liq cluster" in r for r in _cur_rsns)
+                    # Early leakage: Asian session boundary broken before London open
+                    # JP: "When I see price leak out of Asia early, London violates it harder"
+                    _early_leak = False
+                    if _bar_time is not None and pd.to_datetime(_bar_time, utc=True).hour < 9:
+                        try:
+                            _asian_lvls = self._mc_agent._lm.get_levels(self._symbol)
+                            for _lv in _asian_lvls:
+                                if _lv.source_tf != "Asian":
+                                    continue
+                                if desired == 1 and _lv.direction == 1 and _bar_price > _lv.price:
+                                    _early_leak = True; break
+                                if desired == -1 and _lv.direction == -1 and _bar_price < _lv.price:
+                                    _early_leak = True; break
+                        except Exception:
+                            pass
+                    _in_day = _inside_day(df) if df is not None else False
                     _confl = TradeConfluences(
                         fvg_present        = True,        # strategy fires on FVG detection
                         ob_present         = _score_over_floor >= 1,
@@ -2600,6 +2644,9 @@ class TradingEngine(Component):
                         in_ict_macro       = _in_ict_macro(_bar_time) if _bar_time is not None else False,
                         ipda_aligned       = _ipda_aligned(df, desired, _bar_price) if df is not None else False,
                         smt_divergence     = _smt_div,
+                        eq_liq_cluster     = _eq_liq,
+                        early_leakage      = _early_leak,
+                        inside_day         = _in_day,
                     )
                     _prob = self._prob_model.estimate(_confl)
 
@@ -2619,6 +2666,12 @@ class TradingEngine(Component):
                     n_open = len(trader.get_all_positions())   # magic-filtered (H3)
                     concentration_mult = 2.0 if n_open <= 1 else (1.5 if n_open <= 3 else 1.0)
                     combined_mult = size_mult * score_mult * concentration_mult
+
+                    # Monday size reduction — JP: "Markets play catchup to weekend events,
+                    # fundamentals can throw technical analysis out the window."
+                    if _bar_time is not None and pd.to_datetime(_bar_time, utc=True).weekday() == 0:
+                        combined_mult *= 0.75
+                        logger.info("[%s] MONDAY 0.75x size — catchup volatility risk", self.name)
 
                     # Spike regime: halve size — extreme Z-score event, direction uncertain
                     _rg_mult = regime_size_mult(_regime_result)
@@ -2920,6 +2973,8 @@ class Orchestrator:
                 max_account_dd_pct=float(trade_cfg.get("total_kill_pct", 9.5)) / 100,
                 max_daily_loss_pct=float(trade_cfg.get("daily_halt_pct", 2.0)) / 100,
                 max_weekly_dd_pct=float(trade_cfg.get("soft_dd_halt_pct", 9.0)) / 100,
+                daily_profit_target_pct=float(trade_cfg.get("daily_profit_target_pct", 0.0)) / 100,
+                daily_profit_floor_pct=float(trade_cfg.get("daily_profit_floor_pct", 0.0)) / 100,
             ),
         )
         self._ftmo_tracker  = FTMOTracker(initial_equity=initial_equity, challenge=challenge_type)

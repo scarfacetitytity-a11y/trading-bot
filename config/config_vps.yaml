@@ -69,3 +69,8 @@ trading:
   daily_halt_pct:   4.0
   soft_dd_halt_pct: 9.0
   total_kill_pct:   9.5
+
+  # JP mentor profit floor: once up 1.5%, protect 1.0% — play with 0.5%
+  # "I am not leaving today without $1,500 clear profit. I've got $500 to play with."
+  daily_profit_target_pct: 1.5
+  daily_profit_floor_pct:  1.0

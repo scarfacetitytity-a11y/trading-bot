@@ -80,6 +80,9 @@ class TradeConfluences:
     in_ict_macro:      bool  = False   # bar inside an ICT algorithm delivery window
     ipda_aligned:      bool  = False   # direction aligns with 20/40/60-day IPDA delivery
     smt_divergence:    bool  = False   # cousin pair (EU/GU, XAU/XAG) NOT confirming new extreme
+    eq_liq_cluster:    bool  = False   # equal highs/lows present = resting liquidity cluster swept
+    early_leakage:     bool  = False   # price broke Asian session level before London open — JP: "London will violate it harder"
+    inside_day:        bool  = False   # today's daily candle inside yesterday's — no sweep expected, reduce probability
 
 
 @dataclass
@@ -120,9 +123,12 @@ class ProbabilityModel:
             "dom_aligned":        {"lift": 1.15, "n_obs": 0, "n_win": 0},
             "news_aligned":       {"lift": 1.20, "n_obs": 0, "n_win": 0},
             "continuation_type":  {"lift": 0.75, "n_obs": 0, "n_win": 0},  # live: 0% WR → strong prior penalty
-            "in_ict_macro":       {"lift": 1.15, "n_obs": 0, "n_win": 0},  # ICT delivery window — modest prior, unvalidated live
+            "in_ict_macro":       {"lift": 1.15, "n_obs": 0, "n_win": 0},  # provisional — windows from ICT teaching, not live-verified
             "ipda_aligned":       {"lift": 1.20, "n_obs": 0, "n_win": 0},  # price at IPDA extreme, delivery toward target
             "smt_divergence":     {"lift": 1.25, "n_obs": 0, "n_win": 0},  # cousin pair not confirming new extreme = fake move
+            "eq_liq_cluster":     {"lift": 1.20, "n_obs": 0, "n_win": 0},  # equal highs/lows swept = resting liquidity cleared
+            "early_leakage":      {"lift": 1.20, "n_obs": 0, "n_win": 0},  # price broke Asian session boundary before London open
+            "inside_day":         {"lift": 0.85, "n_obs": 0, "n_win": 0},  # inside bar — daily sweep unlikely, JP: "reduce probability"
         }
         self._load_state()
 
@@ -185,6 +191,18 @@ class ProbabilityModel:
         if c.smt_divergence:
             log_odds += math.log(self._lifts["smt_divergence"]["lift"])
             lifts_applied.append(f"SMT(x{self._lifts['smt_divergence']['lift']:.2f})")
+
+        if c.eq_liq_cluster:
+            log_odds += math.log(self._lifts["eq_liq_cluster"]["lift"])
+            lifts_applied.append(f"EqLiq(x{self._lifts['eq_liq_cluster']['lift']:.2f})")
+
+        if c.early_leakage:
+            log_odds += math.log(self._lifts["early_leakage"]["lift"])
+            lifts_applied.append(f"EarlyLeak(x{self._lifts['early_leakage']['lift']:.2f})")
+
+        if c.inside_day:
+            log_odds += math.log(self._lifts["inside_day"]["lift"])
+            lifts_applied.append(f"InsideDay(x{self._lifts['inside_day']['lift']:.2f})")
 
         # Convert log-odds back to probability
         p_win = 1.0 / (1.0 + math.exp(-log_odds))

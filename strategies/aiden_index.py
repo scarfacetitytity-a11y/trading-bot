@@ -1019,17 +1019,17 @@ class AiDENIndexStrategy(Strategy):
                         if _db_count >= 2:
                             score += 1; reasons.append("Double bottom cluster")
 
-                        # Equal lows — liquidity cluster (+1): multiple prior lows at the same
-                        # level below the FVG zone indicate resting stop-loss liquidity that
-                        # price just swept. JP mentor TR4/9: "equal highs, equal highs,
-                        # essentially accumulate — is this a coincidence? Liquidity taken."
+                        # Equal lows — liquidity cluster: recorded for probability lift in
+                        # orchestrator; NOT a +1 gate score to avoid lowering the quality floor.
+                        # JP mentor TR4/9: "equal highs, equal highs, essentially accumulate
+                        # — is this a coincidence? Liquidity taken."
                         _eq_tol = 0.12 * atr_val
                         _eq_lo_count = sum(
                             1 for _j in range(max(0, i - 40), i - 2)
                             if abs(float(low.iloc[_j]) - h2) <= _eq_tol
                         )
                         if _eq_lo_count >= 2:
-                            score += 1; reasons.append("Equal lows (liq cluster)")
+                            reasons.append("Equal lows (liq cluster)")
 
                         # v10 — Previous battlefield (+1): price returns to a prior
                         # congestion zone where bulls/bears already fought (prior CHoCH area).
@@ -1214,8 +1214,8 @@ class AiDENIndexStrategy(Strategy):
                         if _dt_count >= 2:
                             score += 1; reasons.append("Double top cluster")
 
-                        # Equal highs — liquidity cluster (+1): multiple prior highs at the
-                        # same level above the FVG zone = resting buy-stop liquidity swept.
+                        # Equal highs — liquidity cluster: recorded for probability lift;
+                        # NOT a +1 gate score. Mirror of equal lows concept.
                         # JP mentor TR4/9: mirror of equal lows concept.
                         _eq_hi_tol = 0.12 * atr_val
                         _eq_hi_count = sum(
@@ -1223,7 +1223,7 @@ class AiDENIndexStrategy(Strategy):
                             if abs(float(high.iloc[_j]) - l2) <= _eq_hi_tol
                         )
                         if _eq_hi_count >= 2:
-                            score += 1; reasons.append("Equal highs (liq cluster)")
+                            reasons.append("Equal highs (liq cluster)")
 
                         # v10 — Previous battlefield (+1): SHORT mirror
                         if _is_prior_battlefield(high, low, close, i, hv, l2, atr_val):
