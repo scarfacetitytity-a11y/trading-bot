@@ -2612,6 +2612,14 @@ class TradingEngine(Component):
                         except Exception:
                             pass
                     _in_day = _inside_day(df) if df is not None else False
+                    news_dir = 0
+                    if self._news_gate is not None:
+                        try:
+                            news_dir = self._price_confirmed_event_direction(
+                                self._news_gate.get_context()
+                            )
+                        except Exception:
+                            pass
                     _confl = TradeConfluences(
                         fvg_present        = True,        # strategy fires on FVG detection
                         ob_present         = _score_over_floor >= 1,
