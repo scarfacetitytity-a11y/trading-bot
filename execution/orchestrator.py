@@ -70,6 +70,7 @@ from execution.market_context_agent import MarketContextAgent, MarketContext
 from execution.probability_model import ProbabilityModel, TradeConfluences
 from execution.order_flow import analyse_order_flow, order_flow_score_modifier, get_dom_key_levels
 from execution import telegram_notify as tg
+from execution.telegram_commands import TelegramCommandHandler
 from backtests.run_multi_instrument import (
     INSTRUMENTS, OPTIMISED_PARAMS, TRAIL_CONFIGS, BIDIRECTIONAL, M15_PARAMS,
     _size_mult_from_score,
@@ -974,6 +975,8 @@ class TradingEngine(Component):
         self._load_burned_targets()
         self._news_gate:        Optional[ng.NewsGate] = None
         self._news_intel:       Optional[NewsIntelligence] = None
+        self._consec_losses:    int   = 0       # anti-tilt: consecutive losing trades
+        self._entry_equity:     float = 0.0     # equity at entry — used to detect win/loss at close
         self._event_dir_cache: dict[str, int] = {}
         self._trade_manager:   TradeManager = TradeManager()
         self._last_bar         = None
@@ -2190,6 +2193,19 @@ class TradingEngine(Component):
                                     "LONG" if current == 1 else "SHORT")
                     else:
                         trader.close_all(self._symbol)
+                        # Anti-tilt: track win/loss streak by comparing equity to entry equity
+                        if self._entry_equity > 0:
+                            _close_eq = account.get("equity", self._entry_equity) if "account" in dir() else self._entry_equity
+                            if _close_eq < self._entry_equity:
+                                self._consec_losses += 1
+                                logger.info("[%s] Anti-tilt: loss #%d in streak (entry_eq=%.2f close_eq=%.2f)",
+                                            self.name, self._consec_losses, self._entry_equity, _close_eq)
+                            else:
+                                if self._consec_losses > 0:
+                                    logger.info("[%s] Anti-tilt: win resets streak (was %d losses)",
+                                                self.name, self._consec_losses)
+                                self._consec_losses = 0
+                            self._entry_equity = 0.0
                         # Record the close NOW (deduped) so the opposite entry below
                         # sees the outcome in its risk gate — no async lag.
                         self._record_close_now()
@@ -2732,6 +2748,38 @@ class TradingEngine(Component):
                     concentration_mult = 2.0 if n_open <= 1 else (1.5 if n_open <= 3 else 1.0)
                     combined_mult = size_mult * score_mult * concentration_mult
 
+                    # ── Anti-tilt: geometric risk decay after consecutive losses ──
+                    # Each unbroken loss shrinks the next trade's size by decay_factor.
+                    # A win resets the counter. Config: anti_tilt_decay (default 0.85).
+                    _tilt_decay = float(self._trade_cfg.get("anti_tilt_decay", 0.85))
+                    _tilt_max   = int(self._trade_cfg.get("anti_tilt_max_losses", 4))
+                    if self._consec_losses > 0:
+                        _tilt_n    = min(self._consec_losses, _tilt_max)
+                        _tilt_mult = _tilt_decay ** _tilt_n
+                        combined_mult *= _tilt_mult
+                        logger.info("[%s] Anti-tilt: %d consecutive losses → x%.3f size",
+                                    self.name, self._consec_losses, _tilt_mult)
+
+                    # ── ATR-percentile: scale size inversely with volatility regime ──
+                    # High-vol (ATR in top quartile over 100 bars): size 0.75x — outsized moves,
+                    # unpredictable slippage. Low-vol / compression (bottom quartile): size 1.15x —
+                    # breakout expected, higher conviction per unit of stop distance.
+                    if df is not None and len(df) >= 20:
+                        try:
+                            _atr_series = (df["high"] - df["low"]).rolling(14).mean()
+                            _lookback   = min(100, len(_atr_series.dropna()))
+                            _atr_now    = float(_atr_series.iloc[-1])
+                            _atr_hist   = _atr_series.dropna().iloc[-_lookback:]
+                            _atr_pct    = float((_atr_hist < _atr_now).mean())  # percentile rank 0-1
+                            if _atr_pct >= 0.75:
+                                combined_mult *= 0.75
+                                logger.info("[%s] ATR-pct %.0f%% → high vol, size 0.75x", self.name, _atr_pct * 100)
+                            elif _atr_pct <= 0.25:
+                                combined_mult *= 1.15
+                                logger.info("[%s] ATR-pct %.0f%% → low vol, size 1.15x", self.name, _atr_pct * 100)
+                        except Exception:
+                            pass
+
                     # Monday size reduction — JP: "Markets play catchup to weekend events,
                     # fundamentals can throw technical analysis out the window."
                     if _bar_time is not None and pd.to_datetime(_bar_time, utc=True).weekday() == 0:
@@ -2917,6 +2965,8 @@ class TradingEngine(Component):
                             _az.consume_armed(desired)
                         except Exception:
                             pass
+                    # Anti-tilt: record equity at entry so close can compare
+                    self._entry_equity = equity
                     if self._dry_run:
                         logger.info("[%s] DRY RUN: %s %.2f lots SL=%s TP=%s | score=%d x%.2f | %s",
                                     self.name, direction_str, lots, sl, tp,
@@ -3187,7 +3237,7 @@ class Orchestrator:
 
             # Phase 3/4: AnalyzerEngine runs alongside every live engine.
             # Shadow mode (Phase 3): just logs. Live mode (Phase 4): drives signal.
-            _v3_cfg    = self._cfg.get("v3_cutover", {})
+            _v3_cfg    = self.cfg.get("v3_cutover", {})
             _v3_live   = set(_v3_cfg.get("live", []))
             _v3_min_samples = int(_v3_cfg.get("go_no_go_min_samples", 50))
             _born_thr  = float(_v3_cfg.get("born_threshold", 35.0))
@@ -3217,6 +3267,17 @@ class Orchestrator:
                                  name=comp.name, daemon=True)
             t.start()
             self._threads.append(t)
+
+        # Two-way Telegram command handler (Phase 5 upgrade)
+        self._tg_cmd = TelegramCommandHandler(
+            status_fn   = self._tg_status,
+            pause_fn    = self._tg_pause,
+            resume_fn   = self._tg_resume,
+            flatten_fn  = self._tg_flatten,
+            why_fn      = self._tg_why,
+            set_risk_fn = self._tg_set_risk,
+        )
+        self._tg_cmd.start()
 
         self._monitor_loop()
 
@@ -3277,6 +3338,104 @@ class Orchestrator:
         for line in lines:
             logger.info(line)
 
+    # ── Telegram command callbacks ────────────────────────────────────────────
+
+    def _tg_status(self) -> str:
+        lines = []
+        try:
+            account = mt5.account_info()
+            if account:
+                lines.append(f"Equity: ${account.equity:,.2f}  Balance: ${account.balance:,.2f}")
+                lines.append(self._ftmo_tracker.status_line(account.equity))
+        except Exception:
+            pass
+        halt_state = "HALTED" if self.soft_halt.is_set() else "active"
+        lines.append(f"Bot: {halt_state}")
+        rows = self.registry.snapshot()
+        stale = [r["name"] for r in rows if r["status"] not in ("HEALTHY",)]
+        if stale:
+            lines.append(f"Stale/failed: {', '.join(stale)}")
+        else:
+            lines.append(f"Components: {len(rows)} all healthy")
+        try:
+            positions = mt5.positions_get()
+            if positions:
+                for p in positions:
+                    lines.append(
+                        f"  {p.symbol} {'LONG' if p.type==0 else 'SHORT'} "
+                        f"lots={p.volume:.2f} P&L=${p.profit:+.2f}"
+                    )
+            else:
+                lines.append("No open positions")
+        except Exception:
+            pass
+        return "\n".join(lines)
+
+    def _tg_pause(self) -> None:
+        self.soft_halt.set()
+        logger.info("[TgCmd] Soft halt SET via Telegram command")
+
+    def _tg_resume(self) -> None:
+        self.soft_halt.clear()
+        logger.info("[TgCmd] Soft halt CLEARED via Telegram command")
+
+    def _tg_flatten(self) -> str:
+        closed = 0
+        errors = 0
+        for sym in self._symbols:
+            try:
+                n = trader.close_all(sym)
+                closed += n
+            except Exception as exc:
+                logger.warning("[TgCmd] flatten error for %s: %s", sym, exc)
+                errors += 1
+        msg = f"Closed {closed} position(s) across {len(self._symbols)} symbol(s)."
+        if errors:
+            msg += f" {errors} error(s) — check logs."
+        logger.info("[TgCmd] %s", msg)
+        return msg
+
+    def _tg_why(self) -> str:
+        shadow_path = Path(__file__).parent.parent / "logs" / "shadow_stack.jsonl"
+        if not shadow_path.exists():
+            return "No shadow log yet — gates haven't run since restart."
+        try:
+            last_line = None
+            with shadow_path.open("r", encoding="utf-8") as fh:
+                for line in fh:
+                    if line.strip():
+                        last_line = line.strip()
+            if not last_line:
+                return "Shadow log is empty."
+            row = json.loads(last_line)
+            symbol  = row.get("symbol", "?")
+            gate    = row.get("blocking_gate", "none")
+            bar     = row.get("bar_time", "?")
+            score   = row.get("stack_score", row.get("score", "?"))
+            direc   = "+1 (LONG)" if row.get("signal_dir", 0) > 0 else "-1 (SHORT)"
+            msg = f"Symbol: {symbol}  Direction: {direc}\nBar: {bar}\nBlocked by: <b>{gate}</b>\nScore: {score}"
+            gates = row.get("gates", {})
+            if gates:
+                gate_lines = []
+                for g, v in list(gates.items())[-5:]:
+                    if isinstance(v, dict) and v.get("blocked"):
+                        gate_lines.append(f"  ✗ {g}")
+                    elif isinstance(v, dict):
+                        gate_lines.append(f"  ✓ {g}")
+                if gate_lines:
+                    msg += "\n" + "\n".join(gate_lines)
+            return msg
+        except Exception as exc:
+            return f"Error reading shadow log: {exc}"
+
+    def _tg_set_risk(self, pct: float) -> str:
+        self._trade_cfg["risk_pct"] = pct
+        for comp in self._components:
+            if hasattr(comp, "_trade_cfg"):
+                comp._trade_cfg["risk_pct"] = pct
+        logger.info("[TgCmd] risk_pct set to %.2f via Telegram", pct)
+        return f"risk_pct={pct:.2f}%"
+
     # ── Component runner with auto-restart ───────────────────────────────────
 
     def _run_component(self, comp: Component) -> None:
@@ -3329,6 +3488,8 @@ class Orchestrator:
 
     def _shutdown(self) -> None:
         logger.info("Orchestrator shutting down — stopping all components...")
+        if hasattr(self, "_tg_cmd"):
+            self._tg_cmd.stop()
         for comp in self._components:
             comp.stop()
         for t in self._threads:
