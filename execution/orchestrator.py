@@ -76,6 +76,7 @@ from backtests.run_multi_instrument import (
 )
 from core.instrument_profile import PROFILES, build_strategy_kwargs
 from core.probability_stack import StackInput, shadow_logger as _shadow_logger
+from news.news_intelligence import NewsIntelligence, NewsSignal
 
 logger = logging.getLogger(__name__)
 
@@ -971,6 +972,7 @@ class TradingEngine(Component):
         self._burned_targets:  dict = {}
         self._load_burned_targets()
         self._news_gate:        Optional[ng.NewsGate] = None
+        self._news_intel:       Optional[NewsIntelligence] = None
         self._event_dir_cache: dict[str, int] = {}
         self._trade_manager:   TradeManager = TradeManager()
         self._last_bar         = None
@@ -2399,8 +2401,9 @@ class TradingEngine(Component):
                     except Exception:
                         pass
 
-                    # News gate: price-confirmed direction preferred; consensus as fallback
+                    # News gate: price-confirmed direction preferred; NewsIntelligence (decayed) as fallback
                     # Amplifier only — never penalises
+                    _news_sig: Optional[NewsSignal] = None
                     if self._news_gate is not None:
                         news_ctx      = self._news_gate.get_context()
                         confirmed_dir = self._price_confirmed_event_direction(news_ctx)
@@ -2410,14 +2413,31 @@ class TradingEngine(Component):
                                             self.name, [e.name for e in news_ctx.fired_high])
                                 signal_score += 1
                                 _extra_reasons.append("News confirm +1")
+                                _shad.news_mod = 1
                         else:
-                            news_mod = news_ctx.score_modifier(self._symbol, desired)
-                            if news_mod > 0:
-                                logger.info("[%s] Macro consensus amplifies signal: +%d | %s",
-                                            self.name, news_mod,
-                                            news_ctx.fired_summary(self._symbol))
-                                signal_score += news_mod
-                                _extra_reasons.append(f"Macro consensus +{news_mod}")
+                            # Use NewsIntelligence (decayed+tier-aware) when available; fall back to flat +1
+                            if self._news_intel is not None:
+                                try:
+                                    _news_sig = self._news_intel.get_signal(self._symbol, desired)
+                                    if _news_sig.score_mod > 0:
+                                        signal_score += _news_sig.score_mod
+                                        _extra_reasons.append(f"NewsIntel +{_news_sig.score_mod}: {_news_sig.note}")
+                                        logger.info("[%s] NewsIntel: +%d | %s", self.name, _news_sig.score_mod, _news_sig.note)
+                                        _shad.news_mod = _news_sig.score_mod
+                                    if _news_sig.upcoming_caution:
+                                        logger.info("[%s] NewsIntel caution: %s in %.0fmin",
+                                                    self.name, _news_sig.upcoming_name, _news_sig.upcoming_min)
+                                except Exception as _ne:
+                                    logger.debug("[%s] NewsIntel error: %s", self.name, _ne)
+                            else:
+                                news_mod = news_ctx.score_modifier(self._symbol, desired)
+                                if news_mod > 0:
+                                    logger.info("[%s] Macro consensus amplifies signal: +%d | %s",
+                                                self.name, news_mod,
+                                                news_ctx.fired_summary(self._symbol))
+                                    signal_score += news_mod
+                                    _extra_reasons.append(f"Macro consensus +{news_mod}")
+                                    _shad.news_mod = news_mod
 
                     # Level confluence: +1 when entry fires at a pre-marked key level
                     if _approaching_levels:
@@ -2633,7 +2653,10 @@ class TradingEngine(Component):
                         level_strength     = _mc_ctx.level_strength if _mc_ctx else 0.0,
                         order_flow_aligned = _of_aligned or _scout_aligned,
                         dom_aligned        = _dom_supporting,
-                        news_aligned       = news_dir == desired if news_dir != 0 else False,
+                        news_aligned       = (
+                            (_news_sig.score_mod > 0) if _news_sig is not None
+                            else (news_dir == desired if news_dir != 0 else False)
+                        ),
                         trade_type         = _plan_type,
                         rr                 = _plan_rr,
                         in_ict_macro       = _in_ict_macro(_bar_time) if _bar_time is not None else False,
@@ -3017,6 +3040,7 @@ class Orchestrator:
 
         self._news_gate = ng.NewsGate()
         self._news_gate.start()
+        self._news_intel = NewsIntelligence(self._news_gate)
 
         # Log FTMO challenge status before anything trades
         try:
@@ -3119,6 +3143,7 @@ class Orchestrator:
                 book=self._book,
             )
             engine._news_gate     = self._news_gate
+            engine._news_intel    = self._news_intel
             engine._level_monitor = level_monitor
             engine._mc_agent      = MarketContextAgent(level_monitor)
             engine._cousin_router = cousin_router
