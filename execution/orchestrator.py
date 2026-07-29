@@ -75,6 +75,7 @@ from backtests.run_multi_instrument import (
     _size_mult_from_score,
 )
 from core.instrument_profile import PROFILES, build_strategy_kwargs
+from core.probability_stack import StackInput, shadow_logger as _shadow_logger
 
 logger = logging.getLogger(__name__)
 
@@ -2165,6 +2166,14 @@ class TradingEngine(Component):
 
                 # Open new position — gate through soft halt, RiskAgent, FTMOTracker
                 if desired != 0:
+                    _profile = PROFILES.get(self._symbol)
+                    _shad = StackInput(
+                        symbol=self._symbol,
+                        signal_dir=desired,
+                        archetype=_profile.archetype if _profile else "liquidity",
+                        archetype_threshold=_profile.entry_threshold if _profile else 65,
+                        bar_time=bar_dt.isoformat() if bar_dt else None,
+                    )
                     # Council Watch hard-halt file check (external daemon backup).
                     _council_halt = Path(__file__).parent.parent / "logs" / "council_halt.flag"
                     if _council_halt.exists():
@@ -2177,6 +2186,7 @@ class TradingEngine(Component):
                                 )
                                 if self._soft_halt is not None:
                                     self._soft_halt.set()
+                                _shad.gates["council_halt"] = {"blocked": True}; _shad.blocking_gate = "council_halt"; _shadow_logger.record(_shad)
                                 continue
                         except Exception:
                             pass
@@ -2186,6 +2196,7 @@ class TradingEngine(Component):
                     # since the background thread ticks every 60s.
                     if self._soft_halt is not None and self._soft_halt.is_set():
                         logger.warning("[%s] SOFT HALT active — blocking new entry", self.name)
+                        _shad.gates["soft_halt"] = {"blocked": True}; _shad.blocking_gate = "soft_halt"; _shadow_logger.record(_shad)
                         continue
                     _daily_boost = 0
                     if self._risk_guard is not None:
@@ -2202,6 +2213,7 @@ class TradingEngine(Component):
                                 )
                                 if self._soft_halt is not None:
                                     self._soft_halt.set()
+                                _shad.gates["daily_dd"] = {"blocked": True, "value": round(_inline_daily_dd, 3)}; _shad.blocking_gate = "daily_dd"; _shadow_logger.record(_shad)
                                 continue
                             # Compute tiered daily DD boost — applied to score floor after needed is set
                             if _inline_daily_dd >= DAILY_DD_TIER3_PCT:
@@ -2219,6 +2231,7 @@ class TradingEngine(Component):
                                 )
                                 if self._soft_halt is not None:
                                     self._soft_halt.set()
+                                _shad.gates["total_dd"] = {"blocked": True, "value": round(_inline_total_dd, 3)}; _shad.blocking_gate = "total_dd"; _shadow_logger.record(_shad)
                                 continue
 
                     # ── M5 confluence (not a gate — confluence only) ──────────
@@ -2231,6 +2244,7 @@ class TradingEngine(Component):
                             .rolling(14).mean().iloc[-1]
                         )
                     m5_confirmed = detect_m5_entry_trigger(df_m5_entry, desired, atr=atr_entry)
+                    _shad.m5_confirmed = m5_confirmed
                     if not m5_confirmed:
                         # Route to pending M5 trigger — never enter without LTF confirmation.
                         # "entering anyway" produced 0 wins across live testing.
@@ -2238,6 +2252,7 @@ class TradingEngine(Component):
                         if self._pending_signal == 0:
                             self._pending_signal = desired
                             self._pending_bars   = 0
+                        _shad.gates["m5_pending"] = {"blocked": True}; _shad.blocking_gate = "m5_pending"; _shadow_logger.record(_shad)
                         continue
 
                     # ── Accumulation / distribution gate ─────────────────────
@@ -2249,7 +2264,9 @@ class TradingEngine(Component):
                             "[%s] ACCUM GATE: %.0f%% risk of opposing accumulation — blocked signal=%+d",
                             self.name, accum_risk * 100, desired,
                         )
+                        _shad.gates["accumulation"] = {"blocked": True, "value": round(accum_risk, 2)}; _shad.blocking_gate = "accumulation"; _shadow_logger.record(_shad)
                         continue
+                    _shad.gates["accumulation"] = {"blocked": False, "value": round(accum_risk, 2)}
 
                     # ── Liquidity draw gate ───────────────────────────────────
                     liq = detect_liquidity_draw(df_m5_entry, desired, atr=atr_entry)
@@ -2258,14 +2275,18 @@ class TradingEngine(Component):
                             "[%s] LIQUIDITY GATE: opposing pool %.1f ATR away vs aligned %.1f ATR — blocked",
                             self.name, liq["opposing_pool"], liq["aligned_pool"],
                         )
+                        _shad.gates["liquidity_draw"] = {"blocked": True, "opposing": liq["opposing_pool"], "aligned": liq["aligned_pool"]}; _shad.blocking_gate = "liquidity_draw"; _shadow_logger.record(_shad)
                         continue
+                    _shad.gates["liquidity_draw"] = {"blocked": False}
 
                     # ── Correlation divergence gate ───────────────────────────
                     if self._correlation_divergence(desired):
+                        _shad.gates["corr_divergence"] = {"blocked": True}; _shad.blocking_gate = "corr_divergence"; _shadow_logger.record(_shad)
                         continue
 
                     # ── Correlation cluster cap (same-direction) ──────────────
                     if self._correlation_cluster_cap(desired):
+                        _shad.gates["corr_cluster_cap"] = {"blocked": True}; _shad.blocking_gate = "corr_cluster_cap"; _shadow_logger.record(_shad)
                         continue
 
                     # ── Weekend new-entry guard (FTMO compliance) ─────────────
@@ -2284,6 +2305,7 @@ class TradingEngine(Component):
                                 "[%s] Weekend gate: no new entries Fri≥20:00 UTC or Sat/Sun",
                                 self.name,
                             )
+                            _shad.gates["weekend"] = {"blocked": True}; _shad.blocking_gate = "weekend"; _shadow_logger.record(_shad)
                             continue
 
                     open_count = len(trader.get_all_positions())   # magic-filtered (H3)
@@ -2292,6 +2314,7 @@ class TradingEngine(Component):
                     )
                     if not can_trade:
                         logger.warning("[%s] RiskAgent blocked: %s", self.name, reason)
+                        _shad.gates["risk_agent"] = {"blocked": True, "reason": str(reason)}; _shad.blocking_gate = "risk_agent"; _shadow_logger.record(_shad)
                         continue
 
                     # FTMO compliance pre-trade gate (#05) — both total AND daily DD
@@ -2299,6 +2322,7 @@ class TradingEngine(Component):
                         ftmo_status = self._ftmo_tracker.check(equity)
                         if ftmo_status["total_dd_pct"] >= ftmo_status["total_dd_limit"]:
                             logger.critical("[%s] FTMO total DD limit — blocking entry", self.name)
+                            _shad.gates["ftmo_total_dd"] = {"blocked": True, "value": round(ftmo_status["total_dd_pct"], 3)}; _shad.blocking_gate = "ftmo_total_dd"; _shadow_logger.record(_shad)
                             continue
                         # Daily DD: measured from RiskGuard's SERVER-day baseline —
                         # the single source of truth for the daily reference, so this
@@ -2309,6 +2333,7 @@ class TradingEngine(Component):
                             if daily_dd >= ftmo_status["daily_dd_limit"]:
                                 logger.critical("[%s] FTMO daily DD %.2f%% >= %.1f%% — blocking entry",
                                                 self.name, daily_dd, ftmo_status["daily_dd_limit"])
+                                _shad.gates["ftmo_daily_dd"] = {"blocked": True, "value": round(daily_dd, 3)}; _shad.blocking_gate = "ftmo_daily_dd"; _shadow_logger.record(_shad)
                                 continue
 
                     # Level monitor — update key levels, log any approaches
@@ -2463,12 +2488,15 @@ class TradingEngine(Component):
                                     "score floor %d→%d",
                                     self.name, _total_dd_pct, _boost_thr, old_needed, needed)
 
+                    _shad.base_score = signal_score; _shad.final_score = signal_score; _shad.score_floor = needed; _shad.floor_reason = "counter_trend" if against_trend else "with_trend"; _shad.h4_aligned = (getattr(self._strategy, "_last_h4_bias", 0) == desired)
                     if signal_score < needed:
                         logger.info("[%s] LOW CONVICTION skip: %s score=%d < %d (%s)",
                                     self.name, "BUY" if desired == 1 else "SELL",
                                     signal_score, needed,
                                     "counter-trend" if against_trend else "with-trend")
+                        _shad.gates["score_floor"] = {"blocked": True, "score": signal_score, "needed": needed}; _shad.blocking_gate = "score_floor"; _shadow_logger.record(_shad)
                         continue
+                    _shad.gates["score_floor"] = {"blocked": False, "score": signal_score, "needed": needed}
 
                     # ── M1 structural confirmation ─────────────────────────────
                     # Require the last completed M1 candle to break above/below the
@@ -2490,6 +2518,7 @@ class TradingEngine(Component):
                                 self.name, "bull" if desired == 1 else "bear",
                                 _m1_close, _m1_phigh, _m1_plow,
                             )
+                            _shad.gates["m1_confirm"] = {"blocked": True}; _shad.blocking_gate = "m1_confirm"; _shadow_logger.record(_shad)
                             continue
 
                     # ── Z-score regime gate (ruflo/neural-trader classifier) ──
@@ -2505,8 +2534,10 @@ class TradingEngine(Component):
                         _rg_allow, _rg_reason = regime_entry_gate(_regime_result, desired, _plan_type_pre)
                         if not _rg_allow:
                             logger.info("[%s] REGIME GATE: %s", self.name, _rg_reason)
+                            _shad.regime = _regime_result.regime if _regime_result else "unknown"; _shad.gates["regime"] = {"blocked": True, "regime": _shad.regime, "reason": str(_rg_reason)}; _shad.blocking_gate = "regime"; _shadow_logger.record(_shad)
                             continue
                         if _regime_result:
+                            _shad.regime = _regime_result.regime
                             logger.info(
                                 "[%s] Regime: %s (maxZ=%.2f lastZ=%.2f highPct=%.0f%%)",
                                 self.name, _regime_result.regime, _regime_result.max_z,
@@ -2524,6 +2555,7 @@ class TradingEngine(Component):
                                 logger.info("[%s] %s", self.name, _cn)
                         if _mc_ctx.entry_block:
                             logger.info("[%s] MCAgent BLOCK: %s", self.name, _mc_ctx.narrative)
+                            _shad.gates["mc_agent"] = {"blocked": True, "narrative": str(_mc_ctx.narrative)}; _shad.blocking_gate = "mc_agent"; _shadow_logger.record(_shad)
                             continue
 
                     # Continuation trades have 0% live WR — require 2 extra score points
@@ -2533,12 +2565,14 @@ class TradingEngine(Component):
                     if _plan_type == "continuation" and _score_over_floor < 2:
                         logger.info("[%s] CONTINUATION GATE: score only %d over floor — skipping (need +2)",
                                     self.name, _score_over_floor)
+                        _shad.gates["continuation_score"] = {"blocked": True, "score_over_floor": _score_over_floor}; _shad.blocking_gate = "continuation_score"; _shadow_logger.record(_shad)
                         continue
                     # Continuation now 0/7 live: also require entry AT an HTF level.
                     # Chasing mid-range continuation is where the losses came from.
                     if _plan_type == "continuation" and not (_mc_ctx and _mc_ctx.at_level):
                         logger.info("[%s] CONTINUATION GATE: not at an HTF level — skipping "
                                     "(mid-range continuation banned, 0/7 live)", self.name)
+                        _shad.gates["continuation_level"] = {"blocked": True}; _shad.blocking_gate = "continuation_level"; _shadow_logger.record(_shad)
                         continue
 
                     # ── Bayesian probability model — replaces flat score_mult ──
@@ -2611,9 +2645,27 @@ class TradingEngine(Component):
                     )
                     _prob = self._prob_model.estimate(_confl)
 
+                    # Populate all confluence booleans on shadow capture now that _confl is built
+                    _shad.at_htf_level       = _confl.at_htf_level
+                    _shad.level_strength     = _confl.level_strength
+                    _shad.order_flow_aligned = _confl.order_flow_aligned
+                    _shad.dom_aligned        = _confl.dom_aligned
+                    _shad.news_aligned       = _confl.news_aligned
+                    _shad.in_ict_macro       = _confl.in_ict_macro
+                    _shad.ipda_aligned       = _confl.ipda_aligned
+                    _shad.smt_divergence     = _confl.smt_divergence
+                    _shad.eq_liq_cluster     = _confl.eq_liq_cluster
+                    _shad.early_leakage      = _confl.early_leakage
+                    _shad.ob_present         = _confl.ob_present
+                    _shad.prob_model_prob    = getattr(_prob, "p_win", 0.0)
+                    _shad.sweep_present      = any("sweep" in str(r).lower() for r in _cur_rsns)
+                    _shad.scout_aligned      = _scout_aligned
+
                     if not _prob.take_trade:
                         logger.info("[%s] PROB MODEL skip: %s", self.name, _prob.note)
+                        _shad.gates["prob_model"] = {"blocked": True, "note": str(_prob.note)}; _shad.blocking_gate = "prob_model"; _shadow_logger.record(_shad)
                         continue
+                    _shad.gates["prob_model"] = {"blocked": False, "p_win": getattr(_prob, "p_win", 0.0)}
 
                     # score_mult driven by probability model output
                     score_mult = _prob.size_mult
@@ -2688,6 +2740,7 @@ class TradingEngine(Component):
                         alloc = self._allocator.allocate(signal_score, new_risk, book)
                         if not alloc.taken:
                             logger.warning("[%s] ALLOCATOR skip: %s", self.name, alloc.reason)
+                            _shad.gates["allocator"] = {"blocked": True, "reason": str(alloc.reason)}; _shad.blocking_gate = "allocator"; _shadow_logger.record(_shad)
                             continue
                         if alloc.trims:
                             self._execute_trims(alloc.trims, risk_map)
@@ -2701,6 +2754,7 @@ class TradingEngine(Component):
                         if room <= 0.1:
                             logger.warning("[%s] PORTFOLIO RISK CAP: open=%.2f%% >= cap %.2f%% — entry blocked",
                                            self.name, open_risk, max_port)
+                            _shad.gates["portfolio_cap"] = {"blocked": True, "open_risk": round(open_risk, 2)}; _shad.blocking_gate = "portfolio_cap"; _shadow_logger.record(_shad)
                             continue
                         if new_risk > room:
                             scale = room / new_risk
@@ -2748,6 +2802,7 @@ class TradingEngine(Component):
                         logger.info("[%s] NO-DRAW skip: %s (grade %s) — %s",
                                     self.name, direction_str,
                                     self._last_plan.grade, self._last_plan.thesis)
+                        _shad.gates["no_draw"] = {"blocked": True, "grade": str(self._last_plan.grade)}; _shad.blocking_gate = "no_draw"; _shadow_logger.record(_shad)
                         continue
 
                     # ── Per-trade agent: Council adjudication + durable ticket ──
@@ -2765,6 +2820,7 @@ class TradingEngine(Component):
                     if ticket.verdict != "GO":
                         logger.info("[%s] AGENT NO_GO: %s | dissent: %s",
                                     self.name, direction_str, "; ".join(ticket.dissent))
+                        _shad.gates["trade_agent"] = {"blocked": True, "dissent": list(ticket.dissent)}; _shad.blocking_gate = "trade_agent"; _shadow_logger.record(_shad)
                         continue
 
                     # ── Council gate: Telegram approval before order fires ──
@@ -2798,9 +2854,11 @@ class TradingEngine(Component):
                                 self.name, self._symbol, desired, signal_score,
                             )
                             self._cousin_router.cleanup(bar_time)
+                            _shad.gates["cousin_router"] = {"blocked": True}; _shad.blocking_gate = "cousin_router"; _shadow_logger.record(_shad)
                             continue
                         self._cousin_router.cleanup(bar_time)
 
+                    _shad.fired = True; _shadow_logger.record(_shad)
                     if self._dry_run:
                         logger.info("[%s] DRY RUN: %s %.2f lots SL=%s TP=%s | score=%d x%.2f | %s",
                                     self.name, direction_str, lots, sl, tp,
