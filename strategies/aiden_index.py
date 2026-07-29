@@ -480,6 +480,7 @@ class AiDENIndexStrategy(Strategy):
         use_d1_bias: bool        = False,
         # Direction
         long_only: bool          = False,  # False = both longs and shorts
+        h4_bias_gate: bool       = True,   # False = sniper mode: build FVGs both ways, H4 bias is confluence not gate
         # Trailing stop — move SL to breakeven once trade reaches +trail_be_r profit
         # Default False: run to full SL/TP (preserves backtest win rate and RR)
         trail_to_be: bool        = False,
@@ -526,6 +527,7 @@ class AiDENIndexStrategy(Strategy):
         self.require_ce           = require_ce
         self.use_d1_bias          = use_d1_bias
         self.long_only            = long_only
+        self.h4_bias_gate         = h4_bias_gate
         self.trail_to_be          = trail_to_be
         self.trail_be_r           = trail_be_r
         self.trail_lock_r         = trail_lock_r
@@ -839,19 +841,20 @@ class AiDENIndexStrategy(Strategy):
                 rsi_val      = float(rsi_s.iloc[i]) if rsi_s is not None else float("nan")
                 strongly_trending = abs(trend_strength) > self.rr_trend_threshold
 
-                # Remove invalidated FVGs — expire any FVG whose bias no longer matches
-                # current H4 direction. A bull FVG formed when H4 was +1 is stale if H4
-                # has since flipped to 0 or -1; entering it would mean fading the current bias.
-                to_expire = []
-                for _fvg in active_fvgs:
-                    if _fvg["dir"] == "bull" and htf_bias != 1:
-                        to_expire.append(_fvg)
-                    elif _fvg["dir"] == "bear" and htf_bias != -1:
-                        to_expire.append(_fvg)
-                for _fvg in to_expire:
-                    active_fvgs.remove(_fvg)
+                # Remove invalidated FVGs — expire any FVG whose bias no longer matches.
+                # Sniper mode (h4_bias_gate=False): keep FVGs regardless of H4 flip —
+                # price structure is the authority, not the trend filter.
+                if self.h4_bias_gate:
+                    to_expire = []
+                    for _fvg in active_fvgs:
+                        if _fvg["dir"] == "bull" and htf_bias != 1:
+                            to_expire.append(_fvg)
+                        elif _fvg["dir"] == "bear" and htf_bias != -1:
+                            to_expire.append(_fvg)
+                    for _fvg in to_expire:
+                        active_fvgs.remove(_fvg)
 
-                if htf_bias == 0:
+                if htf_bias == 0 and self.h4_bias_gate:
                     self._expire_fvgs_neutral(active_fvgs, cv)
                     signals.iloc[i]     = position * position_size
                     self._stops.iloc[i] = float("nan")
@@ -862,10 +865,14 @@ class AiDENIndexStrategy(Strategy):
                 l2  = float(low.iloc[i - 2])
 
                 # LONG setup — bullish FVG
-                if htf_bias == 1:
+                # Sniper mode: build long FVG regardless of H4 bias; bias becomes confluence only
+                if htf_bias == 1 or not self.h4_bias_gate:
                     bull_gap = lv - h2
                     if bull_gap >= self.min_fvg_atr * atr_val:
-                        score = 2; reasons = ["H4 bias +2"]  # HTF bias +2
+                        if htf_bias == 1:
+                            score = 2; reasons = ["H4 bias +2"]
+                        else:
+                            score = 1; reasons = ["FVG"]  # sniper mode: no H4 gate bonus, bias is confluence
 
                         if not np.isnan(swing_hi) and swing_hi > swing_lo:
                             mid = swing_lo + (swing_hi - swing_lo) * self.discount_pct
@@ -1077,10 +1084,14 @@ class AiDENIndexStrategy(Strategy):
 
 
                 # SHORT setup — bearish FVG
-                if htf_bias == -1 and not self.long_only:
+                # Sniper mode: build short FVG regardless of H4 bias
+                if (htf_bias == -1 or not self.h4_bias_gate) and not self.long_only:
                     bear_gap = l2 - hv
                     if bear_gap >= self.min_fvg_atr * atr_val:
-                        score = 2; reasons = ["H4 bias +2"]  # HTF bias +2
+                        if htf_bias == -1:
+                            score = 2; reasons = ["H4 bias +2"]
+                        else:
+                            score = 1; reasons = ["FVG"]  # sniper mode
 
                         if not np.isnan(swing_hi) and swing_hi > swing_lo:
                             mid = swing_lo + (swing_hi - swing_lo) * self.discount_pct
@@ -1268,11 +1279,11 @@ class AiDENIndexStrategy(Strategy):
                 _alt_cdh_i = _cdh[i]; _alt_cdl_i = _cdl[i]
                 _alt_pdh_i = _pdh[i]; _alt_pdl_i = _pdl[i]
 
-                if htf_bias == 1:
+                if htf_bias == 1 or not self.h4_bias_gate:
                     # ── Sweep reversal long ───────────────────────────────────
                     _swept_lo, _sl_lo = _sweep_reversal_bull(close, low, i, self.liq_lookback * 2)
                     if _swept_lo is not None and not _alt_dup(active_fvgs, "bull", _sl_lo, atr_val):
-                        _sc = 2; _rs = ["H4 bias +2"]
+                        _sc = 2 if htf_bias == 1 else 1; _rs = ["H4 bias +2"] if htf_bias == 1 else ["Sweep reversal"]
                         _sc += 2; _rs.append("Liq sweep reversal +2")
 
                         if not np.isnan(swing_hi) and swing_hi > swing_lo:
@@ -1379,11 +1390,11 @@ class AiDENIndexStrategy(Strategy):
                                 "trend_s":  trend_strength,
                             })
 
-                if htf_bias == -1 and not self.long_only:
+                if (htf_bias == -1 or not self.h4_bias_gate) and not self.long_only:
                     # ── Sweep reversal short ──────────────────────────────────
                     _swept_hi, _sl_hi = _sweep_reversal_bear(close, high, i, self.liq_lookback * 2)
                     if _swept_hi is not None and not _alt_dup(active_fvgs, "bear", _sl_hi, atr_val):
-                        _sc = 2; _rs = ["H4 bias +2"]
+                        _sc = 2 if htf_bias == -1 else 1; _rs = ["H4 bias +2"] if htf_bias == -1 else ["Sweep reversal"]
                         _sc += 2; _rs.append("Liq sweep reversal +2")
 
                         if not np.isnan(swing_hi) and swing_hi > swing_lo:

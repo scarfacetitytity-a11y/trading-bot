@@ -329,6 +329,7 @@ def _build_aiden_strategy(symbol: str) -> AiDENIndexStrategy:
     tf_p  = M15_PARAMS.copy()
     v2    = dict(
         long_only=(symbol not in BIDIRECTIONAL),
+        h4_bias_gate=(symbol not in {"XAUUSD", "XAGUSD"}),  # sniper mode: no H4 trend gate for metals
         rr_model3_bonus=0.5, rr_trend_bonus=0.5, rr_trend_threshold=0.003, rr_max=5.0,
         session_prime_start=13, session_prime_end=15,
         use_rsi=True, rsi_period=56,
@@ -2491,24 +2492,6 @@ class TradingEngine(Component):
                                     "[%s] DD-boost active (DD=%.2f%%, within %.1f%% of soft halt): "
                                     "score floor %d→%d",
                                     self.name, _total_dd_pct, _boost_thr, old_needed, needed)
-
-                    # ── FOMC / central bank rate-decision block ────────────────
-                    # JP mentor v7: "Do you want to surf in a tsunami wave?"
-                    # Hard block all entries within 4h of a rate decision or for
-                    # 1h after it fires — spread widens, slippage can be extreme.
-                    if self._news_gate is not None:
-                        try:
-                            _nctx2 = self._news_gate.get_context(
-                                fired_window_min=120.0, upcoming_window_min=240.0
-                            )
-                            if _nctx2.is_rate_decision_window():
-                                logger.info(
-                                    "[%s] FOMC/rate-decision window → entry blocked (tsunami rule)",
-                                    self.name,
-                                )
-                                continue
-                        except Exception:
-                            pass
 
                     if signal_score < needed:
                         logger.info("[%s] LOW CONVICTION skip: %s score=%d < %d (%s)",
