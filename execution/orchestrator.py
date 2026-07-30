@@ -2455,6 +2455,21 @@ class TradingEngine(Component):
                     # Score-based sizing: psychology_mult * score_mult * concentration_mult
                     _sc          = getattr(self._strategy, "_scores", None)
                     signal_score = int(_sc.iloc[-1]) if _sc is not None else 0
+
+                    # AMD aligned sweep boost: displacement entry = strongest confluence.
+                    # Strong sweep aligned with signal = +2 (equals HTF zone boost).
+                    # Weak sweep aligned = +1.
+                    if _amd_sweep is not None and _amd_sweep.direction == desired:
+                        _amd_boost = 2 if _amd_sweep.strong else 1
+                        signal_score += _amd_boost
+                        logger.info(
+                            "[%s] AMD aligned %s sweep @ %s → +%d score",
+                            self.name,
+                            "BULL" if _amd_sweep.direction == 1 else "BEAR",
+                            _amd_sweep.level_label, _amd_boost,
+                        )
+                        _extra_reasons.append(f"AMD sweep +{_amd_boost}")
+
                     # M5 confluence bonus applied here after base score is loaded
                     if m5_confirmed:
                         signal_score += 1
