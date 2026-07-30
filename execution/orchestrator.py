@@ -1207,20 +1207,26 @@ class TradingEngine(Component):
         # bypassed this and could exceed volume_max or violate volume_step).
         lots = risk._clamp_lots(self._symbol, lots)
 
-        # ── Max notional cap (fix #2) ─────────────────────────────────────────
-        # Backstop so a tight-ish stop can never produce an absurd position size.
-        # Big lots stay allowed on high-conviction trades — just not runaway.
+        # ── Max notional cap ──────────────────────────────────────────────────
+        # Notional must be in account currency (USD). For pairs where USD is the
+        # BASE (e.g. USDJPY), notional = lots * contract (already USD — don't
+        # multiply by price, which would give JPY notional and massively over-cap).
         tick_c = mt5.symbol_info_tick(self._symbol)
         info_c = mt5.symbol_info(self._symbol)
         px_c   = (tick_c.ask if direction == 1 else tick_c.bid) if tick_c else 0.0
         if info_c is not None and px_c > 0 and lots > 0:
-            contract = getattr(info_c, "trade_contract_size", 1.0) or 1.0
-            notional = lots * contract * px_c
+            contract      = getattr(info_c, "trade_contract_size", 1.0) or 1.0
+            currency_base = getattr(info_c, "currency_base", "")
+            acc_currency  = "USD"
+            if currency_base == acc_currency:
+                notional_usd = lots * contract
+            else:
+                notional_usd = lots * contract * px_c
             max_notional = balance * float(self._trade_cfg.get("max_notional_x", 30))
-            if max_notional > 0 and notional > max_notional:
-                capped = risk._clamp_lots(self._symbol, lots * max_notional / notional)
-                logger.warning("[%s] NOTIONAL CAP: %.2f -> %.2f lots (notional %.0f > cap %.0f)",
-                               self.name, lots, capped, notional, max_notional)
+            if max_notional > 0 and notional_usd > max_notional:
+                capped = risk._clamp_lots(self._symbol, lots * max_notional / notional_usd)
+                logger.warning("[%s] NOTIONAL CAP: %.2f -> %.2f lots (notional_usd %.0f > cap %.0f)",
+                               self.name, lots, capped, notional_usd, max_notional)
                 lots = capped
 
         lots = max(lots, 0.01)

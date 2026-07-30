@@ -216,6 +216,20 @@ def modify_sl_tp(
         logger.error("modify_sl_tp: no symbol info for %s", symbol)
         return False
 
+    # Guard: broker requires SL/TP >= stop_level points from current price.
+    # Skipping instead of sending prevents retcode 10016 (invalid stops).
+    if new_sl is not None:
+        tick     = mt5.symbol_info_tick(symbol)
+        stop_pts = getattr(info, "trade_stops_level", 0) or 0
+        min_dist = stop_pts * (getattr(info, "point", 0.00001) or 0.00001)
+        if tick is not None and min_dist > 0:
+            sl_above = new_sl > tick.bid
+            dist = (new_sl - tick.ask) if sl_above else (tick.bid - new_sl)
+            if dist < min_dist:
+                logger.debug("modify_sl_tp: SL %.5f within stop_level %.5f of price — skip",
+                             new_sl, min_dist)
+                return False
+
     request: dict = {"action": mt5.TRADE_ACTION_SLTP, "symbol": symbol, "position": ticket}
     if new_sl is not None:
         request["sl"] = round(new_sl, info.digits)
