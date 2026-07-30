@@ -2416,9 +2416,16 @@ class TradingEngine(Component):
                                        if hasattr(self._strategy, "_atr_cache") else 0.0
                             _all_levels_amd = list(_ls_amd.levels) + list(_ls_amd.zones)
                             try:
-                                _amd_sweep = self._amd_detector.detect(
-                                    df, _all_levels_amd, _atr_amd or (equity * 0.002)
+                                _amd_phase = self._amd_detector.assess_phase(
+                                    self._symbol, df, _all_levels_amd,
+                                    _atr_amd or (equity * 0.002),
                                 )
+                                _amd_sweep = _amd_phase.sweep if _amd_phase.phase.value in (
+                                    "manipulation", "displacement"
+                                ) else None
+                                if _amd_phase.phase.value != "unknown":
+                                    logger.info("[%s] AMD phase: %s", self.name, _amd_phase)
+                                    _shad.regime = _amd_phase.phase.value
                             except Exception:
                                 _amd_sweep = None
                             if _amd_sweep is not None:
