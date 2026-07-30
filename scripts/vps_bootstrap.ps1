@@ -54,23 +54,12 @@ if (-not (Test-Path $VENV)) { & python -m venv $VENV }
 & "$VENV\Scripts\pip.exe" install -r "$BOT_DIR\requirements.txt" --quiet
 Write-Host "Dependencies installed." -ForegroundColor Green
 
-# ── 5. Create .env if missing ────────────────────────────────────────────────
+# ── 5. .env comes from git — verify it's present ────────────────────────────
 $envFile = "$BOT_DIR\.env"
-if (-not (Test-Path $envFile)) {
-    New-Item -ItemType File -Path $envFile | Out-Null
-    @"
-# MT5 Demo account (FTMO $100k challenge — account 1514131398)
-MT5_LOGIN=YOUR_MT5_LOGIN
-MT5_PASSWORD=YOUR_MT5_PASSWORD
-MT5_SERVER=FTMO-Demo
-
-# Telegram alerts (rajanmusicemail@gmail.com bot)
-TELEGRAM_BOT_TOKEN=YOUR_BOT_TOKEN
-TELEGRAM_CHAT_ID=YOUR_CHAT_ID
-"@ | Out-File -FilePath $envFile -Encoding utf8
-    Write-Host ".env created — fill in credentials before starting." -ForegroundColor Yellow
+if (Test-Path $envFile) {
+    Write-Host ".env present (from git)." -ForegroundColor Green
 } else {
-    Write-Host ".env already exists." -ForegroundColor Green
+    Write-Host "WARNING: .env not found after clone — check repo." -ForegroundColor Yellow
 }
 
 # ── 6. Logs directory ────────────────────────────────────────────────────────
@@ -119,7 +108,7 @@ Write-Host ""
 Write-Host "=== Bootstrap complete ===" -ForegroundColor Cyan
 Write-Host ""
 Write-Host "Next steps:" -ForegroundColor Yellow
-Write-Host "  1. Edit $envFile — fill in MT5 credentials + Telegram tokens"
+Write-Host "  1. Verify .env is present (credentials come from git)"
 Write-Host "  2. Edit $BOT_DIR\config\config_vps.yaml if MT5 terminal path differs"
 Write-Host "     (default: C:\Program Files\MetaTrader 5\terminal64.exe)"
 Write-Host "  3. Reboot VPS — both tasks start automatically, watchdog launches bot"
