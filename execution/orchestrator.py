@@ -2484,12 +2484,13 @@ class TradingEngine(Component):
                                     _extra_reasons.append(f"Macro consensus +{news_mod}")
                                     _shad.news_mod = news_mod
 
-                    # Level confluence: +1 when entry fires at a pre-marked key level
+                    # Level confluence: key level proximity +1; HTF zone entry uses zone.score_boost
                     if _approaching_levels:
-                        signal_score += 1
+                        _lvl_boost = max(getattr(l, "score_boost", 1) for l in _approaching_levels)
+                        signal_score += _lvl_boost
                         lvl_names = ", ".join(l.label for l in _approaching_levels)
-                        logger.info("[%s] Key level confluence +1: %s", self.name, lvl_names)
-                        _extra_reasons.append(f"Key level +1 ({lvl_names})")
+                        logger.info("[%s] Level confluence +%d: %s", self.name, _lvl_boost, lvl_names)
+                        _extra_reasons.append(f"Level +{_lvl_boost} ({lvl_names})")
 
                     # DXY alignment check — metals and forex pairs with known DXY correlation.
                     # JP mentor: "Dixie is the driving force behind GU and EU — if Dixie gains
