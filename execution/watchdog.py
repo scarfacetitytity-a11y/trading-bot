@@ -43,10 +43,11 @@ RISK_STATE = LOG_DIR / "risk_agent_state.json"
 HALT_FLAG  = LOG_DIR / "council_halt.flag"
 ENV_FILE   = ROOT / ".env"
 
-POLL_INTERVAL   = 30      # seconds between health checks
-LOG_STALE_SECS  = 300     # 5 min without log update = bot frozen
-RESTART_COOLDOWN= 120     # min seconds between restarts to avoid restart storm
-DD_ALERT_PCT    = 4.0     # alert when daily DD exceeds this %
+POLL_INTERVAL      = 30    # seconds between health checks
+LOG_STALE_SECS     = 300   # 5 min without log update = bot frozen
+RESTART_COOLDOWN   = 120   # min seconds between restarts to avoid restart storm
+BOT_STARTUP_GRACE  = 120   # seconds after bot start before log-freshness check kicks in
+DD_ALERT_PCT       = 4.0   # alert when daily DD exceeds this %
 
 logging.basicConfig(
     level=logging.INFO,
@@ -104,11 +105,17 @@ def _start_bot() -> int | None:
     """Start the trading bot. Returns new PID or None on failure."""
     try:
         BOT_PID.unlink(missing_ok=True)
+        # CREATE_NEW_PROCESS_GROUP isolates the bot so it doesn't receive
+        # SIGINT/Ctrl+C when the watchdog is killed or restarted (Windows).
+        extra = {}
+        if sys.platform == "win32":
+            extra["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
         proc = subprocess.Popen(
             [sys.executable, "-m", "execution.orchestrator"],
             cwd=str(ROOT),
             stdout=open(BOT_LOG, "a", encoding="utf-8"),
             stderr=open(BOT_ERR, "a", encoding="utf-8"),
+            **extra,
         )
         logger.info("Bot started (PID %d)", proc.pid)
         _tg(f"Bot restarted automatically (PID {proc.pid})")
@@ -134,6 +141,7 @@ def _kill(pid: int) -> None:
 class WatchdogState:
     def __init__(self) -> None:
         self.last_restart: float = 0.0
+        self.bot_start_time: float = 0.0  # time.time() when bot was last started
         self.autotrading_alerted: bool = False
         self.dd_alerted: bool = False
         self.last_alert_day: str = ""
@@ -142,7 +150,11 @@ class WatchdogState:
         return (time.time() - self.last_restart) >= RESTART_COOLDOWN
 
     def mark_restart(self) -> None:
-        self.last_restart = time.time()
+        self.last_restart   = time.time()
+        self.bot_start_time = time.time()
+
+    def in_startup_grace(self) -> bool:
+        return (time.time() - self.bot_start_time) < BOT_STARTUP_GRACE
 
 
 def check_bot_process(state: WatchdogState) -> None:
@@ -172,6 +184,8 @@ def check_log_freshness(state: WatchdogState) -> None:
     """If orchestrator.log hasn't been written to in LOG_STALE_SECS, bot is frozen."""
     if not BOT_LOG.exists():
         return
+    if state.in_startup_grace():
+        return   # bot just started — log mtime predates this run
     age = time.time() - BOT_LOG.stat().st_mtime
     if age < LOG_STALE_SECS:
         return
