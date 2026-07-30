@@ -66,6 +66,7 @@ from execution.ftmo_tracker import FTMOTracker
 from execution.trade_journal import TradeJournal
 from execution.portfolio_manager import PortfolioAllocator, PortfolioBook, OpenPos, Trim
 from execution.level_monitor import LevelMonitor
+from core.amd_detector import AMDDetector, SweepEvent
 from execution.market_context_agent import MarketContextAgent, MarketContext
 from execution.probability_model import ProbabilityModel, TradeConfluences
 from execution.order_flow import analyse_order_flow, order_flow_score_modifier, get_dom_key_levels
@@ -962,6 +963,7 @@ class TradingEngine(Component):
         self._adaptive_port    = bool(trade_cfg.get("adaptive_portfolio", False))
         self._lookback         = trade_cfg.get("lookback_bars", 500)
         self._level_monitor:   Optional[LevelMonitor] = None
+        self._amd_detector:    Optional[AMDDetector]  = None
         self._mc_agent:        Optional[MarketContextAgent] = None
         self._corr_matrix:     Optional[CorrelationMatrix] = None
         self._prob_model:      ProbabilityModel = ProbabilityModel()
@@ -2401,6 +2403,55 @@ class TradingEngine(Component):
                         except Exception:
                             pass
 
+                    # AMD sweep detection — runs before score, blocks first.
+                    # If price swept a key level and closed back past it, the expected
+                    # displacement is in the sweep direction. Trading AGAINST that is
+                    # the wrong side of the manipulation. Strong sweeps hard-block;
+                    # weak sweeps require floor+2 extra if counter-direction.
+                    _amd_sweep: Optional[SweepEvent] = None
+                    if self._amd_detector is not None and self._level_monitor is not None:
+                        _ls_amd = self._level_monitor._level_sets.get(self._symbol)
+                        if _ls_amd is not None:
+                            _atr_amd = float(getattr(self._strategy, "_atr_cache", pd.Series()).iloc[-1]) \
+                                       if hasattr(self._strategy, "_atr_cache") else 0.0
+                            _all_levels_amd = list(_ls_amd.levels) + list(_ls_amd.zones)
+                            try:
+                                _amd_sweep = self._amd_detector.detect(
+                                    df, _all_levels_amd, _atr_amd or (equity * 0.002)
+                                )
+                            except Exception:
+                                _amd_sweep = None
+                            if _amd_sweep is not None:
+                                logger.info(
+                                    "[%s] AMD sweep: %s", self.name, _amd_sweep
+                                )
+                                _shad.sweep_present  = (_amd_sweep.direction == desired)
+                                _shad.eq_liq_cluster = _amd_sweep.eq_liq
+                                # Block if signal goes AGAINST a confirmed sweep
+                                if _amd_sweep.direction != desired:
+                                    if _amd_sweep.strong:
+                                        logger.info(
+                                            "[%s] AMD SWEEP HARD BLOCK: STRONG %s sweep @ %s but signal=%+d",
+                                            self.name,
+                                            "BULL" if _amd_sweep.direction == 1 else "BEAR",
+                                            _amd_sweep.level_label, desired,
+                                        )
+                                        _shad.gates["amd_sweep"] = {
+                                            "blocked": True, "sweep_dir": _amd_sweep.direction,
+                                            "strong": True, "level": _amd_sweep.level_label,
+                                        }
+                                        _shad.blocking_gate = "amd_sweep"
+                                        _shadow_logger.record(_shad)
+                                        continue
+                                    # Weak counter-sweep: deferred to score gate (needs floor+2)
+                                    logger.info(
+                                        "[%s] AMD SWEEP WEAK counter-signal: %s sweep @ %s "
+                                        "vs signal=%+d — will need floor+2",
+                                        self.name,
+                                        "BULL" if _amd_sweep.direction == 1 else "BEAR",
+                                        _amd_sweep.level_label, desired,
+                                    )
+
                     # Score-based sizing: psychology_mult * score_mult * concentration_mult
                     _sc          = getattr(self._strategy, "_scores", None)
                     signal_score = int(_sc.iloc[-1]) if _sc is not None else 0
@@ -2591,6 +2642,31 @@ class TradingEngine(Component):
                         _shad.gates["score_floor"] = {"blocked": True, "score": signal_score, "needed": needed}; _shad.blocking_gate = "score_floor"; _shadow_logger.record(_shad)
                         continue
                     _shad.gates["score_floor"] = {"blocked": False, "score": signal_score, "needed": needed}
+
+                    # ── Weak AMD counter-sweep gate (deferred to here for floor+2 check) ──
+                    if (_amd_sweep is not None
+                            and _amd_sweep.direction != desired
+                            and not _amd_sweep.strong):
+                        _sweep_sof = signal_score - needed
+                        if _sweep_sof < 2:
+                            logger.info(
+                                "[%s] AMD SWEEP WEAK BLOCK: counter-%s sweep @ %s, "
+                                "need floor+2 (have +%d)",
+                                self.name,
+                                "BULL" if _amd_sweep.direction == 1 else "BEAR",
+                                _amd_sweep.level_label, _sweep_sof,
+                            )
+                            _shad.gates["amd_sweep"] = {
+                                "blocked": True, "sweep_dir": _amd_sweep.direction,
+                                "strong": False, "over_floor": _sweep_sof,
+                            }
+                            _shad.blocking_gate = "amd_sweep"
+                            _shadow_logger.record(_shad)
+                            continue
+                        logger.info(
+                            "[%s] AMD SWEEP WEAK: counter-sweep but floor+%d >= 2 — allowed",
+                            self.name, signal_score - needed,
+                        )
 
                     # ── HTF premium/discount range gate ────────────────────
                     # If price is in the upper 25% of H4 range (premium), only take
@@ -3307,6 +3383,7 @@ class Orchestrator:
         level_monitor = LevelMonitor(
             proximity_atr=float(self._trade_cfg.get("level_proximity_atr", 1.0))
         )
+        amd_detector  = AMDDetector()
         cousin_router = CousinRouter()
 
         for symbol in self._symbols:
@@ -3330,6 +3407,7 @@ class Orchestrator:
             engine._news_gate     = self._news_gate
             engine._news_intel    = self._news_intel
             engine._level_monitor = level_monitor
+            engine._amd_detector  = amd_detector
             engine._mc_agent      = MarketContextAgent(level_monitor)
             engine._cousin_router = cousin_router
             engine._corr_matrix   = self._corr_matrix
