@@ -1,31 +1,28 @@
-# AiDEN VPS Bootstrap — ForexVPS Windows
-# Paste this entire script into the VPS PowerShell terminal and run it.
-# Run as Administrator.
+# AiDEN VPS Bootstrap — Windows VPS (ForexVPS / Contabo Windows)
+# Run as Administrator in PowerShell.
+# Installs Python, Git, clones repo, sets up .env, registers three-process stack as Scheduled Tasks.
 
 $ErrorActionPreference = "Stop"
-$BOT_DIR = "C:\aiden-bot"
-$REPO_URL = "https://github.com/scarfacetitytity-a11y/trading-bot.git"
+$BOT_DIR    = "C:\aiden-bot"
+$REPO_URL   = "https://github.com/scarfacetitytity-a11y/trading-bot.git"
 $PYTHON_URL = "https://www.python.org/ftp/python/3.11.9/python-3.11.9-amd64.exe"
-$PYTHON_INSTALLER = "$env:TEMP\python-installer.exe"
-$TASK_NAME = "AiDEN-Bot"
+$VENV       = "$BOT_DIR\venv"
+$PY         = "$VENV\Scripts\python.exe"
+$LOG_DIR    = "$BOT_DIR\logs"
 
 Write-Host "=== AiDEN VPS Bootstrap ===" -ForegroundColor Cyan
 
 # ── 1. Python ────────────────────────────────────────────────────────────────
 $pythonOk = $false
-try {
-    $v = & python --version 2>&1
-    if ($v -match "3\.") { $pythonOk = $true; Write-Host "Python already installed: $v" }
-} catch {}
+try { $v = & python --version 2>&1; if ($v -match "3\.") { $pythonOk = $true; Write-Host "Python: $v" } } catch {}
 
 if (-not $pythonOk) {
+    $installer = "$env:TEMP\python-installer.exe"
     Write-Host "Downloading Python 3.11.9..."
-    Invoke-WebRequest -Uri $PYTHON_URL -OutFile $PYTHON_INSTALLER -UseBasicParsing
-    Write-Host "Installing Python (adds to PATH)..."
-    Start-Process -FilePath $PYTHON_INSTALLER -ArgumentList "/quiet InstallAllUsers=1 PrependPath=1 Include_test=0" -Wait
-    $env:PATH = [System.Environment]::GetEnvironmentVariable("PATH", "Machine") + ";" + [System.Environment]::GetEnvironmentVariable("PATH", "User")
-    $v = & python --version 2>&1
-    Write-Host "Installed: $v" -ForegroundColor Green
+    Invoke-WebRequest -Uri $PYTHON_URL -OutFile $installer -UseBasicParsing
+    Start-Process -FilePath $installer -ArgumentList "/quiet InstallAllUsers=1 PrependPath=1 Include_test=0" -Wait
+    $env:PATH = [System.Environment]::GetEnvironmentVariable("PATH","Machine") + ";" + [System.Environment]::GetEnvironmentVariable("PATH","User")
+    Write-Host "Python installed: $(& python --version 2>&1)" -ForegroundColor Green
 }
 
 # ── 2. Git ───────────────────────────────────────────────────────────────────
@@ -33,77 +30,104 @@ $gitOk = $false
 try { & git --version | Out-Null; $gitOk = $true } catch {}
 
 if (-not $gitOk) {
+    $gi = "$env:TEMP\git-installer.exe"
     $GIT_URL = "https://github.com/git-for-windows/git/releases/download/v2.45.2.windows.1/Git-2.45.2-64-bit.exe"
-    $GIT_INSTALLER = "$env:TEMP\git-installer.exe"
     Write-Host "Downloading Git..."
-    Invoke-WebRequest -Uri $GIT_URL -OutFile $GIT_INSTALLER -UseBasicParsing
-    Start-Process -FilePath $GIT_INSTALLER -ArgumentList "/VERYSILENT /NORESTART /COMPONENTS=icons,ext\reg\shellhere,assoc,assoc_sh" -Wait
+    Invoke-WebRequest -Uri $GIT_URL -OutFile $gi -UseBasicParsing
+    Start-Process -FilePath $gi -ArgumentList "/VERYSILENT /NORESTART /COMPONENTS=icons,ext\reg\shellhere,assoc,assoc_sh" -Wait
     $env:PATH = $env:PATH + ";C:\Program Files\Git\cmd"
     Write-Host "Git installed." -ForegroundColor Green
 }
 
-# ── 3. Clone repo ────────────────────────────────────────────────────────────
-if (Test-Path $BOT_DIR) {
-    Write-Host "Bot directory exists — pulling latest..."
+# ── 3. Clone / pull repo ─────────────────────────────────────────────────────
+if (Test-Path "$BOT_DIR\.git") {
+    Write-Host "Pulling latest..."
     & git -C $BOT_DIR pull
 } else {
     Write-Host "Cloning repo..."
     & git clone $REPO_URL $BOT_DIR
 }
 
-# ── 4. Virtual environment + dependencies ────────────────────────────────────
-Write-Host "Setting up Python environment..."
-if (-not (Test-Path "$BOT_DIR\venv")) {
-    & python -m venv "$BOT_DIR\venv"
-}
-& "$BOT_DIR\venv\Scripts\pip.exe" install --upgrade pip --quiet
-& "$BOT_DIR\venv\Scripts\pip.exe" install -r "$BOT_DIR\requirements.txt" --quiet
+# ── 4. Virtualenv + dependencies ─────────────────────────────────────────────
+if (-not (Test-Path $VENV)) { & python -m venv $VENV }
+& "$VENV\Scripts\pip.exe" install --upgrade pip --quiet
+& "$VENV\Scripts\pip.exe" install -r "$BOT_DIR\requirements.txt" --quiet
 Write-Host "Dependencies installed." -ForegroundColor Green
 
 # ── 5. Create .env if missing ────────────────────────────────────────────────
 $envFile = "$BOT_DIR\.env"
 if (-not (Test-Path $envFile)) {
+    New-Item -ItemType File -Path $envFile | Out-Null
     @"
-# MT5 Demo account (100k FTMO challenge)
-MT5_LOGIN_DEMO=YOUR_DEMO_LOGIN
-MT5_PASSWORD_DEMO=YOUR_DEMO_PASSWORD
-MT5_SERVER_DEMO=YOUR_BROKER_SERVER
+# MT5 Demo account (FTMO $100k challenge — account 1514131398)
+MT5_LOGIN=YOUR_MT5_LOGIN
+MT5_PASSWORD=YOUR_MT5_PASSWORD
+MT5_SERVER=FTMO-Demo
 
-# MT5 Live account (£50 live — separate instance)
-MT5_LOGIN_LIVE=YOUR_LIVE_LOGIN
-MT5_PASSWORD_LIVE=YOUR_LIVE_PASSWORD
-MT5_SERVER_LIVE=YOUR_BROKER_SERVER_LIVE
-
-# Telegram alerts
-TELEGRAM_BOT_TOKEN=YOUR_TELEGRAM_BOT_TOKEN
-TELEGRAM_CHAT_ID=YOUR_TELEGRAM_CHAT_ID
+# Telegram alerts (rajanmusicemail@gmail.com bot)
+TELEGRAM_BOT_TOKEN=YOUR_BOT_TOKEN
+TELEGRAM_CHAT_ID=YOUR_CHAT_ID
 "@ | Out-File -FilePath $envFile -Encoding utf8
-    Write-Host ".env created — FILL IN YOUR CREDENTIALS before starting the bot." -ForegroundColor Yellow
+    Write-Host ".env created — fill in credentials before starting." -ForegroundColor Yellow
 } else {
-    Write-Host ".env already exists — skipping." -ForegroundColor Green
+    Write-Host ".env already exists." -ForegroundColor Green
 }
 
-# ── 6. Scheduled Task (auto-start on reboot) ─────────────────────────────────
-Write-Host "Registering Windows Scheduled Task: $TASK_NAME..."
-$action = New-ScheduledTaskAction `
-    -Execute "$BOT_DIR\venv\Scripts\python.exe" `
-    -Argument "$BOT_DIR\execution\orchestrator.py" `
-    -WorkingDirectory $BOT_DIR
+# ── 6. Logs directory ────────────────────────────────────────────────────────
+New-Item -ItemType Directory -Path $LOG_DIR -Force | Out-Null
 
-$trigger = New-ScheduledTaskTrigger -AtStartup
-$settings = New-ScheduledTaskSettingsSet -RestartCount 5 -RestartInterval (New-TimeSpan -Minutes 2) -ExecutionTimeLimit (New-TimeSpan -Days 0)
-$principal = New-ScheduledTaskPrincipal -UserId "SYSTEM" -LogonType ServiceAccount -RunLevel Highest
+# ── 7. Scheduled Tasks (auto-start on reboot) ────────────────────────────────
+# Architecture: watchdog starts bot automatically. Register watchdog + code_monitor only.
 
-if (Get-ScheduledTask -TaskName $TASK_NAME -ErrorAction SilentlyContinue) {
-    Unregister-ScheduledTask -TaskName $TASK_NAME -Confirm:$false
+$tasks = @(
+    @{
+        Name      = "AiDEN-Watchdog"
+        Argument  = "-m execution.watchdog"
+        StdOut    = "$LOG_DIR\watchdog.log"
+        StdErr    = "$LOG_DIR\watchdog_err.log"
+    },
+    @{
+        Name      = "AiDEN-CodeMonitor"
+        Argument  = "-m execution.code_monitor"
+        StdOut    = "$LOG_DIR\code_monitor.log"
+        StdErr    = "$LOG_DIR\code_monitor_err.log"
+    }
+)
+
+foreach ($t in $tasks) {
+    $logStdOut = $t.StdOut
+    $logStdErr = $t.StdErr
+    # Wrap in cmd.exe so stdout/stderr redirect works in Scheduled Tasks
+    $cmd  = "cmd.exe"
+    $args = "/c `"$PY $($t.Argument) >> $logStdOut 2>> $logStdErr`""
+
+    $action   = New-ScheduledTaskAction -Execute $cmd -Argument $args -WorkingDirectory $BOT_DIR
+    $trigger  = New-ScheduledTaskTrigger -AtStartup
+    $settings = New-ScheduledTaskSettingsSet -RestartCount 10 -RestartInterval (New-TimeSpan -Minutes 2) `
+                    -ExecutionTimeLimit (New-TimeSpan -Days 0) -MultipleInstances IgnoreNew
+    $principal = New-ScheduledTaskPrincipal -UserId "SYSTEM" -LogonType ServiceAccount -RunLevel Highest
+
+    if (Get-ScheduledTask -TaskName $t.Name -ErrorAction SilentlyContinue) {
+        Unregister-ScheduledTask -TaskName $t.Name -Confirm:$false
+    }
+    Register-ScheduledTask -TaskName $t.Name -Action $action -Trigger $trigger `
+        -Settings $settings -Principal $principal | Out-Null
+    Write-Host "Registered task: $($t.Name)" -ForegroundColor Green
 }
-Register-ScheduledTask -TaskName $TASK_NAME -Action $action -Trigger $trigger -Settings $settings -Principal $principal | Out-Null
-Write-Host "Scheduled Task registered — bot will auto-start on reboot." -ForegroundColor Green
 
 Write-Host ""
 Write-Host "=== Bootstrap complete ===" -ForegroundColor Cyan
-Write-Host "Next steps:"
-Write-Host "  1. Edit $envFile — fill in your MT5 credentials"
-Write-Host "  2. Copy config\config.yaml to $BOT_DIR\config\config.yaml and verify terminal_path"
-Write-Host "  3. Run: & '$BOT_DIR\venv\Scripts\python.exe' '$BOT_DIR\execution\orchestrator.py'"
-Write-Host "  4. Or reboot the VPS — the Scheduled Task will start it automatically"
+Write-Host ""
+Write-Host "Next steps:" -ForegroundColor Yellow
+Write-Host "  1. Edit $envFile — fill in MT5 credentials + Telegram tokens"
+Write-Host "  2. Edit $BOT_DIR\config\config_vps.yaml if MT5 terminal path differs"
+Write-Host "     (default: C:\Program Files\MetaTrader 5\terminal64.exe)"
+Write-Host "  3. Reboot VPS — both tasks start automatically, watchdog launches bot"
+Write-Host "     OR start now:"
+Write-Host "       Start-ScheduledTask -TaskName AiDEN-Watchdog"
+Write-Host "       Start-ScheduledTask -TaskName AiDEN-CodeMonitor"
+Write-Host ""
+Write-Host "  Logs:"
+Write-Host "    Bot:          $LOG_DIR\orchestrator.log"
+Write-Host "    Watchdog:     $LOG_DIR\watchdog.log"
+Write-Host "    Code monitor: $LOG_DIR\code_monitor.log"

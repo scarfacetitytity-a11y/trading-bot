@@ -36,6 +36,7 @@ RR_TARGET   = 3.0
 RISK_FRAC   = 0.01   # 1% per trade for P&L sim
 SCORE_RANGE = range(30, 85, 5)
 BAR_STRIDE  = 4      # evaluate every Nth bar — reduces runtime 4x, correlation is low on M15
+MAX_BARS    = 5000   # cap to last N bars (~1.25yr M15); ample for threshold calibration
 
 
 def _load(symbol: str) -> tuple[pd.DataFrame, pd.DataFrame] | None:
@@ -45,6 +46,7 @@ def _load(symbol: str) -> tuple[pd.DataFrame, pd.DataFrame] | None:
         return None
     df = pd.read_csv(m15, parse_dates=["time"])
     df = df.sort_values("time").reset_index(drop=True)
+    df = df.tail(MAX_BARS).reset_index(drop=True)
     return df, df   # m5 placeholder = same df for now
 
 

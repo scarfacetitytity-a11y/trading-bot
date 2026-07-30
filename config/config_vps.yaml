@@ -70,7 +70,21 @@ trading:
   soft_dd_halt_pct: 9.0
   total_kill_pct:   9.5
 
-  # JP mentor profit floor: once up 1.5%, protect 1.0% — play with 0.5%
-  # "I am not leaving today without $1,500 clear profit. I've got $500 to play with."
-  daily_profit_target_pct: 1.5
-  daily_profit_floor_pct:  1.0
+  bank_tp_r: 2.5
+  prevent_weekend_entries: false
+
+  dd_score_boost: 2
+  dd_score_boost_threshold: 1.5
+  min_stop_atr_mult: 0.5
+  min_stop_pct: 0.05
+  max_notional_x: 30
+
+v3_cutover:
+  live:
+    - XAUUSD
+  go_no_go_min_samples: 0
+  born_threshold: 35.0
+  entry_thresholds:
+    sniper:    62
+    momentum:  68
+    liquidity: 65
