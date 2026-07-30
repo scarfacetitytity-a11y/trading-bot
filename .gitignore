@@ -10,8 +10,7 @@ build/
 dist/
 .pytest_cache/
 
-# Secrets / local config
-.env
+# Local config (overrides — not committed; use config_vps.yaml for VPS)
 config/config.yaml
 
 # Logs — runtime state and outputs (regenerated on run)
