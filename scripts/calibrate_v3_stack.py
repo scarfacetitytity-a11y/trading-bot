@@ -35,6 +35,7 @@ SYMBOLS = [
 RR_TARGET   = 3.0
 RISK_FRAC   = 0.01   # 1% per trade for P&L sim
 SCORE_RANGE = range(30, 85, 5)
+BAR_STRIDE  = 4      # evaluate every Nth bar — reduces runtime 4x, correlation is low on M15
 
 
 def _load(symbol: str) -> tuple[pd.DataFrame, pd.DataFrame] | None:
@@ -58,7 +59,7 @@ def _run_symbol(symbol: str, df: pd.DataFrame) -> list[dict]:
     )
 
     rows = []
-    for i in range(200, len(df) - 1):
+    for i in range(200, len(df) - 1, BAR_STRIDE):
         window = df.iloc[max(0, i - 500): i + 1].copy()
         try:
             signals = strat.generate_signals(window)
@@ -169,12 +170,14 @@ def _find_threshold(rows: list[dict]) -> dict:
 
 
 def main() -> None:
-    print("V3 ProbabilityStack calibration from historical data\n")
+    import sys as _sys
+    _sys.stdout.reconfigure(line_buffering=True)  # flush each print even when piped
+    print("V3 ProbabilityStack calibration from historical data\n", flush=True)
     results = {}
     all_rows: list[dict] = []
 
     for sym in SYMBOLS:
-        print(f"[{sym}]")
+        print(f"[{sym}]", flush=True)
         data = _load(sym)
         if data is None:
             continue
