@@ -2624,8 +2624,7 @@ class TradingEngine(Component):
                             _shad.gates["mc_agent"] = {"blocked": True, "narrative": str(_mc_ctx.narrative)}; _shad.blocking_gate = "mc_agent"; _shadow_logger.record(_shad)
                             continue
 
-                    # Continuation trades have 0% live WR — require 2 extra score points
-                    # above floor before allowing. At floor+0 or floor+1 = skip, not reduce.
+                    # Continuation trades: require floor+2 minimum.
                     _plan_type = self._last_plan.trade_type if self._last_plan else "breakout"
                     _score_over_floor = signal_score - needed
                     if _plan_type == "continuation" and _score_over_floor < 2:
@@ -2633,13 +2632,16 @@ class TradingEngine(Component):
                                     self.name, _score_over_floor)
                         _shad.gates["continuation_score"] = {"blocked": True, "score_over_floor": _score_over_floor}; _shad.blocking_gate = "continuation_score"; _shadow_logger.record(_shad)
                         continue
-                    # Continuation now 0/7 live: also require entry AT an HTF level.
-                    # Chasing mid-range continuation is where the losses came from.
+                    # Off-level continuation: require floor+3 (one more point than at-level).
+                    # Softened from hard ban — score=floor+3 is high enough conviction.
                     if _plan_type == "continuation" and not (_mc_ctx and _mc_ctx.at_level):
-                        logger.info("[%s] CONTINUATION GATE: not at an HTF level — skipping "
-                                    "(mid-range continuation banned, 0/7 live)", self.name)
-                        _shad.gates["continuation_level"] = {"blocked": True}; _shad.blocking_gate = "continuation_level"; _shadow_logger.record(_shad)
-                        continue
+                        if _score_over_floor < 3:
+                            logger.info("[%s] CONTINUATION GATE: off-level score %d over floor — need +3 off-level",
+                                        self.name, _score_over_floor)
+                            _shad.gates["continuation_level"] = {"blocked": True, "score_over_floor": _score_over_floor}; _shad.blocking_gate = "continuation_level"; _shadow_logger.record(_shad)
+                            continue
+                        logger.info("[%s] CONTINUATION GATE: off-level override — score %d >= floor+3",
+                                    self.name, _score_over_floor)
 
                     # ── Bayesian probability model — replaces flat score_mult ──
                     # Build confluence inputs from what's confirmed above.
@@ -2895,16 +2897,20 @@ class TradingEngine(Component):
                         )
                         continue
 
-                    # ── Liquidity thesis gate: no clean draw within reach = no trade ──
-                    # A trade with no real liquidity target is not a trade — it's
-                    # arithmetic. Skip it rather than place a token lot at a fake TP.
+                    # ── Liquidity thesis gate: no clean draw = min size only, not skip ──
+                    # Grade A/B (real draw): full plan size. Grade C (no draw): allow at
+                    # plan's 0.25x min size if score >= floor+2. Below floor+2 = skip.
                     direction_str = "BUY" if desired == 1 else "SELL"
                     if self._last_plan is not None and not self._last_plan.tradeable:
-                        logger.info("[%s] NO-DRAW skip: %s (grade %s) — %s",
-                                    self.name, direction_str,
-                                    self._last_plan.grade, self._last_plan.thesis)
-                        _shad.gates["no_draw"] = {"blocked": True, "grade": str(self._last_plan.grade)}; _shad.blocking_gate = "no_draw"; _shadow_logger.record(_shad)
-                        continue
+                        if _score_over_floor < 2:
+                            logger.info("[%s] NO-DRAW skip: %s (grade %s, score only %d over floor) — %s",
+                                        self.name, direction_str, self._last_plan.grade,
+                                        _score_over_floor, self._last_plan.thesis)
+                            _shad.gates["no_draw"] = {"blocked": True, "grade": str(self._last_plan.grade)}; _shad.blocking_gate = "no_draw"; _shadow_logger.record(_shad)
+                            continue
+                        logger.info("[%s] NO-DRAW allow: %s grade C, score %d over floor — proceeding at 0.25x",
+                                    self.name, direction_str, _score_over_floor)
+                        _shad.gates["no_draw"] = {"blocked": False, "grade": "C_override", "score_over_floor": _score_over_floor}
 
                     # ── Per-trade agent: Council adjudication + durable ticket ──
                     # Uses the plan already computed in _size_order (no recompute).
