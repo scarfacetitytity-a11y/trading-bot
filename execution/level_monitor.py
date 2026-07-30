@@ -144,6 +144,27 @@ class LevelSet:
                 entered.append(z)
         return entered
 
+    def range_bias(self, price: float) -> int:
+        """Return HTF range position bias.
+
+        +1 = price in lower 25% of H4 range (discount — buy bias)
+        -1 = price in upper 25% of H4 range (premium — sell bias)
+         0 = mid-range or range unavailable
+        """
+        h4_high = next((l.price for l in self.levels if l.label == "H4 Swing High"), None)
+        h4_low  = next((l.price for l in self.levels if l.label == "H4 Swing Low"),  None)
+        if h4_high is None or h4_low is None:
+            return 0
+        rng = h4_high - h4_low
+        if rng <= 0:
+            return 0
+        pos = (price - h4_low) / rng
+        if pos <= 0.25:
+            return +1   # discount — buy expected
+        if pos >= 0.75:
+            return -1   # premium — sell expected
+        return 0
+
     def mark_hit(self, price: float, atr: float) -> None:
         """Mark levels that price has passed through."""
         for l in self.levels:

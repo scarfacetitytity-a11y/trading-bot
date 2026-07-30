@@ -2490,13 +2490,35 @@ class TradingEngine(Component):
                                     _extra_reasons.append(f"Macro consensus +{news_mod}")
                                     _shad.news_mod = news_mod
 
-                    # Level confluence: key level proximity +1; HTF zone entry uses zone.score_boost
+                    # Level confluence: HTF zones carry explicit directional bias.
+                    # Selling into a bullish zone (EQL sweep, bullish OB/FVG) = wrong location.
+                    # Block those trades; only boost score when zone aligns with signal direction.
                     if _approaching_levels:
-                        _lvl_boost = max(getattr(l, "score_boost", 1) for l in _approaching_levels)
-                        signal_score += _lvl_boost
-                        lvl_names = ", ".join(l.label for l in _approaching_levels)
-                        logger.info("[%s] Level confluence +%d: %s", self.name, _lvl_boost, lvl_names)
-                        _extra_reasons.append(f"Level +{_lvl_boost} ({lvl_names})")
+                        _htf_zones  = [l for l in _approaching_levels if hasattr(l, "zone_type")]
+                        _key_levels = [l for l in _approaching_levels if not hasattr(l, "zone_type")]
+
+                        # Hard block: zone direction conflicts with trade direction
+                        _counter_zones = [z for z in _htf_zones if z.direction != 0 and z.direction != desired]
+                        if _counter_zones:
+                            _cz_labels = ", ".join(z.label for z in _counter_zones)
+                            logger.info(
+                                "[%s] HTF ZONE DIRECTION BLOCK: signal=%+d conflicts with %s",
+                                self.name, desired, _cz_labels,
+                            )
+                            _shad.gates["htf_zone_direction"] = {"blocked": True, "zones": _cz_labels}
+                            _shad.blocking_gate = "htf_zone_direction"
+                            _shadow_logger.record(_shad)
+                            continue
+
+                        # Boost only for direction-aligned zones
+                        _aligned = [z for z in _htf_zones if z.direction == 0 or z.direction == desired]
+                        _all_aligned = _key_levels + _aligned
+                        if _all_aligned:
+                            _lvl_boost = max(getattr(l, "score_boost", 1) for l in _all_aligned)
+                            signal_score += _lvl_boost
+                            lvl_names = ", ".join(l.label for l in _all_aligned)
+                            logger.info("[%s] Level confluence +%d: %s", self.name, _lvl_boost, lvl_names)
+                            _extra_reasons.append(f"Level +{_lvl_boost} ({lvl_names})")
 
                     # DXY alignment check — metals and forex pairs with known DXY correlation.
                     # JP mentor: "Dixie is the driving force behind GU and EU — if Dixie gains
@@ -2569,6 +2591,37 @@ class TradingEngine(Component):
                         _shad.gates["score_floor"] = {"blocked": True, "score": signal_score, "needed": needed}; _shad.blocking_gate = "score_floor"; _shadow_logger.record(_shad)
                         continue
                     _shad.gates["score_floor"] = {"blocked": False, "score": signal_score, "needed": needed}
+
+                    # ── HTF premium/discount range gate ────────────────────
+                    # If price is in the upper 25% of H4 range (premium), only take
+                    # sells; if in lower 25% (discount), only take buys. Counter-range
+                    # entries need floor+2 extra conviction — these are low-probability
+                    # trades. Mid-range (50%) = no constraint.
+                    if self._level_monitor is not None:
+                        _ls_rb = self._level_monitor._level_sets.get(self._symbol)
+                        if _ls_rb is not None:
+                            _cur_px   = float(df["close"].iloc[-1])
+                            _rng_bias = _ls_rb.range_bias(_cur_px)
+                            if _rng_bias != 0 and _rng_bias != desired:
+                                _range_label = "premium" if _rng_bias == -1 else "discount"
+                                _score_over_floor_rb = signal_score - needed
+                                if _score_over_floor_rb < 2:
+                                    logger.info(
+                                        "[%s] RANGE BIAS GATE: signal=%+d but price in H4 %s — need floor+2 "
+                                        "(have +%d)",
+                                        self.name, desired, _range_label, _score_over_floor_rb,
+                                    )
+                                    _shad.gates["htf_range_bias"] = {
+                                        "blocked": True, "bias": _range_label, "over_floor": _score_over_floor_rb,
+                                    }
+                                    _shad.blocking_gate = "htf_range_bias"
+                                    _shadow_logger.record(_shad)
+                                    continue
+                                logger.info(
+                                    "[%s] RANGE BIAS: counter-range %s in %s — allowed (floor+%d >= 2)",
+                                    self.name, "BUY" if desired == 1 else "SELL",
+                                    _range_label, _score_over_floor_rb,
+                                )
 
                     # ── M1 structural confirmation ─────────────────────────────
                     # Require the last completed M1 candle to break above/below the
