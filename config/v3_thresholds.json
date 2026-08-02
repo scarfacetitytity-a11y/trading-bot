@@ -1,0 +1,66 @@
+{
+  "XAUUSD": {
+    "threshold": 30,
+    "score": 0.0309,
+    "n": 36,
+    "wr": 0.278,
+    "avg_r": 0.111,
+    "total": 619
+  },
+  "XAGUSD": {
+    "threshold": 30,
+    "score": 0.0519,
+    "n": 68,
+    "wr": 0.294,
+    "avg_r": 0.176,
+    "total": 647
+  },
+  "GBPUSD": {
+    "threshold": 30,
+    "score": -0.0496,
+    "n": 33,
+    "wr": 0.182,
+    "avg_r": -0.273,
+    "total": 524
+  },
+  "US100.cash": {
+    "threshold": 35,
+    "score": -0.0096,
+    "n": 75,
+    "wr": 0.24,
+    "avg_r": -0.04,
+    "total": 734
+  },
+  "US30.cash": {
+    "threshold": 30,
+    "score": -0.0533,
+    "n": 26,
+    "wr": 0.077,
+    "avg_r": -0.692,
+    "total": 665
+  },
+  "US500.cash": {
+    "threshold": 30,
+    "score": 0.0918,
+    "n": 112,
+    "wr": 0.321,
+    "avg_r": 0.286,
+    "total": 777
+  },
+  "US2000.cash": {
+    "threshold": 35,
+    "score": -0.0349,
+    "n": 173,
+    "wr": 0.208,
+    "avg_r": -0.168,
+    "total": 704
+  },
+  "_global": {
+    "threshold": 30,
+    "score": -0.0125,
+    "n": 625,
+    "wr": 0.237,
+    "avg_r": -0.053,
+    "total": 4670
+  }
+}
