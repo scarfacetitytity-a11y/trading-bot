@@ -31,6 +31,14 @@ PROPOSALS = LOG_DIR / "learning_proposals.md"
 _SIG_P_VALUE = 0.05
 _SIG_MIN_TRADES = 30   # Devil's Advocate: no conclusions below this
 
+# Backtest baseline (from 26-month XAUUSD H1 run) — must precede
+# _is_significant, which uses _BASELINE_WR as a default argument
+_BASELINE_WR    = 0.396
+_BASELINE_AVG_R = 0.386
+_WR_FLOOR       = 0.28
+_AVG_R_FLOOR    = 0.10
+_CONSEC_LOSS_LIMIT = 7
+
 
 def _binomial_cdf(k: int, n: int, p: float) -> float:
     """P(X <= k) for Binomial(n, p) — pure Python, no scipy required."""
@@ -57,14 +65,6 @@ def _is_significant(wins: int, n: int, baseline_wr: float = _BASELINE_WR) -> tup
 _EXTRA_LOG_DIRS: list[Path] = [
     # e.g. Path("C:/Users/anton/Documents/trading-bot-account2/logs"),
 ]
-
-# Backtest baseline (from 26-month XAUUSD H1 run)
-_BASELINE_WR    = 0.396
-_BASELINE_AVG_R = 0.386
-_WR_FLOOR       = 0.28
-_AVG_R_FLOOR    = 0.10
-_CONSEC_LOSS_LIMIT = 7
-
 
 # ── Data loading ──────────────────────────────────────────────────────────────
 

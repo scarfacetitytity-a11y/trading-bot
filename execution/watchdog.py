@@ -49,6 +49,13 @@ RESTART_COOLDOWN   = 120   # min seconds between restarts to avoid restart storm
 BOT_STARTUP_GRACE  = 120   # seconds after bot start before log-freshness check kicks in
 DD_ALERT_PCT       = 4.0   # alert when daily DD exceeds this %
 
+# cp1252 console chokes on →/— in log messages
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except (AttributeError, ValueError):
+        pass
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)-8s | watchdog | %(message)s",

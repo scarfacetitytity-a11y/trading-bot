@@ -3498,7 +3498,9 @@ class Orchestrator:
                 # Pre-day brief — send once per day at London open (07:00 UTC)
                 _now = datetime.now(timezone.utc)
                 _today_str = _now.strftime("%Y-%m-%d")
-                if (_now.hour == 7 and _now.minute < 2
+                # >= 7 with noon cutoff: a morning restart still sends the
+                # brief; past noon it's stale, skip until tomorrow
+                if (7 <= _now.hour < 12
                         and _preday_sent_date != _today_str):
                     try:
                         from execution.preday_analysis import run_preday_brief

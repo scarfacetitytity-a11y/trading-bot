@@ -56,6 +56,13 @@ ZOMBIE_TRADE_HOURS   = 24    # open trade older than this = zombie, flag for rev
 POLL_INTERVAL        = 30    # seconds between checks
 
 # ── Logging ──────────────────────────────────────────────────────────────────
+# cp1252 console chokes on →/— in log messages
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except (AttributeError, ValueError):
+        pass
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)-8s | %(message)s",
@@ -589,7 +596,8 @@ def _check_cadre_scheduled() -> None:
             _sched_mark(state, "builder_error_scan")
 
         # ── Sage: Monday 07:00 UTC weekly strategy review ─────────────────────
-        if now.weekday() == 0 and now.hour == 7 and _alerts.should_fire("sage_weekly"):
+        # >= so a late Monday start still fires; should_fire dedupes per day
+        if now.weekday() == 0 and now.hour >= 7 and _alerts.should_fire("sage_weekly"):
             logger.info("[Council] Sage — Monday 07:00 UTC weekly strategy review")
             _fire_cadre("MEM-001", "weekly_strategy_review",
                         f"Week starting {now.strftime('%Y-%m-%d')}. "

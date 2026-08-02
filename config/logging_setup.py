@@ -1,8 +1,17 @@
 """Shared logging configuration for the trading bot."""
 import logging
+import sys
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
+
+# Windows console defaults to cp1252 — unicode in log messages (→, —, ✓)
+# raises UnicodeEncodeError inside the logging machinery otherwise.
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except (AttributeError, ValueError):
+        pass
 
 
 def setup_logger(

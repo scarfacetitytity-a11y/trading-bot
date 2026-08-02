@@ -36,6 +36,13 @@ ENV_FILE  = ROOT / ".env"
 RUN_HOUR  = 6    # UTC hour to generate daily brief
 POLL_SECS = 60   # check-cycle interval
 
+# cp1252 console chokes on →/— in log messages
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except (AttributeError, ValueError):
+        pass
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)-8s | scout | %(message)s",
@@ -390,8 +397,9 @@ def main() -> None:
         while True:
             now   = datetime.now(timezone.utc)
             today = now.strftime("%Y-%m-%d")
-            # Run brief once per day at RUN_HOUR UTC
-            if now.hour == RUN_HOUR and state.get("last_brief") != today:
+            # Run brief once per day at/after RUN_HOUR UTC — >= so a late
+            # process start still produces the brief (catch-up semantics)
+            if now.hour >= RUN_HOUR and state.get("last_brief") != today:
                 ran_date = run_daily_brief()
                 state["last_brief"] = ran_date
                 _save_state(state)

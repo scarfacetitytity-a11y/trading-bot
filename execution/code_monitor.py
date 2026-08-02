@@ -44,6 +44,13 @@ PATTERN_WINDOW  = 3600    # 1h window for new-pattern detection
 NEW_PATTERN_THR = 3       # hits in window before escalating
 DAILY_SUMMARY_H = 21      # UTC hour to write daily summary (after NY close)
 
+# cp1252 console chokes on →/— in log messages
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except (AttributeError, ValueError):
+        pass
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)-8s | code_monitor | %(message)s",
@@ -356,6 +363,17 @@ date: {today}
         # Commit audit to GitHub
         _git_commit_audit(fname, today)
 
+        # Nightly council analysis — was a manual-only tool, now closes the
+        # learning loop automatically alongside the audit
+        try:
+            from execution import learning_loop
+            _ll = learning_loop.analyze()
+            learning_loop.write_report(_ll)
+            logger.info("Council learning-loop report: %d observations from %d trades",
+                        len(_ll["proposals"]), _ll["trades"])
+        except Exception as exc:
+            logger.warning("Learning-loop report failed: %s", exc)
+
         state["daily_summary_done"] = today
         state["session_trades"]     = []
         state["session_errors"]     = []
@@ -365,24 +383,42 @@ date: {today}
 
 
 def _git_commit_audit(path: Path, date: str) -> None:
-    """Commit the daily audit file to GitHub automatically."""
+    """Commit the daily audit into the vault's git repo (not trading-bot's —
+    the audit file lives in the Obsidian vault, outside ROOT)."""
+    vault_repo = OBSIDIAN.parent
+    if not (vault_repo / ".git").exists():
+        logger.debug("Vault repo not initialised — skipping audit commit")
+        return
     try:
-        subprocess.run(
+        r = subprocess.run(
             ["git", "add", str(path)],
-            cwd=str(ROOT), capture_output=True, timeout=15,
+            cwd=str(vault_repo), capture_output=True, text=True, timeout=15,
         )
-        subprocess.run(
+        if r.returncode != 0:
+            logger.warning("Audit git add failed: %s", r.stderr.strip())
+            return
+        r = subprocess.run(
             ["git", "commit", "-m",
              f"Auto: daily audit {date}\n\nCo-Authored-By: AiDEN Code Monitor <noreply@aiden>"],
-            cwd=str(ROOT), capture_output=True, timeout=15,
+            cwd=str(vault_repo), capture_output=True, text=True, timeout=15,
         )
-        subprocess.run(
-            ["git", "push", "origin", "master"],
-            cwd=str(ROOT), capture_output=True, timeout=30,
+        if r.returncode != 0:
+            logger.info("Audit commit skipped: %s", (r.stdout + r.stderr).strip()[:120])
+            return
+        remotes = subprocess.run(
+            ["git", "remote"], cwd=str(vault_repo),
+            capture_output=True, text=True, timeout=10,
         )
-        logger.info("Daily audit committed and pushed to GitHub")
+        if remotes.stdout.strip():
+            subprocess.run(
+                ["git", "push", "origin", "HEAD"],
+                cwd=str(vault_repo), capture_output=True, timeout=30,
+            )
+            logger.info("Daily audit committed and pushed")
+        else:
+            logger.info("Daily audit committed (no remote — local only)")
     except Exception as exc:
-        logger.debug("Git commit failed: %s", exc)
+        logger.warning("Audit git commit failed: %s", exc)
 
 # ── Main loop ─────────────────────────────────────────────────────────────────
 
