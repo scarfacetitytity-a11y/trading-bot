@@ -80,6 +80,12 @@ $tasks = @(
         Argument  = "-m execution.code_monitor"
         StdOut    = "$LOG_DIR\code_monitor.log"
         StdErr    = "$LOG_DIR\code_monitor_err.log"
+    },
+    @{
+        Name      = "AiDEN-Scout"
+        Argument  = "-m execution.scout_reach"
+        StdOut    = "$LOG_DIR\scout_reach.log"
+        StdErr    = "$LOG_DIR\scout_reach_err.log"
     }
 )
 
@@ -120,3 +126,4 @@ Write-Host "  Logs:"
 Write-Host "    Bot:          $LOG_DIR\orchestrator.log"
 Write-Host "    Watchdog:     $LOG_DIR\watchdog.log"
 Write-Host "    Code monitor: $LOG_DIR\code_monitor.log"
+Write-Host "    Scout:        $LOG_DIR\scout_reach.log"

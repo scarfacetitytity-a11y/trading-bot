@@ -26,7 +26,12 @@ from typing import Optional
 
 logger = logging.getLogger(__name__)
 
-_FF_URL       = "https://nfs.faireconomy.media/ff_calendar_thisweek.json"
+# Ordered backends — Agent-Reach pattern: try each in order, first success wins.
+_CALENDAR_BACKENDS = [
+    ("ForexFactory JSON",  "https://nfs.faireconomy.media/ff_calendar_thisweek.json"),
+    ("FF Mirror",          "https://cdn-nfs.faireconomy.media/ff_calendar_thisweek.json"),
+]
+_FF_URL       = _CALENDAR_BACKENDS[0][1]   # kept for backwards-compat references
 _REFRESH_SECS = 1800   # 30 min
 
 # ── Instrument → currency mapping ─────────────────────────────────────────────
@@ -257,12 +262,13 @@ class NewsGate:
     """Thread-safe economic calendar cache. Amplifies entries on macro consensus alignment."""
 
     def __init__(self, refresh_secs: int = _REFRESH_SECS):
-        self._refresh_secs = refresh_secs
+        self._refresh_secs    = refresh_secs
         self._events:    list[NewsEvent] = []
-        self._lock       = threading.Lock()
-        self._last_fetch = 0.0
+        self._lock            = threading.Lock()
+        self._last_fetch      = 0.0
+        self._active_backend  = _CALENDAR_BACKENDS[0][0]
         self._thread:    Optional[threading.Thread] = None
-        self._stop       = threading.Event()
+        self._stop            = threading.Event()
 
     def start(self) -> None:
         self._fetch()
@@ -282,19 +288,21 @@ class NewsGate:
                 self._fetch()
 
     def _fetch(self) -> None:
-        try:
-            req  = urllib.request.Request(
-                _FF_URL, headers={"User-Agent": "AiDEN-NewsGate/1.0"}
-            )
-            resp = urllib.request.urlopen(req, timeout=10)
-            raw  = json.loads(resp.read())
-            events = _parse_events(raw)
-            with self._lock:
-                self._events     = events
-                self._last_fetch = time.time()
-            logger.info("[NewsGate] Fetched %d events", len(events))
-        except Exception as exc:
-            logger.warning("[NewsGate] Fetch failed: %s", exc)
+        for backend_name, url in _CALENDAR_BACKENDS:
+            try:
+                req  = urllib.request.Request(url, headers={"User-Agent": "AiDEN-NewsGate/1.0"})
+                resp = urllib.request.urlopen(req, timeout=10)
+                raw  = json.loads(resp.read())
+                events = _parse_events(raw)
+                with self._lock:
+                    self._events     = events
+                    self._last_fetch = time.time()
+                    self._active_backend = backend_name
+                logger.info("[NewsGate] Fetched %d events via %s", len(events), backend_name)
+                return
+            except Exception as exc:
+                logger.warning("[NewsGate] Backend %s failed: %s", backend_name, exc)
+        logger.warning("[NewsGate] All backends failed — using stale cache (%d events)", len(self._events))
 
     def get_context(
         self,
