@@ -9,6 +9,9 @@ MetaTrader5
 PyYAML
 python-dotenv
 
+# --- RSS / web fetching (Scout Reach) ---
+feedparser
+
 # --- Testing ---
 pytest
 

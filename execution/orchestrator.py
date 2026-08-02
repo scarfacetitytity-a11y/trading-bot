@@ -3316,10 +3316,16 @@ class Orchestrator:
         logger.info("  symbols=%s | tf=%s | dry_run=%s", self._symbols, self._tf_str, self.dry_run)
         logger.info("=" * 60)
 
-        if not connect(self._terminal_path):
-            logger.critical("Cannot connect to MT5. Aborting.")
-            tg.notify_council_flag("01 Principal", "MT5 connection FAILED on startup. Bot aborted.")
-            sys.exit(1)
+        _mt5_retries = 0
+        while not connect(self._terminal_path):
+            _mt5_retries += 1
+            if _mt5_retries >= 10:
+                logger.critical("Cannot connect to MT5 after 10 attempts. Aborting.")
+                tg.notify_council_flag("01 Principal", "MT5 connection FAILED after 10 retries.")
+                sys.exit(1)
+            _wait = min(30 * _mt5_retries, 300)  # 30s, 60s, ... max 5min
+            logger.warning("MT5 connect failed (attempt %d/10) — retrying in %ds", _mt5_retries, _wait)
+            time.sleep(_wait)
 
         self._news_gate = ng.NewsGate()
         self._news_gate.start()

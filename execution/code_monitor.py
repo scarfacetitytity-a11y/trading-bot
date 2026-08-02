@@ -194,12 +194,19 @@ def check_escalations(state: dict) -> None:
     today   = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     alerted = set(state.get("alerted_patterns", []))
 
+    is_weekend = datetime.now(timezone.utc).weekday() >= 5  # Sat=5, Sun=6
+
     for label, hits in state["pattern_hits"].items():
         recent = [t for t in hits if now - t <= PATTERN_WINDOW]
         if len(recent) < NEW_PATTERN_THR:
             continue
         key = f"{label}:{today}"
         if key in alerted:
+            continue
+
+        # DATA_STALE on weekends is expected — suppress alerts
+        if label == "DATA_STALE" and is_weekend:
+            alerted.add(key)
             continue
 
         sev = next((s for _, l, s, _ in _COMPILED if l == label), "warning")
@@ -415,9 +422,10 @@ def main() -> None:
             # Check if any patterns need escalation
             check_escalations(state)
 
-            # Daily summary at DAILY_SUMMARY_H UTC
+            # Daily summary: any poll at or after DAILY_SUMMARY_H UTC triggers it.
+            # write_daily_summary() has an internal date-guard so it only runs once.
             now_utc = datetime.now(timezone.utc)
-            if now_utc.hour == DAILY_SUMMARY_H and now_utc.minute < (POLL_INTERVAL // 60 + 2):
+            if now_utc.hour >= DAILY_SUMMARY_H:
                 write_daily_summary(state)
 
             _save_state(state)
