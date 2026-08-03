@@ -155,7 +155,10 @@ def _active_models(labels: list[str] | None = None) -> list[dict]:
     return [m for m in pool if os.environ.get(m["key_env"], "").strip()]
 
 
-def _call_model(model: dict, prompt: str, max_tokens: int = 200) -> tuple[str, str]:
+def _call_model(
+    model: dict, prompt: str, max_tokens: int = 200,
+    system_prompt: str | None = None,
+) -> tuple[str, str]:
     """Synchronous single-model call. Returns (label, text_or_error)."""
     import requests
 
@@ -168,9 +171,14 @@ def _call_model(model: dict, prompt: str, max_tokens: int = 200) -> tuple[str, s
         "Content-Type":  "application/json",
         **model.get("extra_headers", {}),
     }
+    messages = []
+    if system_prompt:
+        messages.append({"role": "system", "content": system_prompt})
+    messages.append({"role": "user", "content": prompt})
+
     payload = {
         "model":       model["id"],
-        "messages":    [{"role": "user", "content": prompt}],
+        "messages":    messages,
         "max_tokens":  max_tokens,
         "temperature": 0.4,
     }
@@ -191,6 +199,7 @@ def query(
     model_labels: list[str] | None = None,
     max_tokens: int = 200,
     timeout: float = TOTAL_TIMEOUT_S,
+    system_prompt: str | None = None,
 ) -> dict[str, str]:
     """Query all configured (or specified) models concurrently.
 
@@ -213,7 +222,7 @@ def query(
 
     results: dict[str, str] = {}
     with ThreadPoolExecutor(max_workers=len(active)) as pool:
-        futures = {pool.submit(_call_model, m, prompt, max_tokens): m["label"] for m in active}
+        futures = {pool.submit(_call_model, m, prompt, max_tokens, system_prompt): m["label"] for m in active}
         try:
             for fut in as_completed(futures, timeout=timeout):
                 label, text = fut.result()
@@ -313,7 +322,7 @@ def _print_results(results: dict[str, str]) -> None:
     print()
 
 
-def _repl_mode() -> None:
+def _repl_mode(system_prompt: str | None = None) -> None:
     """Interactive REPL — start once, keep querying without retyping commands."""
     _load_env()
     active = _active_models()
@@ -323,10 +332,11 @@ def _repl_mode() -> None:
 
     current_labels: list[str] | None = _default_labels()
     label_str = ", ".join(current_labels) if current_labels else "all active"
+    mode_tag = " [CODER MODE]" if system_prompt else ""
 
-    print(f"\nAiDEN Multi-Model REPL  (models: {label_str})")
-    print("Commands:  /models  /switch <label>  /all  /reset  /exit")
-    print("Shortcut:  g=Groq  o=OpenRouter  gem=Gemini  m=Mistral  t=Together")
+    print(f"\nAiDEN Multi-Model REPL{mode_tag}  (models: {label_str})")
+    print("Commands:  /models  /switch <label>  /all  /reset  /coder  /exit")
+    print("Shortcuts: g=Groq  gem=Gemini  k=Kimi  m=Mistral  t=Together  o=OpenRouter")
     print("-" * 58)
 
     shortcuts = {
@@ -360,6 +370,17 @@ def _repl_mode() -> None:
 
         if raw == "/models":
             _print_models()
+            continue
+
+        if raw == "/coder":
+            from execution.aiden_context import build_system_prompt
+            system_prompt = build_system_prompt()
+            print("[Coder mode ON — AiDEN context injected as system prompt]")
+            continue
+
+        if raw == "/nocoder":
+            system_prompt = None
+            print("[Coder mode OFF]")
             continue
 
         if raw == "/all":
@@ -405,7 +426,8 @@ def _repl_mode() -> None:
 
         label_str_now = ", ".join(labels_for_this) if labels_for_this else "all active"
         print(f"[{label_str_now}] ...", end="", flush=True)
-        results = query(prompt, model_labels=labels_for_this, max_tokens=800, timeout=30)
+        results = query(prompt, model_labels=labels_for_this, max_tokens=800, timeout=30,
+                        system_prompt=system_prompt)
         print("\r", end="")
         _print_results(results)
 
@@ -427,6 +449,10 @@ def _cli_main() -> None:
                         help="Comma-separated model labels (default: DEFAULT_LLM_MODELS or all active)")
     parser.add_argument("--list", "-l", action="store_true", help="List models and exit")
     parser.add_argument("--repl", "-r", action="store_true", help="Interactive REPL session")
+    parser.add_argument("--coder", "-c", action="store_true",
+                        help="Inject full AiDEN codebase context as system prompt (coding assistant mode)")
+    parser.add_argument("--handoff", action="store_true",
+                        help="Export AiDEN context handoff document (paste into any AI when Claude runs out)")
     parser.add_argument("--max-tokens", type=int, default=800)
     parser.add_argument("--timeout", type=float, default=30)
     args = parser.parse_args()
@@ -435,8 +461,23 @@ def _cli_main() -> None:
         _print_models()
         return
 
+    if args.handoff:
+        from execution.aiden_context import export_handoff
+        from pathlib import Path
+        out = Path("logs") / "handoff.md"
+        doc = export_handoff(out)
+        print(doc)
+        print(f"\n[Saved to {out}]")
+        return
+
+    sys_prompt = None
+    if args.coder:
+        from execution.aiden_context import build_system_prompt
+        sys_prompt = build_system_prompt()
+        print("[Coder mode: AiDEN context loaded as system prompt]\n")
+
     if args.repl or not args.prompt:
-        _repl_mode()
+        _repl_mode(system_prompt=sys_prompt)
         return
 
     # Detect inline prefix shortcut
@@ -465,7 +506,8 @@ def _cli_main() -> None:
 
     active = _active_models(labels)
     print(f"\nQuerying {len(active)} model(s)...\n")
-    results = query(prompt, model_labels=labels, max_tokens=args.max_tokens, timeout=args.timeout)
+    results = query(prompt, model_labels=labels, max_tokens=args.max_tokens,
+                    timeout=args.timeout, system_prompt=sys_prompt)
     _print_results(results)
 
 
