@@ -34,6 +34,30 @@ _CALENDAR_BACKENDS = [
 _FF_URL       = _CALENDAR_BACKENDS[0][1]   # kept for backwards-compat references
 _REFRESH_SECS = 1800   # 30 min
 
+# Agent-Reach probe pattern: track consecutive failures + skip-until timestamp per backend.
+# Structure: {backend_name: (consecutive_fail_count, skip_until_ts)}
+_backend_failures: dict[str, tuple[int, float]] = {}
+_FAIL_THRESHOLD   = 2      # consecutive failures before entering cooldown
+_COOLDOWN_SECS    = 300    # 5 min cooldown after threshold hit
+
+
+def _probe_backend(name: str, url: str, timeout: int = 5) -> bool:
+    """Lightweight GET to verify a backend is live. Returns True if reachable.
+
+    Uses GET not HEAD — some CDNs return 405 on HEAD even when the resource is
+    live, which produces false-dead classifications.
+    """
+    try:
+        req  = urllib.request.Request(url, headers={"User-Agent": "AiDEN-NewsGate/probe"})
+        resp = urllib.request.urlopen(req, timeout=timeout)
+        resp.read(64)   # consume minimal bytes; just need the 2xx status
+        resp.close()
+        return True
+    except Exception as exc:
+        logger.debug("[NewsGate] Probe failed for %s: %s", name, exc)
+        return False
+
+
 # ── Instrument → currency mapping ─────────────────────────────────────────────
 
 _INSTRUMENT_CURRENCY: dict[str, str] = {
@@ -288,20 +312,44 @@ class NewsGate:
                 self._fetch()
 
     def _fetch(self) -> None:
+        now = time.time()
         for backend_name, url in _CALENDAR_BACKENDS:
+            fail_count, skip_until = _backend_failures.get(backend_name, (0, 0.0))
+
+            # Backend is in cooldown — skip without probing or fetching.
+            if fail_count >= _FAIL_THRESHOLD and now < skip_until:
+                remaining = int(skip_until - now)
+                logger.debug("[NewsGate] Skipping %s — in cooldown (%ds left)", backend_name, remaining)
+                continue
+
+            # Previously failed but cooldown expired — probe before real request.
+            if fail_count > 0:
+                if not _probe_backend(backend_name, url):
+                    new_count = fail_count + 1
+                    new_skip  = now + _COOLDOWN_SECS if new_count >= _FAIL_THRESHOLD else 0.0
+                    _backend_failures[backend_name] = (new_count, new_skip)
+                    logger.warning("[NewsGate] Probe failed for %s — skipping", backend_name)
+                    continue
+                logger.debug("[NewsGate] Probe passed for %s — attempting real fetch", backend_name)
+
             try:
                 req  = urllib.request.Request(url, headers={"User-Agent": "AiDEN-NewsGate/1.0"})
                 resp = urllib.request.urlopen(req, timeout=10)
                 raw  = json.loads(resp.read())
                 events = _parse_events(raw)
                 with self._lock:
-                    self._events     = events
-                    self._last_fetch = time.time()
+                    self._events         = events
+                    self._last_fetch     = time.time()
                     self._active_backend = backend_name
+                _backend_failures.pop(backend_name, None)  # reset on success
                 logger.info("[NewsGate] Fetched %d events via %s", len(events), backend_name)
                 return
             except Exception as exc:
+                new_count = fail_count + 1
+                new_skip  = now + _COOLDOWN_SECS if new_count >= _FAIL_THRESHOLD else 0.0
+                _backend_failures[backend_name] = (new_count, new_skip)
                 logger.warning("[NewsGate] Backend %s failed: %s", backend_name, exc)
+
         logger.warning("[NewsGate] All backends failed — using stale cache (%d events)", len(self._events))
 
     def get_context(
