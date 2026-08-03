@@ -3245,6 +3245,13 @@ class TradingEngine(Component):
                                 df=df,
                                 reasons=_reasons,
                             )
+                            try:
+                                from execution.aiden_event_bus import append_event
+                                append_event("TRADE_EXECUTED",
+                                    symbol=self._symbol, direction=desired,
+                                    score=signal_score, lots=lots, equity=equity)
+                            except Exception:
+                                pass
 
             except Exception as exc:
                 self.registry.fail(self.name, str(exc))

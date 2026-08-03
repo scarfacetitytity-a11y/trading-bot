@@ -206,6 +206,14 @@ class TradeJournal:
             equity=equity_after,
             session_pnl=session_pnl,
         )
+        try:
+            from execution.aiden_event_bus import append_event
+            append_event("TRADE_CLOSED",
+                symbol=rec.symbol, outcome=rec.outcome or "unknown",
+                r_multiple=round(rec.r_multiple or 0.0, 3),
+                pnl_usd=round(rec.pnl_usd or 0.0, 2), equity=round(equity_after, 2))
+        except Exception:
+            pass
         self._run_learning_loop()
         self._sync_obsidian(rec, equity_after, session_pnl)
 
@@ -421,8 +429,15 @@ class TradeJournal:
         def _bg():
             try:
                 from execution import learning_loop
-                result = learning_loop.analyze()
-                learning_loop.write_report(result)
+                result  = learning_loop.analyze()
+                applied = learning_loop.auto_apply(result)
+                learning_loop.write_report(result, applied)
+                if applied:
+                    try:
+                        from execution.aiden_event_bus import append_event
+                        append_event("LEARNING_APPLIED", applied=applied, n_trades=result["trades"])
+                    except Exception:
+                        pass
                 try:
                     from execution import obsidian_sync as ob
                     _proposals_path = Path(__file__).resolve().parent.parent / "logs" / "learning_proposals.md"
@@ -432,8 +447,8 @@ class TradeJournal:
                     pass
                 n = len(result["proposals"])
                 logger.info(
-                    "[LearningLoop] %d live trades / %d wins / %d misfires → %d proposals",
-                    result["trades"], result.get("wins", 0), result["misfires"], n,
+                    "[LearningLoop] %d live trades / %d wins / %d misfires → %d proposals, %d auto-applied",
+                    result["trades"], result.get("wins", 0), result["misfires"], n, len(applied),
                 )
                 if n:
                     logger.info("[LearningLoop] Proposals written to logs/learning_proposals.md")

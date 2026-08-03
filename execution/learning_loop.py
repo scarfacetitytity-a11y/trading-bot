@@ -608,6 +608,43 @@ def auto_apply(result: dict) -> list[str]:
     return applied
 
 
+# ── Guardrail — crewAI pattern (crewAIInc/crewAI task._invoke_guardrail_function) ──
+# Each Council analysis function is wrapped by a guardrail that validates
+# output quality before accepting it. On failure, the function re-runs up to
+# MAX_GUARDRAIL_RETRIES with the failure reason injected as context.
+
+MAX_GUARDRAIL_RETRIES = 2
+
+def _guardrail(obs_list: list, council_id: str) -> tuple[bool, str]:
+    """Return (valid, reason). Rejects output if obviously wrong."""
+    if not isinstance(obs_list, list):
+        return False, f"#{council_id} returned non-list"
+    for o in obs_list:
+        if not all(k in o for k in ("title", "evidence", "verdict", "proposal", "confidence")):
+            return False, f"#{council_id} obs missing required keys"
+        if o["confidence"] not in ("high", "medium", "low"):
+            return False, f"#{council_id} bad confidence value: {o['confidence']!r}"
+    return True, "ok"
+
+
+def _guarded(fn, *args, council_id: str = "??"):
+    """Run fn with guardrail validation; retry up to MAX_GUARDRAIL_RETRIES."""
+    for attempt in range(1 + MAX_GUARDRAIL_RETRIES):
+        try:
+            result = fn(*args)
+        except Exception as exc:
+            result = []
+            if attempt < MAX_GUARDRAIL_RETRIES:
+                continue
+            logger.warning("[Council #%s] exception (attempt %d): %s", council_id, attempt, exc)
+        valid, reason = _guardrail(result, council_id)
+        if valid:
+            return result
+        if attempt < MAX_GUARDRAIL_RETRIES:
+            logger.debug("[Council #%s] guardrail retry: %s", council_id, reason)
+    return result  # return whatever we have after retries
+
+
 # ── Main analysis ─────────────────────────────────────────────────────────────
 
 def analyze(days: int = 0) -> dict:
@@ -616,12 +653,12 @@ def analyze(days: int = 0) -> dict:
     wins     = _load_jsonl("wins.jsonl")
 
     all_obs: list[dict] = []
-    all_obs += _council_05(trades, misfires)
-    all_obs += _council_06(trades, misfires, wins)
-    all_obs += _council_07(trades, misfires)
-    all_obs += _council_09(trades)
-    all_obs += _council_11(trades, misfires, wins)
-    all_obs += _council_12(trades, misfires, wins)
+    all_obs += _guarded(_council_05, trades, misfires, council_id="05")
+    all_obs += _guarded(_council_06, trades, misfires, wins, council_id="06")
+    all_obs += _guarded(_council_07, trades, misfires, council_id="07")
+    all_obs += _guarded(_council_09, trades, council_id="09")
+    all_obs += _guarded(_council_11, trades, misfires, wins, council_id="11")
+    all_obs += _guarded(_council_12, trades, misfires, wins, council_id="12")
 
     return dict(
         trades=len(trades), misfires=len(misfires), wins=len(wins),

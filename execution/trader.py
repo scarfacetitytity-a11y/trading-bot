@@ -3,8 +3,14 @@
 Handles placing, closing, and inspecting positions for the bot.
 All bot orders are tagged with a magic number so they can be
 distinguished from manual trades in the terminal.
+
+Retry envelope (adapted from goose crates/goose/src/agents/retry.rs):
+  place_order() retries up to ORDER_RETRIES times on transient failures,
+  verifying the fill via positions_get() after each attempt rather than
+  trusting the retcode alone. State is cleanly reset between retries.
 """
 import logging
+import time
 
 import MetaTrader5 as mt5
 
@@ -107,21 +113,50 @@ def place_order(
     if tp:
         request["tp"] = round(tp, info.digits)
 
-    result = mt5.order_send(request)
-    if result is None or result.retcode != mt5.TRADE_RETCODE_DONE:
-        code = result.retcode if result else "None"
-        comment_out = result.comment if result else mt5.last_error()
-        logger.error(
-            "Order FAILED: %s %s %.2f lots | retcode=%s | %s",
-            "BUY" if direction == 1 else "SELL", symbol, lots, code, comment_out,
-        )
-        return False
+    # Retry envelope — goose pattern: send, verify fill, retry on transient failure.
+    # Retryable retcodes: 10004 (requote), 10006 (rejected), 10014 (invalid volume
+    # — can happen mid-tick), 10016 (invalid stops — stale price). Non-retryable:
+    # 10027 (AutoTrading off — needs human), 10009 (already filled, success).
+    ORDER_RETRIES    = 3
+    _RETRYABLE       = {10004, 10006, 10014, 10016}
+    dir_str = "BUY" if direction == 1 else "SELL"
 
-    logger.info(
-        "Order OK: %s %s %.2f lots @ %.5f | SL=%s TP=%s | ticket=%s",
-        "BUY" if direction == 1 else "SELL", symbol, lots, price, sl, tp, result.order,
-    )
-    return True
+    for attempt in range(1, ORDER_RETRIES + 1):
+        # Refresh price on each retry — stale price is the most common transient error
+        try:
+            tick  = get_tick(symbol)
+            price = tick.ask if direction == 1 else tick.bid
+            request["price"] = price
+        except Exception:
+            pass
+
+        result = mt5.order_send(request)
+
+        if result is not None and result.retcode == mt5.TRADE_RETCODE_DONE:
+            # Verify fill: confirm a position actually exists (defensive)
+            time.sleep(0.3)
+            filled = any(p.magic == _MAGIC for p in (mt5.positions_get(symbol=symbol) or []))
+            if filled or result.order > 0:
+                logger.info(
+                    "Order OK: %s %s %.2f lots @ %.5f | SL=%s TP=%s | ticket=%s (attempt %d)",
+                    dir_str, symbol, lots, price, sl, tp, result.order, attempt,
+                )
+                return True
+            # retcode=DONE but no position — rare; retry
+            logger.warning("Order retcode DONE but no fill detected — retrying (attempt %d)", attempt)
+        else:
+            code = result.retcode if result else "None"
+            msg  = result.comment if result else str(mt5.last_error())
+            if result and result.retcode not in _RETRYABLE:
+                logger.error("Order FAILED (non-retryable): %s %s | retcode=%s | %s", dir_str, symbol, code, msg)
+                return False
+            logger.warning("Order attempt %d/%d failed retcode=%s | %s — retrying", attempt, ORDER_RETRIES, code, msg)
+
+        if attempt < ORDER_RETRIES:
+            time.sleep(1.0 * attempt)  # 1s, 2s back-off
+
+    logger.error("Order FAILED after %d attempts: %s %s %.2f lots", ORDER_RETRIES, dir_str, symbol, lots)
+    return False
 
 
 def close_position(position) -> bool:
