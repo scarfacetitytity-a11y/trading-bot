@@ -45,6 +45,7 @@ _TOGETHER_BASE   = "https://api.together.xyz/v1/chat/completions"
 _GEMINI_BASE     = "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions"
 _MISTRAL_BASE    = "https://api.mistral.ai/v1/chat/completions"
 _KIMI_BASE       = "https://api.moonshot.cn/v1/chat/completions"
+_OPENROUTER_BASE2 = "https://openrouter.ai/api/v1/chat/completions"
 
 # ── Model registry ─────────────────────────────────────────────────────────────
 # Add/remove entries here to change which models get called.
@@ -129,6 +130,23 @@ ALL_MODELS: list[dict] = [
         "label":    "Kimi",
         "free":     False,
         "extra_headers": {},
+    },
+    # Claude via OpenRouter — seamless Claude fallback when this session ends
+    {
+        "id":       "anthropic/claude-sonnet-4-5",
+        "endpoint": _OPENROUTER_BASE,
+        "key_env":  "OPENROUTER_API_KEY",
+        "label":    "Claude-Sonnet",
+        "free":     False,
+        "extra_headers": {"HTTP-Referer": "https://aiden-trading-bot", "X-Title": "AiDEN"},
+    },
+    {
+        "id":       "anthropic/claude-opus-4-5",
+        "endpoint": _OPENROUTER_BASE,
+        "key_env":  "OPENROUTER_API_KEY",
+        "label":    "Claude-Opus",
+        "free":     False,
+        "extra_headers": {"HTTP-Referer": "https://aiden-trading-bot", "X-Title": "AiDEN"},
     },
 ]
 
@@ -352,6 +370,10 @@ def _repl_mode(system_prompt: str | None = None) -> None:
         "together":["Together/Llama3.3-70B"],
         "k":       ["Kimi"],
         "kimi":    ["Kimi"],
+        "claude":  ["Claude-Sonnet"],
+        "cs":      ["Claude-Sonnet"],
+        "co":      ["Claude-Opus"],
+        "opus":    ["Claude-Opus"],
     }
 
     while True:
@@ -494,6 +516,10 @@ def _cli_main() -> None:
         "together:": ["Together/Llama3.3-70B"],
         "k:": ["Kimi"],
         "kimi:": ["Kimi"],
+        "claude:": ["Claude-Sonnet"],
+        "cs:": ["Claude-Sonnet"],
+        "co:": ["Claude-Opus"],
+        "opus:": ["Claude-Opus"],
         "all:": None,
     }
     prompt = args.prompt
