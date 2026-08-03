@@ -12,7 +12,9 @@ Event types:
   BOT_RESTARTED    — watchdog restarted the bot
   LEARNING_APPLIED — auto_apply() ran and updated lifts/config
   SCOUT_BRIEF_READY — Scout wrote today's market brief
+  COUNCIL_VERDICT  — CouncilRouter governance check result (approved/vetoed + personas)
   COUNCIL_VETO     — Council member flagged a trade for human review
+  PERSONA_EXCLUDED — SelfHealingManager excluded a persona (backoff active)
 
 Publishers (append_event):  orchestrator, watchdog, learning_loop, scout_reach
 Subscribers (iter_new):     watchdog, code_monitor, council_watch, scout_reach

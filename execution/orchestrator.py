@@ -3087,6 +3087,45 @@ class TradingEngine(Component):
                         _shad.gates["trade_agent"] = {"blocked": True, "dissent": list(ticket.dissent)}; _shad.blocking_gate = "trade_agent"; _shadow_logger.record(_shad)
                         continue
 
+                    # ── OmniRoute CouncilRouter governance check ──────────────
+                    # Selects top-fit Council personas via composite scoring,
+                    # runs rule-based verdicts, emits COUNCIL_VERDICT to event bus.
+                    try:
+                        from council import CouncilRouter
+                        if not hasattr(self, "_council_router"):
+                            self._council_router = CouncilRouter()
+                        _council_verdict = self._council_router.governance_check(
+                            symbol       = self._symbol,
+                            direction    = desired,
+                            signal_score = signal_score,
+                            daily_dd_pct = _inline_daily_dd,
+                            lots         = lots,
+                            equity       = equity,
+                            sl           = sl or 0.0,
+                            tp           = tp,
+                            plan_type    = _plan_type,
+                            atr_ratio    = (atr_entry / 1.0) if atr_entry else 1.0,
+                            news_window  = bool(ctx.get("news_window") if (ctx := getattr(self, "_news_gate", None)) and hasattr(ctx, "news_window") else False),
+                        )
+                        for _cn in _council_verdict.notes:
+                            logger.info("[%s] Council: %s", self.name, _cn)
+                        if not _council_verdict.approved:
+                            _shad.gates["council_router"] = {
+                                "blocked": True,
+                                "vetoed_by": _council_verdict.vetoed_by,
+                                "notes": _council_verdict.notes,
+                            }
+                            _shad.blocking_gate = "council_router"
+                            _shadow_logger.record(_shad)
+                            continue
+                        _shad.gates["council_router"] = {
+                            "blocked": False,
+                            "selected": _council_verdict.selected,
+                            "profile": _council_verdict.strategy_profile,
+                        }
+                    except Exception as _cr_exc:
+                        logger.debug("[%s] CouncilRouter error (non-blocking): %s", self.name, _cr_exc)
+
                     # ── Council gate: Telegram approval before order fires ──
                     require_approval = self._trade_cfg.get("require_approval", False)
                     if require_approval and not self._dry_run:
