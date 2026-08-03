@@ -48,10 +48,13 @@ STOP_BUFFER_ATR    = 0.20   # padding beyond the structural level for slippage
 # Per-instrument minimum stop distance in points — prevents spread eating the SL
 # USDJPY/JPY pairs: typical spread 0.5-1 pip = 5-10 points; need 15pt clearance minimum
 _MIN_STOP_POINTS: dict[str, float] = {
-    "USDJPY": 0.150,   # 15 pips minimum beyond structure
+    "USDJPY": 0.150,    # 15 pips minimum beyond structure
+    "AUDJPY": 0.150,    # JPY cross — same pip scaling as USDJPY
+    "NZDJPY": 0.150,
+    "GBPJPY": 0.200,    # GBPJPY wider — higher vol, spread larger
     "JP225.cash": 5.0,
     "HK50.cash":  5.0,
-    "XAUUSD":     0.50,  # 50 cents above/below structure
+    "XAUUSD":     0.50,
     "XAGUSD":     0.05,
 }
 

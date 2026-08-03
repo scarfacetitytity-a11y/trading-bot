@@ -190,6 +190,8 @@ _SMT_COUSINS: dict[str, str] = {
     "XAUUSD": "XAGUSD",   "XAGUSD": "XAUUSD",
     "US30":   "US100",    "US100":  "US30",
     "US500":  "US100",
+    "AUDJPY": "NZDJPY",   "NZDJPY": "AUDJPY",   # AUD/NZD divergence = Asia SMT signal
+    "AUDUSD": "AUDJPY",                            # AUD cross divergence
 }
 
 _SMT_WINDOW = 20   # bars to look back for swing extreme comparison
@@ -251,11 +253,12 @@ _TF_SECONDS = {
 # Instruments that move together — used for divergence gate.
 # If any member has an active position in OPPOSITE direction, block new entry.
 _CORR_GROUPS: list[set] = [
-    {"US30.cash", "US100.cash", "US500.cash", "US2000.cash"},  # US indices
-    {"UK100.cash", "GER40.cash"},                               # EU indices
-    {"XAUUSD", "XAGUSD"},                                       # metals
-    {"GBPUSD", "EURUSD"},                                       # DXY-driven forex pairs (inverse)
-    {"USDJPY"},                                                  # JPY pair — BOJ-sensitive, standalone
+    {"US30.cash", "US100.cash", "US500.cash", "US2000.cash"},           # US indices
+    {"UK100.cash", "GER40.cash"},                                         # EU indices
+    {"XAUUSD", "XAGUSD"},                                                 # metals
+    {"GBPUSD", "EURUSD"},                                                 # DXY-driven forex
+    {"USDJPY", "AUDJPY", "NZDJPY", "GBPJPY"},                           # all JPY crosses
+    {"AUDUSD", "AUDJPY", "NZDJPY"},                                      # AUD-denominated
 ]
 
 # Max concurrent SAME-direction positions within a correlation group.
@@ -268,8 +271,9 @@ MAX_SAME_DIR_CLUSTER = 3
 # higher-scoring one enters (JP mentor: "GU and EU are cousins — pick the better one").
 _COUSIN_PAIRS: list[frozenset] = [
     frozenset({"GBPUSD", "EURUSD"}),
-    # US equity indices: highly correlated — only the highest-scoring fires per bar
     frozenset({"US30.cash", "US500.cash", "US100.cash", "US2000.cash"}),
+    frozenset({"AUDJPY", "NZDJPY"}),          # Asia JPY crosses — pick the better score
+    frozenset({"AUDUSD", "AUDJPY"}),           # AUD exposure — one entry per bar
 ]
 
 

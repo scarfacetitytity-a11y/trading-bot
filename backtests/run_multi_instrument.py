@@ -51,8 +51,13 @@ INSTRUMENTS = {
     # Forex — JP mentor primary pairs; DXY inverse filter applied at execution layer
     "GBPUSD":      dict(session_start=7,  session_end=21),   # London + NY crossover
     "EURUSD":      dict(session_start=7,  session_end=21),   # London + NY crossover
-    # JPY pair — Alan + mentor: "UJ is one of the most important currencies; BOJ drives markets"
-    "USDJPY":      dict(session_start=0,  session_end=21),   # Tokyo + London + NY (all sessions)
+    # JPY pairs — all sessions; BOJ + risk sentiment drive structure
+    "USDJPY":      dict(session_start=0,  session_end=21),   # Tokyo + London + NY
+    "AUDJPY":      dict(session_start=0,  session_end=13),   # Sydney + Tokyo (Asia prime)
+    "NZDJPY":      dict(session_start=0,  session_end=13),   # Sydney + Tokyo (Asia prime)
+    "GBPJPY":      dict(session_start=0,  session_end=13),   # Tokyo + early London
+    # AUD — Asian session high volume
+    "AUDUSD":      dict(session_start=22, session_end=13),   # Sydney open through London
     # Metals
     "XAUUSD":      dict(session_start=7,  session_end=21),   # London + NY
     # US indices — NY session
@@ -60,13 +65,12 @@ INSTRUMENTS = {
     "US30.cash":   dict(session_start=12, session_end=21),
     "US500.cash":  dict(session_start=12, session_end=21),
     "US2000.cash": dict(session_start=12, session_end=21),
-    # European session — UK100 replaces GER40 (better edge, tighter DD)
-    "UK100.cash":  dict(session_start=7,  session_end=17),   # London hours
+    # European session
+    "UK100.cash":  dict(session_start=7,  session_end=17),
     # Asian session
     "JP225.cash":  dict(session_start=0,  session_end=9),    # Nikkei — Tokyo
-    # Excluded: GER40 (weak edge on M15)
-    # XAGUSD back in — conservative params in OPTIMISED_PARAMS (score=6, NY-only)
-    "XAGUSD":      dict(session_start=7,  session_end=21),   # silver: London + NY
+    # XAGUSD — conservative params in OPTIMISED_PARAMS
+    "XAGUSD":      dict(session_start=7,  session_end=21),
 }
 
 # All instruments are bidirectional — AiDEN trades both long and short based on
