@@ -260,76 +260,199 @@ def list_models() -> list[dict]:
 #   python -m execution.llm_advisor --models "Groq/Llama3.3-70B,Gemini-2.0-Flash" "Explain FVG"
 #   python -m execution.llm_advisor --list
 
-def _cli_main() -> None:
-    import argparse, json
+def _load_env() -> None:
+    """Load .env from project root into os.environ (setdefault — never overwrite)."""
     from pathlib import Path
-
-    # Load .env from project root
-    _env_path = Path(__file__).parent.parent / ".env"
-    if _env_path.exists():
-        for line in _env_path.read_text(encoding="utf-8").splitlines():
+    env_path = Path(__file__).parent.parent / ".env"
+    if env_path.exists():
+        for line in env_path.read_text(encoding="utf-8").splitlines():
             line = line.strip()
             if line and not line.startswith("#") and "=" in line:
                 k, _, v = line.partition("=")
                 os.environ.setdefault(k.strip(), v.strip())
 
+
+def _default_labels() -> list[str] | None:
+    """Return labels from DEFAULT_LLM_MODELS env var, or None (= all active)."""
+    raw = os.environ.get("DEFAULT_LLM_MODELS", "").strip()
+    if not raw:
+        return None
+    return [l.strip() for l in raw.split(",") if l.strip()]
+
+
+def _print_models() -> None:
+    models = list_models()
+    print(f"\n{'Label':<26} {'Provider':<16} {'Active'}")
+    print("-" * 55)
+    for m in models:
+        tick = "ACTIVE" if m["active"] else "  ---"
+        print(f"{m['label']:<26} {m['provider']:<16} {tick}")
+    active_count = sum(1 for m in models if m["active"])
+    print(f"\n{active_count}/{len(models)} active — set keys in .env to activate more\n")
+
+
+def _print_results(results: dict[str, str]) -> None:
+    if not results:
+        print("\nNo responses — set at least one API key in .env\n")
+        return
+    for label, text in results.items():
+        print(f"\n{'='*58}")
+        print(f"  {label}")
+        print(f"{'='*58}")
+        print(text)
+    print()
+
+
+def _repl_mode() -> None:
+    """Interactive REPL — start once, keep querying without retyping commands."""
+    _load_env()
+    active = _active_models()
+    if not active:
+        print("\nNo models active. Add at least one API key to .env first.\n")
+        return
+
+    current_labels: list[str] | None = _default_labels()
+    label_str = ", ".join(current_labels) if current_labels else "all active"
+
+    print(f"\nAiDEN Multi-Model REPL  (models: {label_str})")
+    print("Commands:  /models  /switch <label>  /all  /reset  /exit")
+    print("Shortcut:  g=Groq  o=OpenRouter  gem=Gemini  m=Mistral  t=Together")
+    print("-" * 58)
+
+    shortcuts = {
+        "g":       ["Groq/Llama3.3-70B", "Groq/Mixtral-8x7B"],
+        "groq":    ["Groq/Llama3.3-70B", "Groq/Mixtral-8x7B"],
+        "o":       ["Qwen3-8B", "Llama3.3-70B", "Gemma3-27B"],
+        "or":      ["Qwen3-8B", "Llama3.3-70B", "Gemma3-27B"],
+        "gem":     ["Gemini-2.0-Flash"],
+        "gemini":  ["Gemini-2.0-Flash"],
+        "m":       ["Mistral-Small"],
+        "mistral": ["Mistral-Small"],
+        "t":       ["Together/Llama3.3-70B"],
+        "together":["Together/Llama3.3-70B"],
+    }
+
+    while True:
+        try:
+            raw = input("\n> ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print("\nExiting.")
+            break
+
+        if not raw:
+            continue
+
+        if raw in ("/exit", "/quit", "exit", "quit"):
+            print("Exiting.")
+            break
+
+        if raw == "/models":
+            _print_models()
+            continue
+
+        if raw == "/all":
+            current_labels = None
+            print("Switched to: all active models")
+            continue
+
+        if raw == "/reset":
+            current_labels = _default_labels()
+            label_str = ", ".join(current_labels) if current_labels else "all active"
+            print(f"Reset to default: {label_str}")
+            continue
+
+        if raw.startswith("/switch "):
+            target = raw[8:].strip()
+            if target in shortcuts:
+                current_labels = shortcuts[target]
+            else:
+                # Try as a direct label match
+                names = [m["label"] for m in ALL_MODELS]
+                matches = [n for n in names if target.lower() in n.lower()]
+                if matches:
+                    current_labels = matches
+                else:
+                    print(f"Unknown model: {target}. Use /models to see labels.")
+                    continue
+            label_str = ", ".join(current_labels)
+            print(f"Switched to: {label_str}")
+            continue
+
+        # Check for inline prefix: "g: question" or "gem: question"
+        prompt = raw
+        labels_for_this = current_labels
+        for sc, sc_labels in shortcuts.items():
+            if raw.lower().startswith(f"{sc}: ") or raw.lower().startswith(f"{sc}:"):
+                prefix_len = len(sc) + 1 + (1 if raw[len(sc)+1:len(sc)+2] == " " else 0)
+                prompt = raw[prefix_len:].strip()
+                labels_for_this = sc_labels
+                break
+
+        if not prompt:
+            continue
+
+        label_str_now = ", ".join(labels_for_this) if labels_for_this else "all active"
+        print(f"[{label_str_now}] ...", end="", flush=True)
+        results = query(prompt, model_labels=labels_for_this, max_tokens=800, timeout=30)
+        print("\r", end="")
+        _print_results(results)
+
+
+def _cli_main() -> None:
+    import argparse
+    _load_env()
+
     parser = argparse.ArgumentParser(
         prog="python -m execution.llm_advisor",
-        description="Query multiple free AI models simultaneously from the terminal.",
+        description="Query multiple free AI models — or start an interactive REPL session.",
+        epilog=(
+            "Model shortcuts (use as prefix in prompt): "
+            "g:=Groq  o:=OpenRouter  gem:=Gemini  m:=Mistral  t:=Together  all:=all"
+        ),
     )
-    parser.add_argument("prompt", nargs="?", help="The prompt to send to all models")
-    parser.add_argument(
-        "--models", "-m",
-        default=None,
-        help="Comma-separated model labels to query (default: all active). "
-             "Use --list to see available labels.",
-    )
-    parser.add_argument(
-        "--list", "-l",
-        action="store_true",
-        help="List all models and their active status",
-    )
-    parser.add_argument(
-        "--max-tokens", type=int, default=800,
-        help="Max response tokens per model (default: 800)",
-    )
-    parser.add_argument(
-        "--timeout", type=float, default=30,
-        help="Wall-clock deadline in seconds (default: 30)",
-    )
+    parser.add_argument("prompt", nargs="?", help="Prompt to send (omit for REPL mode)")
+    parser.add_argument("--models", "-m", default=None,
+                        help="Comma-separated model labels (default: DEFAULT_LLM_MODELS or all active)")
+    parser.add_argument("--list", "-l", action="store_true", help="List models and exit")
+    parser.add_argument("--repl", "-r", action="store_true", help="Interactive REPL session")
+    parser.add_argument("--max-tokens", type=int, default=800)
+    parser.add_argument("--timeout", type=float, default=30)
     args = parser.parse_args()
 
     if args.list:
-        models = list_models()
-        print(f"\n{'Label':<25} {'Provider':<15} {'Free':<6} {'Active'}")
-        print("-" * 60)
-        for m in models:
-            tick = "YES" if m["active"] else "---"
-            free = "free" if m["free"] else "paid"
-            print(f"{m['label']:<25} {m['provider']:<15} {free:<6} {tick}")
-        active_count = sum(1 for m in models if m["active"])
-        print(f"\n{active_count}/{len(models)} models active (keys configured in .env)\n")
+        _print_models()
         return
 
-    if not args.prompt:
-        parser.print_help()
+    if args.repl or not args.prompt:
+        _repl_mode()
         return
 
-    labels = [l.strip() for l in args.models.split(",")] if args.models else None
-    print(f"\nQuerying {len(_active_models(labels))} model(s)...\n")
+    # Detect inline prefix shortcut
+    shortcuts = {
+        "g:": ["Groq/Llama3.3-70B", "Groq/Mixtral-8x7B"],
+        "groq:": ["Groq/Llama3.3-70B", "Groq/Mixtral-8x7B"],
+        "o:": ["Qwen3-8B", "Llama3.3-70B", "Gemma3-27B"],
+        "or:": ["Qwen3-8B", "Llama3.3-70B", "Gemma3-27B"],
+        "gem:": ["Gemini-2.0-Flash"],
+        "gemini:": ["Gemini-2.0-Flash"],
+        "m:": ["Mistral-Small"],
+        "mistral:": ["Mistral-Small"],
+        "t:": ["Together/Llama3.3-70B"],
+        "together:": ["Together/Llama3.3-70B"],
+        "all:": None,
+    }
+    prompt = args.prompt
+    labels = [l.strip() for l in args.models.split(",")] if args.models else _default_labels()
+    for prefix, sc_labels in shortcuts.items():
+        if prompt.lower().startswith(prefix):
+            prompt = prompt[len(prefix):].strip()
+            labels = sc_labels
+            break
 
-    results = query(args.prompt, model_labels=labels, max_tokens=args.max_tokens, timeout=args.timeout)
-
-    if not results:
-        print("No responses — check that API keys are set in .env")
-        return
-
-    for label, text in results.items():
-        print(f"{'='*60}")
-        print(f"  {label}")
-        print(f"{'='*60}")
-        print(text)
-        print()
+    active = _active_models(labels)
+    print(f"\nQuerying {len(active)} model(s)...\n")
+    results = query(prompt, model_labels=labels, max_tokens=args.max_tokens, timeout=args.timeout)
+    _print_results(results)
 
 
 if __name__ == "__main__":
