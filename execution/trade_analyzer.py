@@ -34,7 +34,7 @@ from execution.signal_detectors import _swing_highs, _swing_lows
 
 # ── Tunables ──────────────────────────────────────────────────────────────────
 MIN_RR_TRADEABLE   = 1.2    # below this, the draw is too close to be worth the risk
-MAX_REACH_ATR      = 5.0    # a target beyond this many ATR is not reachable this session
+MAX_REACH_ATR      = 8.0    # a target beyond this many ATR is not reachable this session
 EQ_TOLERANCE_ATR   = 0.15   # equal-high/low cluster tolerance
 MIN_BEYOND_ATR     = 0.5    # target must sit at least this far beyond entry to count
 SWING_ORDER        = 3
