@@ -367,10 +367,11 @@ date: {today}
         # learning loop automatically alongside the audit
         try:
             from execution import learning_loop
-            _ll = learning_loop.analyze()
-            learning_loop.write_report(_ll)
-            logger.info("Council learning-loop report: %d observations from %d trades",
-                        len(_ll["proposals"]), _ll["trades"])
+            _ll      = learning_loop.analyze()
+            _applied = learning_loop.auto_apply(_ll)
+            learning_loop.write_report(_ll, _applied)
+            logger.info("Learning loop: %d obs from %d trades, %d auto-applied",
+                        len(_ll["proposals"]), _ll["trades"], len(_applied))
         except Exception as exc:
             logger.warning("Learning-loop report failed: %s", exc)
 

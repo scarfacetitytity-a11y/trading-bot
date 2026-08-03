@@ -3493,7 +3493,18 @@ class Orchestrator:
         _preday_sent_date: Optional[str] = None   # track which UTC date brief was sent
         try:
             while not self.kill_switch.is_set():
-                self._print_dashboard()
+                # _print_dashboard calls mt5.account_info() which can hang
+                # indefinitely on weekend disconnects — run in a guarded thread.
+                _dash_done = threading.Event()
+                def _dash_target():
+                    try:
+                        self._print_dashboard()
+                    finally:
+                        _dash_done.set()
+                _dash_thread = threading.Thread(target=_dash_target, name="Dashboard", daemon=True)
+                _dash_thread.start()
+                if not _dash_done.wait(timeout=30):
+                    logger.warning("[Monitor] dashboard timed out (MT5 call hung >30s) — continuing")
 
                 # Pre-day brief — send once per day at London open (07:00 UTC)
                 _now = datetime.now(timezone.utc)

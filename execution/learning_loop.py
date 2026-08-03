@@ -506,6 +506,108 @@ def _council_12(trades: list, misfires: list, wins: list) -> list:
     return obs
 
 
+# ── Auto-apply engine ─────────────────────────────────────────────────────────
+
+def _compute_confluence_lifts(trades: list) -> dict[str, float]:
+    """Compute per-confluence observed win rates from live trades.
+
+    Keys match ProbabilityModel._lifts keys. Only returned when n >= 3.
+    ProbabilityModel applies Laplace smoothing on its end — we just supply
+    the raw (wins, obs) counts and let it blend with the prior.
+    """
+    confluence_keys = [
+        "fvg_present", "ob_present", "m5_confirmed", "h4_aligned",
+        "at_htf_level", "order_flow_aligned", "news_aligned",
+        "continuation_type", "in_ict_macro", "ipda_aligned",
+        "smt_divergence", "eq_liq_cluster", "early_leakage", "inside_day",
+    ]
+    counts: dict[str, list] = {k: [0, 0] for k in confluence_keys}  # [wins, obs]
+
+    for t in trades:
+        won = t.get("outcome") == "win"
+        c   = t.get("confluences", {})
+        for k in confluence_keys:
+            v = c.get(k, False)
+            # continuation_type is True when trade_type == "continuation"
+            if k == "continuation_type":
+                v = t.get("trade_type") == "continuation"
+            if v:
+                counts[k][1] += 1
+                if won:
+                    counts[k][0] += 1
+
+    result = {}
+    BASE_WR = 0.35  # matches ProbabilityModel.BASE_WIN_RATE
+    PSEUDO  = 5
+    for k, (w, n) in counts.items():
+        if n < 3:
+            continue
+        p_cond   = (w + PSEUDO * BASE_WR) / (n + PSEUDO)
+        new_lift = p_cond / BASE_WR
+        new_lift = max(0.20, min(new_lift, 4.0))  # safety bounds
+        result[k] = round(new_lift, 4)
+    return result
+
+
+def auto_apply(result: dict) -> list[str]:
+    """Apply learning loop findings to the live system.
+
+    Tier 1 (always): Bayesian lift updates written to quant_lift_proposals.json
+      — ProbabilityModel reads this file on next estimate() call and blends
+      updates with smoothing (n/20 blend weight, so 3 obs = 15% influence).
+
+    Tier 2 (n >= 30, HIGH confidence): structural config changes applied now.
+      Devil's Advocate (#12) veto blocks all tier-2 until 30 trades.
+
+    Returns list of human-readable applied-change strings for Telegram/report.
+    """
+    applied: list[str] = []
+    trades = result.get("_trades_raw", [])
+    n      = result["trades"]
+
+    # ── Tier 1: always — Bayesian lift update via quant proposal file ──────────
+    lifts = _compute_confluence_lifts(trades)
+    if lifts:
+        proposal_file = LOG_DIR / "quant_lift_proposals.json"
+        try:
+            proposal_file.write_text(
+                json.dumps({"confluences": lifts, "ts": datetime.now(timezone.utc).isoformat(),
+                            "n_trades": n}, indent=2)
+            )
+            applied.append(f"Bayesian lifts updated from {n} trades ({len(lifts)} confluences)")
+        except Exception as exc:
+            applied.append(f"Lift update failed: {exc}")
+
+    # ── Tier 2: structural — only when Devil's Advocate clears (n >= 30) ──────
+    da_veto = any(o["council"] == "12" and "too small" in o["title"].lower()
+                  for o in result["proposals"])
+    if da_veto:
+        applied.append(f"Tier-2 structural changes deferred: Devil's Advocate veto (n={n}, need 30)")
+        return applied
+
+    # Each structural fix: check current value vs evidence, apply + log
+    for obs in result["proposals"]:
+        if obs["confidence"] != "high":
+            continue
+        title = obs["title"].lower()
+
+        # MAX_REACH_ATR reduction — 0% liquidity target hit rate
+        if "liquidity target" in title or "max_reach_atr" in title:
+            ta_file = Path(__file__).parent / "trade_analyzer.py"
+            try:
+                src = ta_file.read_text(encoding="utf-8")
+                import re
+                m = re.search(r"MAX_REACH_ATR\s*=\s*([\d.]+)", src)
+                if m and float(m.group(1)) > 5.0:
+                    new_src = re.sub(r"(MAX_REACH_ATR\s*=\s*)[\d.]+", r"\g<1>5.0", src)
+                    ta_file.write_text(new_src, encoding="utf-8")
+                    applied.append(f"MAX_REACH_ATR reduced to 5.0 (was {m.group(1)}) — 0% hit rate")
+            except Exception as exc:
+                applied.append(f"MAX_REACH_ATR update failed: {exc}")
+
+    return applied
+
+
 # ── Main analysis ─────────────────────────────────────────────────────────────
 
 def analyze(days: int = 0) -> dict:
@@ -524,12 +626,13 @@ def analyze(days: int = 0) -> dict:
     return dict(
         trades=len(trades), misfires=len(misfires), wins=len(wins),
         proposals=all_obs,
+        _trades_raw=trades,  # passed to auto_apply, stripped before report
     )
 
 
 # ── Report ────────────────────────────────────────────────────────────────────
 
-def write_report(result: dict) -> None:
+def write_report(result: dict, applied: list[str] | None = None) -> None:
     obs    = result["proposals"]
     by_cid = defaultdict(list)
     for o in obs:
@@ -545,15 +648,19 @@ def write_report(result: dict) -> None:
     }
 
     lines = [
-        "---", "type: analysis", "status: needs-review",
+        "---", "type: analysis", "status: auto-applied",
         "tags: [trading-bot, council-review, learning-loop]",
         "relatedTo: [trading-bot, misfire-ledger]", "---", "",
         f"# Council of 12 — Trade Review  {datetime.now(timezone.utc):%Y-%m-%d %H:%M UTC}", "",
         f"**{result['trades']} live trades** | **{result['wins']} wins** | "
         f"**{result['misfires']} misfires** | **{len(obs)} observations**", "",
-        "> HARD RULE: nothing in this report is applied automatically. "
-        "Every proposal requires Anton's approval.", "",
     ]
+
+    if applied:
+        lines += ["## Auto-Applied Changes", ""]
+        for a in applied:
+            lines.append(f"- {a}")
+        lines.append("")
 
     if not obs:
         lines.append("_No patterns yet — need more live trades._")
@@ -563,31 +670,33 @@ def write_report(result: dict) -> None:
             lines += [f"---", f"## Council #{cid} — {cname}", ""]
             for i, o in enumerate(by_cid[cid], 1):
                 conf_icon = {"high": "🔴", "medium": "🟡", "low": "🟢"}.get(o["confidence"], "⚪")
+                status = o.get("status", "")
                 lines += [
                     f"### {conf_icon} {o['title']}",
                     f"**Evidence:** {o['evidence']}",
                     "",
                     f"**Verdict:** {o['verdict']}",
                     "",
-                    f"**Proposal `[{o['status']}]`:** {o['proposal']}",
+                    f"**Action `[{status}]`:** {o['proposal']}",
                     "",
                 ]
 
     PROPOSALS.write_text("\n".join(lines), encoding="utf-8")
 
-    # Mirror to Obsidian Brain if there are proposals worth recording
+    # Mirror to Obsidian Brain
     if obs:
         try:
             from execution import obsidian_sync as ob
-            title = f"Learning Loop — {datetime.now(timezone.utc):%Y-%m-%d} ({len(obs)} proposals)"
+            title = f"Learning Loop — {datetime.now(timezone.utc):%Y-%m-%d} ({len(obs)} obs, {len(applied or [])} applied)"
             ob.write_brain_entry(title, "\n".join(lines[6:]), tags=["learning-loop", "council", "aiden"])
         except Exception:
             pass
 
 
 def main():
-    res = analyze()
-    write_report(res)
+    res     = analyze()
+    applied = auto_apply(res)
+    write_report(res, applied)
     by_conf = Counter(o["confidence"] for o in res["proposals"])
     print(
         f"Council review: {res['trades']} live trades | "
