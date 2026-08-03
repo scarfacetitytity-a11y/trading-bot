@@ -288,34 +288,95 @@ severity: {sev}
 
 
 def write_daily_summary(state: dict) -> None:
-    """Write daily session summary to Obsidian Brain/Audit and update Sessions note."""
+    """Write structured daily digest to Obsidian Brain/Audit and logs/session_digest.jsonl.
+
+    Sections are ordered by importance so truncation from the tail loses least
+    signal: CRITICAL → PERFORMANCE → GATE ACTIVITY → ERRORS → LEARNING.
+    """
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     if state.get("daily_summary_done") == today:
         return
 
     try:
-        trades  = state.get("session_trades", [])
-        errors  = state.get("session_errors", [])
-        hits    = state.get("pattern_hits", {})
+        session_trades = state.get("session_trades", [])
+        errors         = state.get("session_errors", [])
+        hits           = state.get("pattern_hits", {})
 
-        # Count AMD blocks, zone blocks, trade executions
+        # ── Counts ──────────────────────────────────────────────────────────────
         amd_blocks   = len(hits.get("AMD_BLOCK", []))
         zone_blocks  = len(hits.get("HTF_ZONE_BLOCK", []))
         range_blocks = len(hits.get("RANGE_BIAS_BLOCK", []))
         low_score    = len(hits.get("LOW_SCORE_SKIP", []))
         trade_count  = len(hits.get("TRADE_EXECUTED", []))
-        closed_count = len(hits.get("TRADE_CLOSED", []))
         scale_ins    = len(hits.get("SCALE_IN", []))
 
-        # Risk state for P&L
+        # Closed trades from event bus payloads (schema: {type, symbol, outcome,
+        # r_multiple, pnl_usd, equity, ts}).  Old log-hit rows have no 'outcome'.
+        closed_events = [t for t in session_trades if t.get("outcome")]
+        closed_count  = len(closed_events)
+        wins          = [t for t in closed_events if t.get("outcome") == "win"]
+        losses        = [t for t in closed_events if t.get("outcome") == "loss"]
+        win_rate      = len(wins) / closed_count if closed_count else 0.0
+        r_vals        = [float(t.get("r_multiple") or 0) for t in closed_events]
+        avg_r         = sum(r_vals) / len(r_vals) if r_vals else 0.0
+
+        # ── Risk state ───────────────────────────────────────────────────────────
         risk_data = {}
         risk_path = LOG_DIR / "risk_agent_state.json"
         if risk_path.exists():
-            risk_data = json.loads(risk_path.read_text(encoding="utf-8"))
+            try:
+                risk_data = json.loads(risk_path.read_text(encoding="utf-8"))
+            except Exception:
+                pass
 
-        eq_now   = risk_data.get("current_equity", 0)
-        eq_start = risk_data.get("daily_start_equity", 0)
+        eq_now   = float(risk_data.get("current_equity") or 0)
+        eq_start = float(risk_data.get("daily_start_equity") or 0)
         pnl      = eq_now - eq_start if eq_now and eq_start else 0
+        daily_dd_pct = ((eq_start - eq_now) / eq_start * 100) if eq_start > 0 else 0.0
+
+        # ── Run learning loop BEFORE composing content so output lands in digest ─
+        _applied: list[str] = []
+        try:
+            from execution import learning_loop
+            _ll      = learning_loop.analyze()
+            _applied = learning_loop.auto_apply(_ll)
+            learning_loop.write_report(_ll, _applied)
+            logger.info("Learning loop: %d obs from %d trades, %d auto-applied",
+                        len(_ll["proposals"]), _ll["trades"], len(_applied))
+        except Exception as exc:
+            logger.warning("Learning-loop report failed: %s", exc)
+
+        # ── CRITICAL flags ───────────────────────────────────────────────────────
+        critical_flags: list[str] = []
+        if daily_dd_pct > 3.5:
+            critical_flags.append(
+                f"DAILY DD {daily_dd_pct:.2f}% > 3.5% threshold (FTMO limit 5%)"
+            )
+        if hits.get("DAILY_DD_HALT"):
+            critical_flags.append("DAILY_DD_HALT triggered — trading halted")
+        if hits.get("PYTHON_EXCEPTION"):
+            critical_flags.append(f"PYTHON_EXCEPTION: {len(hits['PYTHON_EXCEPTION'])} traceback(s)")
+        # unknown_hits is keyed by hash (not label), stored in its own dict
+        active_unknown = [h for h, ts in state.get("unknown_hits", {}).items() if ts]
+        if active_unknown:
+            critical_flags.append(
+                f"Unknown error pattern(s) active: {len(active_unknown)}"
+            )
+
+        gen_ts = datetime.now(timezone.utc).strftime("%H:%M UTC")
+
+        # ── Markdown audit — importance-ordered sections ─────────────────────────
+        critical_section = (
+            "\n".join(f"- **{f}**" for f in critical_flags) if critical_flags
+            else "- None"
+        )
+        error_section = (
+            "\n".join(f'- **{e["label"]}**: {e["line"][:80]}' for e in errors[-10:])
+            if errors else "- None"
+        )
+        learning_section = (
+            "\n".join(f"- {a}" for a in _applied) if _applied else "- No changes auto-applied"
+        )
 
         fname = OBS_BRAIN / "Audit" / f"{today}-daily-audit.md"
         fname.parent.mkdir(parents=True, exist_ok=True)
@@ -329,18 +390,28 @@ date: {today}
 
 # Daily Audit — {today}
 
-*Auto-generated by code_monitor at {datetime.now(timezone.utc).strftime('%H:%M UTC')}*
+*Auto-generated by code_monitor at {gen_ts}*
 
-## Session Metrics
+## 1. CRITICAL
+
+{critical_section}
+
+## 2. PERFORMANCE
+
 | Metric | Value |
 |--------|-------|
 | Trades executed | {trade_count} |
 | Positions closed | {closed_count} |
+| Wins / Losses | {len(wins)} / {len(losses)} |
+| Win rate | {win_rate*100:.1f}% |
+| Avg R | {avg_r:+.3f} |
 | Scale-ins | {scale_ins} |
 | Daily P&L | ${pnl:+.2f} |
 | Equity | ${eq_now:,.2f} |
+| Daily DD | {daily_dd_pct:.2f}% |
 
-## Gate Activity (signal quality filter)
+## 3. GATE ACTIVITY
+
 | Gate | Blocks |
 |------|--------|
 | AMD sweep blocks | {amd_blocks} |
@@ -348,11 +419,13 @@ date: {today}
 | H4 range bias blocks | {range_blocks} |
 | Low score skips | {low_score} |
 
-## Error Summary
-{chr(10).join(f'- **{e["label"]}**: {e["line"][:80]}' for e in errors[-10:]) or '- None'}
+## 4. ERRORS
 
-## Pattern Counts
-{chr(10).join(f'- {k}: {len(v)}' for k, v in sorted(hits.items(), key=lambda x: -len(x[1]))[:10])}
+{error_section}
+
+## 5. LEARNING
+
+{learning_section}
 
 ## Links
 [[Sessions/{today}]] | [[AiDEN]]
@@ -360,20 +433,35 @@ date: {today}
         fname.write_text(content, encoding="utf-8")
         logger.info("Daily audit written: %s", fname.name)
 
+        # ── Machine-readable digest — one JSON line per day ──────────────────────
+        digest_record = {
+            "date": today, "generated_ts": gen_ts,
+            "critical": critical_flags,
+            "performance": {
+                "trade_count": trade_count, "closed_count": closed_count,
+                "wins": len(wins), "losses": len(losses),
+                "win_rate": round(win_rate, 4), "avg_r": round(avg_r, 4),
+                "pnl": round(pnl, 2), "equity": round(eq_now, 2),
+                "daily_dd_pct": round(daily_dd_pct, 2),
+            },
+            "gate_activity": {
+                "amd_blocks": amd_blocks, "zone_blocks": zone_blocks,
+                "range_blocks": range_blocks, "low_score_skips": low_score,
+                "scale_ins": scale_ins,
+            },
+            "error_count": len(errors),
+            "learning_applied": _applied,
+        }
+        digest_path = LOG_DIR / "session_digest.jsonl"
+        try:
+            with open(digest_path, "a", encoding="utf-8") as _f:
+                _f.write(json.dumps(digest_record) + "\n")
+            logger.info("Session digest appended: %s", digest_path.name)
+        except Exception as exc:
+            logger.warning("Session digest write failed: %s", exc)
+
         # Commit audit to GitHub
         _git_commit_audit(fname, today)
-
-        # Nightly council analysis — was a manual-only tool, now closes the
-        # learning loop automatically alongside the audit
-        try:
-            from execution import learning_loop
-            _ll      = learning_loop.analyze()
-            _applied = learning_loop.auto_apply(_ll)
-            learning_loop.write_report(_ll, _applied)
-            logger.info("Learning loop: %d obs from %d trades, %d auto-applied",
-                        len(_ll["proposals"]), _ll["trades"], len(_applied))
-        except Exception as exc:
-            logger.warning("Learning-loop report failed: %s", exc)
 
         state["daily_summary_done"] = today
         state["session_trades"]     = []
@@ -446,9 +534,31 @@ def main() -> None:
     _tg(f"Code monitor online (PID {my_pid})")
 
     state = _load_state()
+    state.setdefault("session_trades", [])
+
+    try:
+        from execution.aiden_event_bus import EventBusReader
+        _bus = EventBusReader("code_monitor")
+    except Exception as _bus_exc:
+        logger.warning("Event bus unavailable: %s — code_monitor running without bus", _bus_exc)
+        _bus = None
 
     try:
         while True:
+            # Consume event bus — append trade/learning events to session state.
+            if _bus is not None:
+                try:
+                    for event in _bus.iter_new():
+                        etype = event.get("type", "")
+                        if etype == "TRADE_CLOSED":
+                            state["session_trades"].append(event)
+                        elif etype == "LEARNING_APPLIED":
+                            logger.info(
+                                "[EventBus] LEARNING_APPLIED: %s", event.get("applied", [])
+                            )
+                except Exception as exc:
+                    logger.debug("Event bus consume error: %s", exc)
+
             # Scan new log lines
             findings = scan_new_lines(state)
             if findings:

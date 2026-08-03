@@ -64,6 +64,8 @@ class TradeRecord:
     # ── Path tracking (MFE/MAE while open) ──
     path_high:    Optional[float] = None
     path_low:     Optional[float] = None
+    # ── Importance score (0.0-1.0) — high-importance trades drive learning more ──
+    importance:   Optional[float] = None
     # ── Post-trade review (from analyze_exit at close) ──
     hit_target:   Optional[bool] = None
     mfe_r:        Optional[float] = None
@@ -183,6 +185,25 @@ class TradeJournal:
             rec.outcome = "loss"
         else:
             rec.outcome = "breakeven"
+
+        # ── Importance score — drives weighting in learning loop ──
+        # Read daily_loss_pct from risk state so near-breaches are flagged 1.0.
+        try:
+            _rs_path = Path(__file__).resolve().parent.parent / "logs" / "risk_agent_state.json"
+            _rs = json.loads(_rs_path.read_text(encoding="utf-8")) if _rs_path.exists() else {}
+            _start_eq = float(_rs.get("daily_start_equity") or 0)
+            _daily_loss_pct = ((_start_eq - equity_after) / _start_eq * 100) if _start_eq > 0 else 0.0
+        except Exception:
+            _daily_loss_pct = 0.0
+        _r = rec.r_multiple or 0.0
+        if _daily_loss_pct > 3.5 or _r < -2.0:
+            rec.importance = 1.0    # near-breach or catastrophic loss
+        elif rec.outcome == "win" and _r > 2.0:
+            rec.importance = 0.8    # strong win
+        elif rec.outcome == "breakeven":
+            rec.importance = 0.3
+        else:
+            rec.importance = 0.5    # normal win or normal loss
 
         # ── Post-trade review — learn from every close ──
         self._review(rec, close_price)

@@ -78,8 +78,15 @@ def _load_jsonl(name: str) -> list:
 
 
 def _live_trades() -> list:
-    """All closed trades across all registered accounts — forward-test data only."""
-    return [t for t in _load_jsonl("trades.jsonl") if t.get("outcome")]
+    """All closed trades across all registered accounts — forward-test data only.
+
+    Sorted by importance descending so high-importance trades (near-breaches,
+    big losses, strong wins) dominate analysis when only a window is used.
+    Old records without the field default to 0.0 (treated as low importance).
+    """
+    trades = [t for t in _load_jsonl("trades.jsonl") if t.get("outcome")]
+    trades.sort(key=lambda t: float(t.get("importance") or 0.0), reverse=True)
+    return trades
 
 
 def _r(t) -> float:
@@ -91,8 +98,11 @@ def _pnl(t) -> float:
 
 
 def _consec_losses(trades: list) -> int:
+    # Sort chronologically here — input trades may be importance-sorted, but
+    # consecutive-loss detection requires the most-recent trade at the tail.
+    ordered = sorted(trades, key=lambda t: t.get("close_time") or t.get("open_time") or "")
     count = 0
-    for t in reversed(trades):
+    for t in reversed(ordered):
         if t.get("outcome") == "loss":
             count += 1
         else:

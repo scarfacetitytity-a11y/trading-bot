@@ -145,6 +145,8 @@ def _kill(pid: int) -> None:
 
 # ── Health checks + healers ───────────────────────────────────────────────────
 
+TRADE_LOG_GRACE = 60   # extra seconds of log-freshness grace after a trade executes
+
 class WatchdogState:
     def __init__(self) -> None:
         self.last_restart: float = 0.0
@@ -152,6 +154,7 @@ class WatchdogState:
         self.autotrading_alerted: bool = False
         self.dd_alerted: bool = False
         self.last_alert_day: str = ""
+        self._last_trade_time: float = 0.0  # time.time() when last TRADE_EXECUTED seen
 
     def can_restart(self) -> bool:
         return (time.time() - self.last_restart) >= RESTART_COOLDOWN
@@ -162,6 +165,10 @@ class WatchdogState:
 
     def in_startup_grace(self) -> bool:
         return (time.time() - self.bot_start_time) < BOT_STARTUP_GRACE
+
+    def in_trade_grace(self) -> bool:
+        """True within 60s of a trade executing — trades produce log bursts."""
+        return (time.time() - self._last_trade_time) < TRADE_LOG_GRACE
 
 
 def check_bot_process(state: WatchdogState) -> None:
@@ -193,6 +200,8 @@ def check_log_freshness(state: WatchdogState) -> None:
         return
     if state.in_startup_grace():
         return   # bot just started — log mtime predates this run
+    if state.in_trade_grace():
+        return   # trade just executed — burst activity expected; avoid false positive
     age = time.time() - BOT_LOG.stat().st_mtime
     if age < LOG_STALE_SECS:
         return
@@ -346,8 +355,34 @@ def main() -> None:
     _tg(f"Watchdog online (PID {my_pid})")
 
     state = WatchdogState()
+
+    try:
+        from execution.aiden_event_bus import EventBusReader
+        _bus = EventBusReader("watchdog")
+    except Exception as _bus_exc:
+        logger.warning("Event bus unavailable: %s — watchdog running without bus", _bus_exc)
+        _bus = None
+
     try:
         while True:
+            # Consume event bus first so state is fresh before health checks run.
+            if _bus is not None:
+                try:
+                    for event in _bus.iter_new():
+                        etype = event.get("type", "")
+                        if etype == "TRADE_EXECUTED":
+                            state._last_trade_time = time.time()
+                            logger.info(
+                                "[EventBus] TRADE_EXECUTED: %s dir=%s score=%s",
+                                event.get("symbol"), event.get("direction"), event.get("score"),
+                            )
+                        elif etype == "LEARNING_APPLIED":
+                            logger.info(
+                                "[EventBus] LEARNING_APPLIED: %s", event.get("applied", [])
+                            )
+                except Exception as exc:
+                    logger.debug("Event bus consume error: %s", exc)
+
             for check in CHECKS:
                 try:
                     check(state)
