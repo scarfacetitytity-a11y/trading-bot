@@ -43,7 +43,17 @@ LOOKBACK_BARS      = 60
 
 MAX_STOP_ATR       = 6.0    # a structural stop beyond this is too wide — invalid setup
 MIN_STOP_ATR       = 0.5    # a structural stop nearer than this sits inside the noise
-STOP_BUFFER_ATR    = 0.12   # padding beyond the structural level for slippage
+STOP_BUFFER_ATR    = 0.20   # padding beyond the structural level for slippage
+
+# Per-instrument minimum stop distance in points — prevents spread eating the SL
+# USDJPY/JPY pairs: typical spread 0.5-1 pip = 5-10 points; need 15pt clearance minimum
+_MIN_STOP_POINTS: dict[str, float] = {
+    "USDJPY": 0.150,   # 15 pips minimum beyond structure
+    "JP225.cash": 5.0,
+    "HK50.cash":  5.0,
+    "XAUUSD":     0.50,  # 50 cents above/below structure
+    "XAGUSD":     0.05,
+}
 
 
 @dataclass
@@ -302,6 +312,7 @@ def analyze_entry(
     h4_bias:   int = 0,
     rr_fallback: float = 2.0,
     swept:     bool = False,
+    symbol:    str = "",
 ) -> TradePlan:
     """Produce a fully structural trade plan — stop AND target from levels, not
     arithmetic. `stop` is a fallback reference only. `swept` = a recent sweep/
@@ -330,11 +341,17 @@ def analyze_entry(
     if s_stop is None:
         s_stop, stop_src = _stop_from(df_m15)
     if s_stop is None:
-        # No valid structure to anchor the stop — fall back to the reference stop,
-        # but that means we can't justify the risk -> lower grade downstream.
         s_stop, stop_src = stop, "atr_fallback"
 
     dist = abs(entry - s_stop)
+
+    # Per-instrument minimum stop distance — prevents spread eating through the SL
+    # on tight-spread instruments (JPY pairs, indices at open)
+    _min_pts = _MIN_STOP_POINTS.get(symbol, 0.0)
+    if _min_pts > 0 and dist < _min_pts:
+        extra = _min_pts - dist
+        s_stop = (s_stop - extra) if direction == 1 else (s_stop + extra)
+        dist = abs(entry - s_stop)
     if dist <= 1e-9:
         return TradePlan(False, entry, s_stop, 0.0, "range", "C", 0.0,
                          "atr_fallback", stop_src, "invalid stop distance", 0)

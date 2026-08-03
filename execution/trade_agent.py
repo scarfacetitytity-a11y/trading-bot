@@ -145,6 +145,7 @@ class TradeAgent:
             plan = analyze_entry(
                 df_m15=df_m15, df_m5=df_m5, direction=direction, entry=entry,
                 stop=ref_stop, atr=atr, h4_bias=h4_bias, rr_fallback=rr_fallback, swept=swept,
+                symbol=symbol,
             )
         voices = _council_review(plan, gates, dd_room_daily, dd_room_total)
         vetoes = [v for v in voices if v.vote == "veto"]

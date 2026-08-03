@@ -1141,6 +1141,7 @@ class TradingEngine(Component):
             plan = analyze_entry(
                 df_m15=df_m15_a, df_m5=df_m5_a, direction=direction,
                 entry=entry, stop=sl, atr=atr_val, h4_bias=h4b, rr_fallback=rr_fb,
+                symbol=self._symbol,
             )
             sl = plan.stop          # structural stop replaces the ATR stop
             tp = plan.tp
@@ -2053,11 +2054,13 @@ class TradingEngine(Component):
                     except Exception as _v3e:
                         logger.warning("[%s] V3 mode error — falling back to v2 signal: %s", self.name, _v3e)
                         signals = self._strategy.generate_signals(df)
-                        desired = int(signals.iloc[-1])
+                        _sv = float(signals.iloc[-1])
+                        desired = 1 if _sv > 0 else (-1 if _sv < 0 else 0)
                 else:
                     # Phase 0-3: old gate cascade generates signal
                     signals = self._strategy.generate_signals(df)
-                    desired = int(signals.iloc[-1])
+                    _sv = float(signals.iloc[-1])
+                    desired = 1 if _sv > 0 else (-1 if _sv < 0 else 0)
                     # Shadow AnalyzerEngine update (dry-run only)
                     if _az is not None:
                         try:
