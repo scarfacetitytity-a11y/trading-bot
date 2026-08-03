@@ -87,6 +87,23 @@ def _get(url: str, timeout: int = 15) -> str:
     with urllib.request.urlopen(req, timeout=timeout) as r:
         return r.read().decode("utf-8", errors="replace")
 
+def _probe(url: str, timeout: int = 5) -> bool:
+    """Lightweight reachability check for a URL. Returns True if the URL responds 2xx.
+
+    Distinct from Channel.probe() (which calls self.fetch()). This is a cheap
+    pre-flight check used inside channel fetch() methods before committing to a
+    full request. Uses GET not HEAD to avoid CDN 405 false-dead responses.
+    """
+    try:
+        req  = urllib.request.Request(url, headers={"User-Agent": _UA})
+        resp = urllib.request.urlopen(req, timeout=timeout)
+        resp.read(64)
+        resp.close()
+        return True
+    except Exception as exc:
+        logger.debug("[Scout] Probe failed for %s: %s", url, exc)
+        return False
+
 # ── Channel abstraction (adapted from Agent-Reach) ────────────────────────────
 
 @dataclass
@@ -122,28 +139,35 @@ HIGH_IMPACT_EVENTS = {
     "jolts", "adp", "pce",
 }
 
+_FF_PRIMARY_URL = "https://nfs.faireconomy.media/ff_calendar_thisweek.json"
+_FF_JINA_URL    = "https://r.jina.ai/https://www.investing.com/economic-calendar/"
+
 class ForexCalendarChannel(Channel):
     name = "forex_calendar"
     backends = ["ForexFactory JSON", "Jina Web Reader"]
 
     def fetch(self) -> ChannelResult:
-        # Backend 0: FF JSON API
-        try:
-            raw = _get("https://nfs.faireconomy.media/ff_calendar_thisweek.json", timeout=10)
-            events = json.loads(raw)
-            today  = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-            high   = [
-                e for e in events
-                if e.get("impact", "").lower() in ("high", "red")
-                and today in (e.get("date", "") or "")
-            ]
-            return ChannelResult("ok", data=json.dumps(high), source="ForexFactory JSON")
-        except Exception as exc:
-            logger.warning("FF JSON failed: %s — trying Jina fallback", exc)
+        # Backend 0: FF JSON API — probe first to avoid wasting a full request on a dead CDN.
+        primary_live = _probe(_FF_PRIMARY_URL)
+        if not primary_live:
+            logger.warning("[Scout] ForexFactory primary URL unreachable — using Jina fallback")
+        else:
+            try:
+                raw = _get(_FF_PRIMARY_URL, timeout=10)
+                events = json.loads(raw)
+                today  = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+                high   = [
+                    e for e in events
+                    if e.get("impact", "").lower() in ("high", "red")
+                    and today in (e.get("date", "") or "")
+                ]
+                return ChannelResult("ok", data=json.dumps(high), source="ForexFactory JSON")
+            except Exception as exc:
+                logger.warning("FF JSON failed: %s — trying Jina fallback", exc)
 
         # Backend 1: Jina reader on investing.com economic calendar
         try:
-            page = _get("https://r.jina.ai/https://www.investing.com/economic-calendar/", timeout=20)
+            page = _get(_FF_JINA_URL, timeout=20)
             # Extract lines containing currency + impact words
             lines = [l.strip() for l in page.splitlines()
                      if any(w in l.lower() for w in HIGH_IMPACT_EVENTS)]
@@ -195,16 +219,21 @@ class RSSChannel(Channel):
                 except Exception as exc:
                     logger.debug("RSS %s failed: %s", feed_name, exc)
 
-        # Jina fallback if feedparser unavailable or no headlines found
+        # Jina fallback if feedparser unavailable or no headlines found.
+        # Probe the Jina endpoint before committing to a full 20s timeout request.
         if not headlines:
-            try:
-                page = _get("https://r.jina.ai/https://www.forexlive.com", timeout=20)
-                lines = [l.strip() for l in page.splitlines()
-                         if any(kw in l.lower() for kw in FX_KEYWORDS) and len(l) > 30]
-                headlines = lines[:10]
-                used_backend = "Jina/ForexLive"
-            except Exception as exc:
-                logger.debug("Jina ForexLive fallback failed: %s", exc)
+            jina_url = "https://r.jina.ai/https://www.forexlive.com"
+            if not _probe(jina_url):
+                logger.warning("[Scout] RSSChannel: Jina/ForexLive fallback unreachable — no headlines")
+            else:
+                try:
+                    page = _get(jina_url, timeout=20)
+                    lines = [l.strip() for l in page.splitlines()
+                             if any(kw in l.lower() for kw in FX_KEYWORDS) and len(l) > 30]
+                    headlines = lines[:10]
+                    used_backend = "Jina/ForexLive"
+                except Exception as exc:
+                    logger.debug("Jina ForexLive fallback failed: %s", exc)
 
         if not headlines:
             return ChannelResult("warn", data="No FX headlines found.", source=used_backend)
@@ -213,13 +242,18 @@ class RSSChannel(Channel):
 
 # ── Channel 3: DXY Context ────────────────────────────────────────────────────
 
+_DXY_URL = "https://r.jina.ai/https://www.forexlive.com/tag/dxy/"
+
 class DXYContextChannel(Channel):
     name = "dxy_context"
     backends = ["Jina/ForexLive-DXY"]
 
     def fetch(self) -> ChannelResult:
+        # Single backend — probe is advisory; we still attempt the fetch either way.
+        if not _probe(_DXY_URL):
+            logger.warning("[Scout] DXYContextChannel: Jina/ForexLive-DXY unreachable — attempting anyway")
         try:
-            page = _get("https://r.jina.ai/https://www.forexlive.com/tag/dxy/", timeout=20)
+            page = _get(_DXY_URL, timeout=20)
             lines = [l.strip() for l in page.splitlines()
                      if any(w in l.lower() for w in ("dollar", "dxy", "index", "strength", "weak"))
                      and 20 < len(l) < 300]
