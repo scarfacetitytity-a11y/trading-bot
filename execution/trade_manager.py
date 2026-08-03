@@ -116,18 +116,18 @@ class TradeManager:
 
     def __init__(
         self,
-        exit_thresh:      int   = 4,
-        partial_thresh:   int   = 3,
-        tighten_thresh:   int   = 2,
-        extend_thresh:    int   = 3,     # lowered from 4 — HHLL+H4 alone can reach 4
-        runner_thresh:    int   = 2,     # HOLD_RUNNER fires at cont ≥ 2
-        partial_pct:      float = 0.30,
+        exit_thresh:      int   = 3,     # was 4 — with h4_ctr_discount=0.85, max counter≈3.4
+        partial_thresh:   int   = 2,     # was 3 — fires on CHoCH+BOS or CHoCH+FVG
+        tighten_thresh:   int   = 1,     # was 2 — any single counter signal tightens SL
+        extend_thresh:    int   = 3,
+        runner_thresh:    int   = 2,
+        partial_pct:      float = 0.25,  # was 0.30 — smaller per-event so ladder can repeat
         m5_weight:        float = 1.0,
         m1_weight:        float = 0.5,
-        min_extend_r:     float = 1.0,   # minimum R before TP can be extended
+        min_extend_r:     float = 1.0,
         atr_period:       int   = 14,
-        sweep_thresh:     float = 0.45,  # sweep_risk above this → WAIT instead of EXIT
-        h4_ctr_discount:  float = 0.70,  # M5 counter weight multiplier when H4 aligned
+        sweep_thresh:     float = 0.45,
+        h4_ctr_discount:  float = 0.85,  # was 0.70 — 4 signals × 0.85 = 3.4 → exit reaches 3
     ):
         self._exit_thresh     = exit_thresh
         self._partial_thresh  = partial_thresh
@@ -347,6 +347,25 @@ class TradeManager:
                 reason        = f"PARTIAL({self._partial_pct:.0%}) counter={counter} | {reason}",
                 probability   = probs.get(action, 0.5),
                 alternatives  = self._top_alternatives(probs, action),
+                sweep_risk    = sweep_risk,
+                council_notes = self._council_notes(action, counter, cont, sweep_risk, position, probs),
+            )
+
+        # ── RUNNER TRIM: T1 already hit, any counter signal = reduce runner ────
+        # After the first partial at T1, the runner should be protected more
+        # aggressively — a single counter signal is enough to trim it further.
+        if position.t1_hit and counter >= 1 and not early_exit_blocked and cur_r >= 0.5:
+            new_sl = find_structure_sl(df_primary, pos_dir, position.current_sl, atr=atr_m5)
+            action = ActionType.PARTIAL_CLOSE
+            return TradeAction(
+                action        = action,
+                close_pct     = 0.25,
+                new_sl        = new_sl,
+                counter_score = counter,
+                cont_score    = cont,
+                reason        = f"RUNNER_TRIM(25%) t1_hit counter={counter} R={cur_r:.2f} | {reason}",
+                probability   = probs.get(ActionType.PARTIAL_CLOSE, 0.5),
+                alternatives  = self._top_alternatives(probs, ActionType.PARTIAL_CLOSE),
                 sweep_risk    = sweep_risk,
                 council_notes = self._council_notes(action, counter, cont, sweep_risk, position, probs),
             )
