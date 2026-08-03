@@ -44,6 +44,7 @@ _GROQ_BASE       = "https://api.groq.com/openai/v1/chat/completions"
 _TOGETHER_BASE   = "https://api.together.xyz/v1/chat/completions"
 _GEMINI_BASE     = "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions"
 _MISTRAL_BASE    = "https://api.mistral.ai/v1/chat/completions"
+_KIMI_BASE       = "https://api.moonshot.cn/v1/chat/completions"
 
 # ── Model registry ─────────────────────────────────────────────────────────────
 # Add/remove entries here to change which models get called.
@@ -118,6 +119,15 @@ ALL_MODELS: list[dict] = [
         "key_env":  "MISTRAL_API_KEY",
         "label":    "Mistral-Small",
         "free":     True,
+        "extra_headers": {},
+    },
+    # Kimi (Moonshot AI) — long-context specialist, strong reasoning
+    {
+        "id":       "moonshot-v1-8k",
+        "endpoint": _KIMI_BASE,
+        "key_env":  "KIMI_API_KEY",
+        "label":    "Kimi",
+        "free":     False,
         "extra_headers": {},
     },
 ]
@@ -330,6 +340,8 @@ def _repl_mode() -> None:
         "mistral": ["Mistral-Small"],
         "t":       ["Together/Llama3.3-70B"],
         "together":["Together/Llama3.3-70B"],
+        "k":       ["Kimi"],
+        "kimi":    ["Kimi"],
     }
 
     while True:
@@ -439,6 +451,8 @@ def _cli_main() -> None:
         "mistral:": ["Mistral-Small"],
         "t:": ["Together/Llama3.3-70B"],
         "together:": ["Together/Llama3.3-70B"],
+        "k:": ["Kimi"],
+        "kimi:": ["Kimi"],
         "all:": None,
     }
     prompt = args.prompt
