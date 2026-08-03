@@ -9,7 +9,8 @@ MetaTrader5
 PyYAML
 python-dotenv
 
-# --- RSS / web fetching (Scout Reach) ---
+# --- HTTP client (LLM advisory layer, Scout Reach) ---
+requests
 feedparser
 
 # --- Testing ---

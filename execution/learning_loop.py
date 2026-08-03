@@ -100,6 +100,51 @@ def _consec_losses(trades: list) -> int:
     return count
 
 
+def rolling_30d_stats(trades: list) -> dict:
+    """Compute win-rate, avg-R, and consecutive losses over the last 30 calendar days.
+
+    Uses open_time[:10] (YYYY-MM-DD) for date comparison — avoids timezone
+    parsing failures. Returns an empty dict if there are no trades in the window.
+
+    Adapted from the last30days-skill 30-day recency filter concept: rather than
+    analysing the full trade history, we surface only the most recent calendar
+    window so the learning loop can detect short-term drift that all-time stats
+    would mask.
+    """
+    from datetime import date, timedelta
+
+    cutoff = (date.today() - timedelta(days=30)).isoformat()  # "YYYY-MM-DD"
+
+    window = [
+        t for t in trades
+        if (t.get("open_time") or "")[:10] >= cutoff
+    ]
+
+    if not window:
+        return {}
+
+    wins   = sum(1 for t in window if t.get("outcome") == "win")
+    n      = len(window)
+    r_vals = [float(t.get("r_multiple") or 0) for t in window]
+    avg_r  = sum(r_vals) / len(r_vals)
+    consec = _consec_losses(window)
+
+    sig, p_val = _is_significant(wins, n)
+
+    return {
+        "n":         n,
+        "wins":      wins,
+        "losses":    n - wins,
+        "win_rate":  round(wins / n, 4),
+        "avg_r":     round(avg_r, 4),
+        "consec_losses": consec,
+        "significant":   sig,
+        "p_value":       p_val,
+        "window_days":   30,
+        "cutoff_date":   cutoff,
+    }
+
+
 # ── Council observation dataclass ─────────────────────────────────────────────
 
 def _obs(council_id: str, member: str, title: str, evidence: str,
@@ -698,6 +743,26 @@ def write_report(result: dict, applied: list[str] | None = None) -> None:
         for a in applied:
             lines.append(f"- {a}")
         lines.append("")
+
+    # ── Rolling 30-day snapshot ───────────────────────────────────────────────
+    _raw = result.get("_trades_raw", [])
+    _r30 = rolling_30d_stats(_raw)
+    if _r30:
+        _wr_pct = _r30["win_rate"] * 100
+        _sig_tag = f"p={_r30['p_value']:.3f} {'SIGNIFICANT' if _r30['significant'] else 'n.s.'}"
+        lines += [
+            "## Rolling 30-Day Window", "",
+            f"| Metric | Value |",
+            f"|--------|-------|",
+            f"| Trades | {_r30['n']} ({_r30['wins']}W / {_r30['losses']}L) |",
+            f"| Win Rate | {_wr_pct:.1f}% vs baseline {_BASELINE_WR*100:.1f}% ({_sig_tag}) |",
+            f"| Avg R | {_r30['avg_r']:.3f} vs baseline {_BASELINE_AVG_R:.3f} |",
+            f"| Consec Losses | {_r30['consec_losses']} |",
+            f"| Window | {_r30['cutoff_date']} → today |",
+            "",
+        ]
+    else:
+        lines += ["## Rolling 30-Day Window", "", "_No trades in the last 30 calendar days._", ""]
 
     if not obs:
         lines.append("_No patterns yet — need more live trades._")

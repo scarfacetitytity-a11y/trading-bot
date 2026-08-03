@@ -144,6 +144,27 @@ class CouncilRouter:
             scored=scored,
         )
 
+        # Optional LLM advisory — non-authoritative, fire-and-forget bounded at 10s.
+        # Only runs when at least one LLM key is configured. Never changes approval.
+        try:
+            import os as _os
+            _has_llm_keys = any(
+                _os.environ.get(k) for k in ("OPENROUTER_API_KEY", "GROQ_API_KEY")
+            )
+            if _has_llm_keys:
+                from execution.llm_advisor import trade_advisory
+                _llm_notes = trade_advisory(
+                    symbol=symbol,
+                    direction=direction,
+                    score=signal_score,
+                    daily_dd_pct=daily_dd_pct,
+                )
+                for _model, _txt in _llm_notes.items():
+                    if _txt and not _txt.startswith("["):
+                        verdict.notes.append(f"[LLM:{_model}] {_txt}")
+        except Exception as _llm_exc:
+            logger.debug("[Council] LLM advisory skipped: %s", _llm_exc)
+
         # Emit event
         try:
             from execution.aiden_event_bus import append_event
