@@ -43,7 +43,7 @@ def detect_choch(
         return 0
 
     recent = df.tail(lookback + order * 2).iloc[:-1]  # exclude current forming bar
-    close  = float(df["close"].iloc[-1])
+    close  = float(df["close"].iloc[-2])  # last completed bar — not the forming bar
 
     if position_dir == 1:
         sl_mask  = _swing_lows(recent["low"], order=order)
@@ -84,7 +84,7 @@ def detect_bos(df: pd.DataFrame, position_dir: int, lookback: int = 40, order: i
         return 0
 
     recent = df.tail(lookback + order * 2).iloc[:-1]
-    close  = float(df["close"].iloc[-1])
+    close  = float(df["close"].iloc[-2])  # last completed bar — not the forming bar
     sh_mask = _swing_highs(recent["high"], order=order)
     sl_mask = _swing_lows(recent["low"],   order=order)
     sh_vals = recent["high"][sh_mask]
@@ -130,11 +130,12 @@ def detect_counter_fvg(
     Only counts if gap >= min_atr_mult * ATR (filters noise).
     Returns 1 if counter FVG detected, 0 otherwise.
     """
-    if len(df) < 3:
+    if len(df) < 5:
         return 0
 
-    c1 = df.iloc[-3]
-    c3 = df.iloc[-1]
+    # Use completed bars only — all three candles must be closed
+    c1 = df.iloc[-4]
+    c3 = df.iloc[-2]
 
     if position_dir == 1:
         gap = float(c1["high"]) - float(c3["low"])
@@ -201,8 +202,9 @@ def detect_hh_ll(df: pd.DataFrame, position_dir: int, lookback: int = 10) -> int
     if len(df) < lookback + 1:
         return 0
 
-    current_bar = df.iloc[-1]
-    prior       = df.iloc[-(lookback + 1):-1]
+    # Use last completed bar — forming bar intrabar spike is noise not confirmation
+    current_bar = df.iloc[-2]
+    prior       = df.iloc[-(lookback + 2):-2]
 
     if position_dir == 1:
         if float(current_bar["high"]) > float(prior["high"].max()):
@@ -348,10 +350,10 @@ def detect_sweep_recovery(
             return 0.0
         key_level = float(sl_vals.iloc[-1])
 
-        # Check current bar and prior recover_lookback bars for sweep pattern
+        # Check completed bars only (offset=1 skips forming bar)
         swept_low   = None
         swept_close = None
-        for offset in range(recover_lookback):
+        for offset in range(1, recover_lookback + 1):
             bar = df.iloc[-(offset + 1)]
             lo  = float(bar["low"])
             cl  = float(bar["close"])
@@ -382,7 +384,7 @@ def detect_sweep_recovery(
 
         swept_high  = None
         swept_close = None
-        for offset in range(recover_lookback):
+        for offset in range(1, recover_lookback + 1):
             bar = df.iloc[-(offset + 1)]
             hi  = float(bar["high"])
             cl  = float(bar["close"])

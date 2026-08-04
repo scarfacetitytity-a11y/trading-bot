@@ -37,8 +37,9 @@ MIN_RR_TRADEABLE   = 1.2    # below this, the draw is too close to be worth the 
 MAX_REACH_ATR      = 8.0    # a target beyond this many ATR is not reachable this session
 EQ_TOLERANCE_ATR   = 0.15   # equal-high/low cluster tolerance
 MIN_BEYOND_ATR     = 0.5    # target must sit at least this far beyond entry to count
-SWING_ORDER        = 3
-LOOKBACK_BARS      = 60
+SWING_ORDER           = 3
+LOOKBACK_BARS         = 60
+TARGET_LOOKBACK_BARS  = 120   # wider window for liquidity target discovery
 
 
 MAX_STOP_ATR       = 6.0    # a structural stop beyond this is too wide — invalid setup
@@ -100,7 +101,7 @@ def _find_target(
     if df is None or len(df) < LOOKBACK_BARS or atr <= 0:
         return None, "none", 0
 
-    window = df.tail(LOOKBACK_BARS)
+    window = df.tail(TARGET_LOOKBACK_BARS)
     tol    = atr * EQ_TOLERANCE_ATR
     beyond = atr * MIN_BEYOND_ATR
     reach  = atr * MAX_REACH_ATR

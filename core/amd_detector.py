@@ -146,7 +146,7 @@ class AMDDetector:
 
         state = PhaseState()
 
-        if len(df) < _MIN_IMPULSE and atr <= 0:
+        if len(df) < _LOOKBACK + 2 or atr <= 0:
             return state
 
         # ── Weekly range estimate if not provided ────────────────────────
@@ -248,9 +248,6 @@ class AMDDetector:
 
         # Use only completed bars (exclude the currently forming bar)
         completed = df.iloc[-(lookback + 1): -1]
-        current_close = float(df["close"].iloc[-2])   # last completed bar close
-        current_low   = float(df["low"].iloc[-2])
-        current_high  = float(df["high"].iloc[-2])
 
         best: Optional[SweepEvent] = None
         best_impulse = _MIN_IMPULSE
@@ -261,13 +258,15 @@ class AMDDetector:
             level_dir    = int(getattr(item, "direction", 0))
             is_eq_liq    = getattr(item, "zone_type", None) in ("eqh", "eql")
 
-            # ── Bullish sweep: some bar swept BELOW level_price, current close is ABOVE ──
-            # Allowed when level has bullish or neutral direction (don't check bearish OBs for bullish)
+            # ── Bullish sweep: bar wicked BELOW level and CLOSED back ABOVE ──
+            # Classic sweep pattern: wick takes liquidity, close confirms displacement.
+            # Same-bar close ensures the reversal happened — not a later unrelated close.
             if level_dir >= 0:
                 for i in range(len(completed)):
                     bar = completed.iloc[i]
-                    if float(bar["low"]) < level_price and current_close > level_price:
-                        impulse = (current_close - level_price) / atr
+                    bar_close = float(bar["close"])
+                    if float(bar["low"]) < level_price and bar_close > level_price:
+                        impulse = (bar_close - level_price) / atr
                         if impulse > best_impulse:
                             best_impulse = impulse
                             best = SweepEvent(
@@ -280,12 +279,13 @@ class AMDDetector:
                                 strong=impulse >= _STRONG_THRESH,
                             )
 
-            # ── Bearish sweep: some bar swept ABOVE level_price, current close is BELOW ──
+            # ── Bearish sweep: bar wicked ABOVE level and CLOSED back BELOW ──
             if level_dir <= 0:
                 for i in range(len(completed)):
                     bar = completed.iloc[i]
-                    if float(bar["high"]) > level_price and current_close < level_price:
-                        impulse = (level_price - current_close) / atr
+                    bar_close = float(bar["close"])
+                    if float(bar["high"]) > level_price and bar_close < level_price:
+                        impulse = (level_price - bar_close) / atr
                         if impulse > best_impulse:
                             best_impulse = impulse
                             best = SweepEvent(

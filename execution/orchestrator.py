@@ -2054,7 +2054,7 @@ class TradingEngine(Component):
                         _az_score = _az.get_armed_score()
                         # Inject into strategy's _scores so downstream sizing picks it up
                         if hasattr(self._strategy, "_scores") and self._strategy._scores is not None and len(self._strategy._scores) > 0:
-                            self._strategy._scores.iloc[-1] = int(_az_score / 10)  # normalize 0-100 → 0-10 scale
+                            self._strategy._scores.iloc[-1] = round(_az_score / 10)  # normalize 0-100 → 0-10 scale
                     except Exception as _v3e:
                         logger.warning("[%s] V3 mode error — falling back to v2 signal: %s", self.name, _v3e)
                         signals = self._strategy.generate_signals(df)
@@ -2210,7 +2210,7 @@ class TradingEngine(Component):
                         trader.close_all(self._symbol)
                         # Anti-tilt: track win/loss streak by comparing equity to entry equity
                         if self._entry_equity > 0:
-                            _close_eq = account.get("equity", self._entry_equity) if "account" in dir() else self._entry_equity
+                            _close_eq = account.get("equity", self._entry_equity)
                             if _close_eq < self._entry_equity:
                                 self._consec_losses += 1
                                 logger.info("[%s] Anti-tilt: loss #%d in streak (entry_eq=%.2f close_eq=%.2f)",

@@ -232,8 +232,12 @@ class TradeManager:
                 continuation += 1.0
                 reasons.append("news_aligned:1")
             else:
-                counter += 2.0
-                reasons.append("news_opposed:2")
+                # Apply H4 discount to news opposition same as M5 counter signals —
+                # a news event against the trade while H4 is aligned is often a spike,
+                # not a genuine reversal signal, and should not solo-trigger an exit.
+                news_ctr_w = self._h4_ctr_discount if h4_aligned else 1.0
+                counter += 2.0 * news_ctr_w
+                reasons.append(f"news_opposed:{2.0 * news_ctr_w:.1f}")
 
         c  = int(round(counter))
         co = int(round(continuation))
@@ -252,9 +256,10 @@ class TradeManager:
             c = max(c, self._exit_thresh)
             reasons.append(f"portfolio_gate(pnl={portfolio_pnl_r:.1f}R pos={cur_r:.1f}R):force_exit")
         elif portfolio_pnl_r >= 0.5 and cur_r < -0.2:
-            # Portfolio up 0.5R+, this trade losing — tighten exit threshold
-            reasons.append(f"portfolio_gate(pnl={portfolio_pnl_r:.1f}R):exit_thresh-2")
-            c = max(c, self._exit_thresh - 2)
+            # Portfolio up 0.5R, trade losing — log but don't force counter;
+            # automatic SL tightening from a 0.5R portfolio edge is too aggressive
+            # and stops out normal retracements before the trade has room to work.
+            reasons.append(f"portfolio_gate(pnl={portfolio_pnl_r:.1f}R pos={cur_r:.1f}R):noted")
 
         reason_str = " | ".join(reasons) if reasons else "no_signals"
         return self._select_action(
@@ -354,7 +359,7 @@ class TradeManager:
         # ── RUNNER TRIM: T1 already hit, any counter signal = reduce runner ────
         # After the first partial at T1, the runner should be protected more
         # aggressively — a single counter signal is enough to trim it further.
-        if position.t1_hit and counter >= 1 and not early_exit_blocked and cur_r >= 0.5:
+        if position.t1_hit and counter >= 2 and not early_exit_blocked and cur_r >= 0.5:
             new_sl = find_structure_sl(df_primary, pos_dir, position.current_sl, atr=atr_m5)
             action = ActionType.PARTIAL_CLOSE
             return TradeAction(
@@ -440,6 +445,14 @@ class TradeManager:
             lock_r = 0.05   # breakeven + spread buffer
         if lock_r is not None and position.risk_dist > 0:
             lock_px = position.entry_price + pos_dir * lock_r * position.risk_dist
+            # Prefer structural SL to avoid placing stop inside swing noise;
+            # only use arithmetic lock_px as the minimum floor.
+            struct_sl = find_structure_sl(df_primary, pos_dir, position.current_sl, atr=atr_m5)
+            if struct_sl is not None:
+                satisfies = ((pos_dir == 1 and struct_sl >= lock_px) or
+                             (pos_dir == -1 and struct_sl <= lock_px))
+                if satisfies:
+                    lock_px = struct_sl
             improves = ((pos_dir == 1 and lock_px > position.current_sl) or
                         (pos_dir == -1 and lock_px < position.current_sl))
             if improves:

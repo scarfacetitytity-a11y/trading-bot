@@ -678,7 +678,7 @@ class AiDENIndexStrategy(Strategy):
                         ob_lo, ob_hi = _find_bullish_ob(open_, close, high, low, i - 2, self.ob_lookback)
                         if ob_lo is not None and min(ob_hi, lv) - max(ob_lo, h2) > 0:
                             score += 2; is_model3 = True; reasons.append("Order block (M3) +2")
-                        else:
+                        elif ob_lo is not None:
                             score += 1; is_model3 = False; reasons.append("Order block")
 
                         if in_session:
@@ -787,13 +787,14 @@ class AiDENIndexStrategy(Strategy):
                             score += 1; reasons.append("Prior battlefield")
 
                         # Gap 10 — Multi-TF synchrony (+1): H4 or D1 candle close alignment.
-                        # JP mentor: entering on a candle that closes multiple TFs simultaneously
-                        # concentrates institutional order flow at that moment.
-                        _bar_hour = hour if isinstance(hour, int) else int(hours.iloc[i])
-                        if _bar_hour % 4 == 0:
-                            score += 1; reasons.append("H4 sync")
-                        elif _bar_hour == 0:
+                        # Only the EXACT M15 bar that coincides with the H4/D1 close gets
+                        # the bonus — not all 4 bars within the same hour.
+                        _bar_hour   = hour if isinstance(hour, int) else int(hours.iloc[i])
+                        _bar_minute = getattr(bar_time, "minute", 0)
+                        if _bar_hour == 0 and _bar_minute == 0:
                             score += 1; reasons.append("D1 sync")
+                        elif _bar_hour % 4 == 0 and _bar_minute == 0:
+                            score += 1; reasons.append("H4 sync")
 
                         # Gap 7 — USDJPY macro filter (+1/-1 for DXY-linked instruments).
                         # JP mentor v7: "I look at UJ — it tells me the DXY direction."
@@ -888,7 +889,7 @@ class AiDENIndexStrategy(Strategy):
                         ob_lo, ob_hi = _find_bearish_ob(open_, close, high, low, i - 2, self.ob_lookback)
                         if ob_lo is not None and min(ob_hi, l2) - max(ob_lo, hv) > 0:
                             score += 2; is_model3 = True; reasons.append("Order block (M3) +2")
-                        else:
+                        elif ob_lo is not None:
                             score += 1; is_model3 = False; reasons.append("Order block")
 
                         if in_session:
