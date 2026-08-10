@@ -995,7 +995,8 @@ class TradingEngine(Component):
         self._t1_hit:              bool = False
         self._bars_since_entry:    int  = 0
         self._consecutive_waits:   int  = 0
-        self._entry_cooldown_until: float = 0.0  # epoch time; TM exits blocked until then
+        self._entry_cooldown_until: float = 0.0   # epoch time; TM exits blocked until then
+        self._stopout_cooldown_until: float = 0.0  # epoch time; new entries blocked after a loss
         self._last_partial_bar:    int   = 0     # bar timestamp of last PARTIAL_CLOSE
         self._block_entry:      bool = False
         self._scaled_in:        bool = False
@@ -2213,7 +2214,8 @@ class TradingEngine(Component):
                             _close_eq = account.get("equity", self._entry_equity)
                             if _close_eq < self._entry_equity:
                                 self._consec_losses += 1
-                                logger.info("[%s] Anti-tilt: loss #%d in streak (entry_eq=%.2f close_eq=%.2f)",
+                                self._stopout_cooldown_until = time.time() + 900  # 15min block after loss
+                                logger.info("[%s] Anti-tilt: loss #%d in streak (entry_eq=%.2f close_eq=%.2f) — 15min entry block",
                                             self.name, self._consec_losses, self._entry_equity, _close_eq)
                             else:
                                 if self._consec_losses > 0:
@@ -2227,6 +2229,13 @@ class TradingEngine(Component):
                         self._reset_position_state()
 
                 # Open new position — gate through soft halt, RiskAgent, FTMOTracker
+                if desired != 0 and time.time() < self._stopout_cooldown_until:
+                    _remaining = int(self._stopout_cooldown_until - time.time())
+                    logger.info("[%s] STOPOUT COOLDOWN: %ds remaining — skip entry", self.name, _remaining)
+                    _shad.gates["stopout_cooldown"] = {"blocked": True, "remaining_s": _remaining}
+                    _shad.blocking_gate = "stopout_cooldown"
+                    _shadow_logger.record(_shad)
+                    continue
                 if desired != 0:
                     _profile = PROFILES.get(self._symbol)
                     _shad = StackInput(

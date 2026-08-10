@@ -176,7 +176,6 @@ class AiDENIndexStrategy(Strategy):
     def __init__(
         self,
         # Confluence gate
-        min_score: int           = 4,
         # H4 bias — in H4 BARS
         htf_lookback: int        = 20,
         h4_swing_lookback: int   = 40,
@@ -234,7 +233,6 @@ class AiDENIndexStrategy(Strategy):
         # Time stop — exit if no TP progress after N bars; 0 = disabled
         time_stop_bars: int      = 0,
     ):
-        self.min_score            = min_score
         self.htf_lookback         = htf_lookback
         self.h4_swing_lookback    = h4_swing_lookback
         self.h4_bias_method       = h4_bias_method
@@ -287,7 +285,6 @@ class AiDENIndexStrategy(Strategy):
         direction = "long" if self.long_only else "bi"
         return (
             f"AiDEN-v2({direction}"
-            f",s>={self.min_score}"
             f",{self.h4_bias_method}"
             f",rr={self.rr_target}+dyn"
             f",sess={self.session_start}-{self.session_end})"
@@ -605,209 +602,26 @@ class AiDENIndexStrategy(Strategy):
                 h2  = float(high.iloc[i - 2])
                 l2  = float(low.iloc[i - 2])
 
+                # Weekly premium/discount hard gate — block longs above weekly 50%,
+                # shorts below it. Swing-range check alone let gold longs through at
+                # weekly premium when the weekly range dwarfed the H4 swing.
+                _w1_mid_i       = _w1_mid_arr[i]
+                _w1_in_premium  = not np.isnan(_w1_mid_i) and cv > _w1_mid_i
+                _w1_in_discount = not np.isnan(_w1_mid_i) and cv < _w1_mid_i
+
                 # LONG setup — bullish FVG
                 # Sniper mode: build long FVG regardless of H4 bias; bias becomes confluence only
                 if htf_bias == 1 or not self.h4_bias_gate:
                     bull_gap = lv - h2
                     if bull_gap >= self.min_fvg_atr * atr_val:
-                        if htf_bias == 1:
-                            score = 2; reasons = ["H4 bias +2"]
-                        else:
-                            score = 1; reasons = ["FVG"]  # sniper mode: no H4 gate bonus, bias is confluence
-
-                        if not np.isnan(swing_hi) and swing_hi > swing_lo:
-                            mid = swing_lo + (swing_hi - swing_lo) * self.discount_pct
-                            if cv < mid:
-                                score += 1; reasons.append("Discount zone")
-                            # H4 impulse 50% POI: price at midpoint of H4 swing range.
-                            # JP mentor video 5: "50% of the impulse is always a point of interest"
-                            # — more specific than discount zone, rewards being exactly at the wall.
-                            h4_rng = swing_hi - swing_lo
-                            if h4_rng > 0 and abs(cv - mid) <= 0.10 * h4_rng:
-                                score += 1; reasons.append("H4 impulse 50%")
-
-                        # ── Negatives — reasons NOT to trade ─────────────────
-                        # No liquidity sweep: longs need to see prior lows swept before entry.
-                        # Market that hasn't swept lows hasn't cleared retail positions yet.
-                        if _liq_swept_low(low, i, self.liq_lookback):
-                            score += 1; reasons.append("Liquidity sweep")
-                        else:
-                            score -= 1; reasons.append("-No sweep")
-
-                        # Opposing manipulation M active: if M pattern formed recently,
-                        # market just signalled it wants to go DOWN. Don't fade it for a long.
-                        if _manipulation_m(high, low, i, lookback=min(20, i)):
-                            score -= 1; reasons.append("-Opposing Manip M")
-
-                        # RSI extreme against trade: entering a long when RSI already > 75
-                        # means the market is overbought — chasing a move that's exhausted.
-                        if self.use_rsi and rsi_s is not None:
-                            _rsi_now = float(rsi_s.iloc[i])
-                            if not np.isnan(_rsi_now) and _rsi_now > 75.0:
-                                score -= 1; reasons.append("-RSI overbought")
-
-                        # Untaken session low below: if Asian session low hasn't been swept
-                        # today, that liquidity is a magnet — price may dip there first before
-                        # any long continuation. JP mentor: "liquidity is drawn to price."
-                        _pl_i = _pl[i]; _cdl_i = _cdl[i]
-                        if (not np.isnan(_pl_i) and not np.isnan(_cdl_i)
-                                and _cdl_i > _pl_i and _pl_i < cv):
-                            score -= 1; reasons.append("-Untaken session low below")
-
-                        # Both Asian H + L swept before trade = concern (JP mentor v7:
-                        # "It leaked early. I always have a concern about that.")
-                        # When liquidity has been taken on BOTH sides, directional clarity
-                        # is reduced — the market may reverse or go sideways.
-                        _ph_i = _ph[i]; _cdh_i = _cdh[i]
-                        if (not np.isnan(_ph_i) and not np.isnan(_pl_i)
-                                and not np.isnan(_cdh_i) and not np.isnan(_cdl_i)
-                                and _cdh_i >= _ph_i and _cdl_i <= _pl_i):
-                            score -= 1; reasons.append("-Both Asian H+L swept")
-
-                        # Mid daily range (40-60%): JP mentor v7 — "kind of in the middle
-                        # of the range, market could go up or down, I'm a bit concerned."
-                        # Neither premium nor discount = no directional edge from range position.
-                        _pdh_i = _pdh[i]; _pdl_i = _pdl[i]
-                        if (not np.isnan(_pdh_i) and not np.isnan(_pdl_i)
-                                and _pdh_i > _pdl_i):
-                            _d_rng = _pdh_i - _pdl_i
-                            _pct   = (cv - _pdl_i) / _d_rng
-                            if 0.40 <= _pct <= 0.60:
-                                score -= 1; reasons.append("-Mid daily range")
-
                         ob_lo, ob_hi = _find_bullish_ob(open_, close, high, low, i - 2, self.ob_lookback)
-                        if ob_lo is not None and min(ob_hi, lv) - max(ob_lo, h2) > 0:
-                            score += 2; is_model3 = True; reasons.append("Order block (M3) +2")
-                        elif ob_lo is not None:
-                            score += 1; is_model3 = False; reasons.append("Order block")
-
-                        if in_session:
-                            score += 1; reasons.append("Session")
-                        if in_prime and self.use_prime_bonus:
-                            score += 1; reasons.append("Prime window")
-
-                        if self.use_rsi and not np.isnan(rsi_val):
-                            if self.rsi_long_lo <= rsi_val <= self.rsi_long_hi:
-                                score += 1; reasons.append("RSI zone")
-
-                        if strongly_trending:
-                            score += 1; reasons.append("Trend regime")
-
-                        if self.use_vol_spike and vol_mean is not None:
-                            vm = float(vol_mean.iloc[i])
-                            if vm > 0 and float(vol_s.iloc[i]) > self.vol_spike_mult * vm:
-                                score += 1; reasons.append("Volume spike")
-
-                        if d1_bias_at is not None and d1_bias_at(bar_time) == 1:
-                            score += 1; reasons.append("D1 aligned")
-
-                        # ── JP Mentor confluences (Asian session structure) ──
-                        _psm = _presess_mid[i]; _psr = _presess_rng[i]
-                        _pdh_i = _pdh[i];       _pdl_i = _pdl[i]
-                        if not np.isnan(_psm) and _psr > 0:
-                            if abs(cv - _psm) <= 0.20 * _psr:
-                                score += 1; reasons.append("Asian 50% level")
-                            if not np.isnan(_pdl_i) and _pl[i] < _pdl_i:
-                                score += 1; reasons.append("Early leakage (London sweep)")
-                        # London 50% level as NY POI: when NY is open and price taps into
-                        # 50% of the London session range — mentor video 4: "NY pushed up
-                        # to 50% of the previous session (London) and had huge wick rejection"
-                        if hour >= 13 and not np.isnan(_lon_mid[i]) and _lon_rng[i] > 0:
-                            if abs(cv - _lon_mid[i]) <= 0.20 * _lon_rng[i]:
-                                score += 1; reasons.append("London 50% NY POI")
-                        if (not np.isnan(_pdh_i) and not np.isnan(_pdl_i)
-                                and hv < _pdh_i and lv > _pdl_i
-                                and (_pdh_i - cv) < (cv - _pdl_i)):
-                            score += 1; reasons.append("Inside day (closer high)")
-                        # Manipulation W: sweep of prior lows + right shoulder + CHoCH
-                        if _manipulation_w(high, low, i, lookback=min(20, i)):
-                            score += 1; reasons.append("Manipulation W")
-                        # PDL swept today (+1): today's running low has taken prior day low
-                        if not np.isnan(_pdl[i]) and not np.isnan(_cdl[i]) and _cdl[i] < _pdl[i]:
-                            score += 1; reasons.append("PDL swept today")
-                        # D1 FVG retest (+1): price is inside a daily-level imbalance zone
-                        # Mentor: "I marked out the imbalance — that's a point of interest"
-                        for _z in _d1_fvg_zones:
-                            if _z[2] == 1 and _z[0] <= cv <= _z[1]:
-                                score += 1; reasons.append("D1 FVG retest"); break
-
-                        # Gap 6 — Weekly FVG retest (+2): highest-TF institutional imbalance
-                        # JP mentor v3: "we are currently closing up a little bit of weekly imbalance"
-                        for _wz in _w1_fvg_zones:
-                            if _wz[2] == 1 and _wz[0] <= cv <= _wz[1]:
-                                score += 2; reasons.append("W1 FVG retest +2"); break
-
-                        # Gap 13 — Weekly range position: discount (lower half) favours longs
-                        # JP mentor v7: "before I do anything, I zoom out to the weekly —
-                        # are we at a weekly high, low, or in the middle?"
-                        _w1_mid_i = _w1_mid_arr[i]; _w1_rng_i = _w1_rng_arr[i]
-                        if not np.isnan(_w1_mid_i) and _w1_rng_i > 0:
-                            if cv < _w1_mid_i:
-                                score += 1; reasons.append("Weekly discount")
-                            elif cv > _w1_mid_i + 0.30 * _w1_rng_i:
-                                score -= 1; reasons.append("-At weekly premium (risk long)")
-
-                        # Gap 5 — NY swept London Low (bullish): NY's first move takes the
-                        # London session low, then reverses — the classic NY reversal setup.
-                        # JP mentor v7: "typically NY sweeps London levels, goes takes the
-                        # London low, then reverses and rallies"
-                        if (hour >= 13 and not np.isnan(_lon_pl[i])
-                                and not np.isnan(_cdl_i) and _cdl_i <= _lon_pl[i]):
-                            score += 1; reasons.append("NY swept London Low")
-
-                        # Gap 11 — Double bottom cluster at FVG zone (+1): two or more prior
-                        # swing lows at approximately the same level as fvg_lo = accumulated
-                        # resting liquidity. JP mentor v9: "double bottom... accumulation beside
-                        # the liquidity is your signal."
-                        _db_tol = 0.15 * atr_val
-                        _db_count = sum(
-                            1 for _j in range(max(0, i - 30), i - 2)
-                            if abs(float(low.iloc[_j]) - h2) <= _db_tol
-                        )
-                        if _db_count >= 2:
-                            score += 1; reasons.append("Double bottom cluster")
-
-                        # Equal lows — liquidity cluster: recorded for probability lift in
-                        # orchestrator; NOT a +1 gate score to avoid lowering the quality floor.
-                        # JP mentor TR4/9: "equal highs, equal highs, essentially accumulate
-                        # — is this a coincidence? Liquidity taken."
-                        _eq_tol = 0.12 * atr_val
-                        _eq_lo_count = sum(
-                            1 for _j in range(max(0, i - 40), i - 2)
-                            if abs(float(low.iloc[_j]) - h2) <= _eq_tol
-                        )
-                        if _eq_lo_count >= 2:
-                            reasons.append("Equal lows (liq cluster)")
-
-                        # v10 — Previous battlefield (+1): price returns to a prior
-                        # congestion zone where bulls/bears already fought (prior CHoCH area).
-                        # JP mentor v10: "I came back into a previous battlefield — that's
-                        # how I was able to get into this trade."
-                        if _is_prior_battlefield(high, low, close, i, h2, lv, atr_val):
-                            score += 1; reasons.append("Prior battlefield")
-
-                        # Gap 10 — Multi-TF synchrony (+1): H4 or D1 candle close alignment.
-                        # Only the EXACT M15 bar that coincides with the H4/D1 close gets
-                        # the bonus — not all 4 bars within the same hour.
-                        _bar_hour   = hour if isinstance(hour, int) else int(hours.iloc[i])
-                        _bar_minute = getattr(bar_time, "minute", 0)
-                        if _bar_hour == 0 and _bar_minute == 0:
-                            score += 1; reasons.append("D1 sync")
-                        elif _bar_hour % 4 == 0 and _bar_minute == 0:
-                            score += 1; reasons.append("H4 sync")
-
-                        # Gap 7 — USDJPY macro filter (+1/-1 for DXY-linked instruments).
-                        # JP mentor v7: "I look at UJ — it tells me the DXY direction."
-                        # EURUSD/GBPUSD/XAUUSD/XAGUSD are DXY-inverse: USDJPY bullish
-                        # (USD strong) means these pairs naturally weaken → penalise longs.
-                        # USDJPY bearish (USD weak) → tailwind for longs → reward.
-                        if self._uj_h4_bias != 0:
-                            if self._uj_h4_bias == 1:
-                                score -= 1; reasons.append("-UJ macro headwind (long)")
-                            else:  # _uj_h4_bias == -1
-                                score += 1; reasons.append("UJ macro tailwind (long)")
-
-                        if score >= self.min_score:
+                        is_model3 = ob_lo is not None and min(ob_hi, lv) - max(ob_lo, h2) > 0
+                        reasons = ["FVG"]
+                        if ob_lo is not None:
+                            reasons.append("OB")
+                        _in_premium = (not np.isnan(swing_hi) and swing_hi > swing_lo
+                                       and cv >= swing_lo + (swing_hi - swing_lo) * self.discount_pct)
+                        if not _in_premium and not _w1_in_premium:
                             active_fvgs.append({
                                 "dir":      "bull",
                                 "fvg_lo":   h2,
@@ -815,7 +629,7 @@ class AiDENIndexStrategy(Strategy):
                                 "fvg_ce":   (h2 + lv) / 2,
                                 "ob_lo":    ob_lo,
                                 "ob_hi":    ob_hi,
-                                "score":    score,
+                                "score":    0,
                                 "reasons":  reasons,
                                 "formed":   i,
                                 "tested":   False,
@@ -830,175 +644,14 @@ class AiDENIndexStrategy(Strategy):
                 if (htf_bias == -1 or not self.h4_bias_gate) and not self.long_only:
                     bear_gap = l2 - hv
                     if bear_gap >= self.min_fvg_atr * atr_val:
-                        if htf_bias == -1:
-                            score = 2; reasons = ["H4 bias +2"]
-                        else:
-                            score = 1; reasons = ["FVG"]  # sniper mode
-
-                        if not np.isnan(swing_hi) and swing_hi > swing_lo:
-                            mid = swing_lo + (swing_hi - swing_lo) * self.discount_pct
-                            if cv > mid:
-                                score += 1; reasons.append("Premium zone")
-                            # H4 impulse 50% POI (SHORT): same logic, bearish direction
-                            h4_rng = swing_hi - swing_lo
-                            if h4_rng > 0 and abs(cv - mid) <= 0.10 * h4_rng:
-                                score += 1; reasons.append("H4 impulse 50%")
-
-                        # ── Negatives — reasons NOT to trade ─────────────────
-                        if _liq_swept_high(high, i, self.liq_lookback):
-                            score += 1; reasons.append("Liquidity sweep")
-                        else:
-                            score -= 1; reasons.append("-No sweep")
-
-                        # Opposing Manipulation W: market just signalled it wants to go UP.
-                        if _manipulation_w(high, low, i, lookback=min(20, i)):
-                            score -= 1; reasons.append("-Opposing Manip W")
-
-                        # RSI oversold entering a short: chasing an exhausted down move.
-                        if self.use_rsi and rsi_s is not None:
-                            _rsi_now = float(rsi_s.iloc[i])
-                            if not np.isnan(_rsi_now) and _rsi_now < 25.0:
-                                score -= 1; reasons.append("-RSI oversold")
-
-                        # Untaken session high above: if Asian session high hasn't been swept
-                        # today, that liquidity is a magnet — price may rally there first before
-                        # any short continuation. JP mentor: "why would it turn before taking that high?"
-                        _ph_i = _ph[i]; _cdh_i = _cdh[i]
-                        if (not np.isnan(_ph_i) and not np.isnan(_cdh_i)
-                                and _cdh_i < _ph_i and _ph_i > cv):
-                            score -= 1; reasons.append("-Untaken session high above")
-
-                        # Both Asian H + L swept before trade = concern (JP mentor v7:
-                        # "It leaked early. I always have a concern about that.")
-                        _pl_i = _pl[i]; _cdl_i = _cdl[i]
-                        if (not np.isnan(_ph_i) and not np.isnan(_pl_i)
-                                and not np.isnan(_cdh_i) and not np.isnan(_cdl_i)
-                                and _cdh_i >= _ph_i and _cdl_i <= _pl_i):
-                            score -= 1; reasons.append("-Both Asian H+L swept")
-
-                        # Mid daily range (40-60%): JP mentor v7 — "kind of in the middle
-                        # of the range, market could go up or down, I'm a bit concerned."
-                        _pdh_i = _pdh[i]; _pdl_i = _pdl[i]
-                        if (not np.isnan(_pdh_i) and not np.isnan(_pdl_i)
-                                and _pdh_i > _pdl_i):
-                            _d_rng = _pdh_i - _pdl_i
-                            _pct   = (cv - _pdl_i) / _d_rng
-                            if 0.40 <= _pct <= 0.60:
-                                score -= 1; reasons.append("-Mid daily range")
-
                         ob_lo, ob_hi = _find_bearish_ob(open_, close, high, low, i - 2, self.ob_lookback)
-                        if ob_lo is not None and min(ob_hi, l2) - max(ob_lo, hv) > 0:
-                            score += 2; is_model3 = True; reasons.append("Order block (M3) +2")
-                        elif ob_lo is not None:
-                            score += 1; is_model3 = False; reasons.append("Order block")
-
-                        if in_session:
-                            score += 1; reasons.append("Session")
-                        if in_prime and self.use_prime_bonus:
-                            score += 1; reasons.append("Prime window")
-
-                        if self.use_rsi and not np.isnan(rsi_val):
-                            if self.rsi_short_lo <= rsi_val <= self.rsi_short_hi:
-                                score += 1; reasons.append("RSI zone")
-
-                        if strongly_trending:
-                            score += 1; reasons.append("Trend regime")
-
-                        if self.use_vol_spike and vol_mean is not None:
-                            vm = float(vol_mean.iloc[i])
-                            if vm > 0 and float(vol_s.iloc[i]) > self.vol_spike_mult * vm:
-                                score += 1; reasons.append("Volume spike")
-
-                        if d1_bias_at is not None and d1_bias_at(bar_time) == -1:
-                            score += 1; reasons.append("D1 aligned")
-
-                        # ── JP Mentor confluences (Asian session structure) ──
-                        _psm = _presess_mid[i]; _psr = _presess_rng[i]
-                        _pdh_i = _pdh[i];       _pdl_i = _pdl[i]
-                        if not np.isnan(_psm) and _psr > 0:
-                            if abs(cv - _psm) <= 0.20 * _psr:
-                                score += 1; reasons.append("Asian 50% level")
-                            if not np.isnan(_pdh_i) and _ph[i] > _pdh_i:
-                                score += 1; reasons.append("Early leakage (London sweep)")
-                        # London 50% level as NY POI (SHORT): same logic, bearish direction
-                        if hour >= 13 and not np.isnan(_lon_mid[i]) and _lon_rng[i] > 0:
-                            if abs(cv - _lon_mid[i]) <= 0.20 * _lon_rng[i]:
-                                score += 1; reasons.append("London 50% NY POI")
-                        if (not np.isnan(_pdh_i) and not np.isnan(_pdl_i)
-                                and hv < _pdh_i and lv > _pdl_i
-                                and (cv - _pdl_i) < (_pdh_i - cv)):
-                            score += 1; reasons.append("Inside day (closer low)")
-                        # Manipulation M: sweep of prior highs + right shoulder + CHoCH
-                        if _manipulation_m(high, low, i, lookback=min(20, i)):
-                            score += 1; reasons.append("Manipulation M")
-                        # PDH swept today (+1): today's running high has taken prior day high
-                        if not np.isnan(_pdh[i]) and not np.isnan(_cdh[i]) and _cdh[i] > _pdh[i]:
-                            score += 1; reasons.append("PDH swept today")
-                        # D1 FVG retest (+1): price is inside a bearish daily imbalance zone
-                        for _z in _d1_fvg_zones:
-                            if _z[2] == -1 and _z[0] <= cv <= _z[1]:
-                                score += 1; reasons.append("D1 FVG retest"); break
-
-                        # Gap 6 — Weekly FVG retest (+2): bearish weekly imbalance
-                        for _wz in _w1_fvg_zones:
-                            if _wz[2] == -1 and _wz[0] <= cv <= _wz[1]:
-                                score += 2; reasons.append("W1 FVG retest +2"); break
-
-                        # Gap 13 — Weekly premium favours shorts
-                        _w1_mid_i = _w1_mid_arr[i]; _w1_rng_i = _w1_rng_arr[i]
-                        if not np.isnan(_w1_mid_i) and _w1_rng_i > 0:
-                            if cv > _w1_mid_i:
-                                score += 1; reasons.append("Weekly premium")
-                            elif cv < _w1_mid_i - 0.30 * _w1_rng_i:
-                                score -= 1; reasons.append("-At weekly discount (risk short)")
-
-                        # Gap 5 — NY swept London High (bearish): NY sweeps the London high
-                        # then reverses — the bearish NY setup. JP mentor v7.
-                        if (hour >= 13 and not np.isnan(_lon_ph[i])
-                                and not np.isnan(_cdh_i) and _cdh_i >= _lon_ph[i]):
-                            score += 1; reasons.append("NY swept London High")
-
-                        # Gap 11 — Double top cluster at FVG zone (+1)
-                        _dt_tol = 0.15 * atr_val
-                        _dt_count = sum(
-                            1 for _j in range(max(0, i - 30), i - 2)
-                            if abs(float(high.iloc[_j]) - l2) <= _dt_tol
-                        )
-                        if _dt_count >= 2:
-                            score += 1; reasons.append("Double top cluster")
-
-                        # Equal highs — liquidity cluster: recorded for probability lift;
-                        # NOT a +1 gate score. Mirror of equal lows concept.
-                        # JP mentor TR4/9: mirror of equal lows concept.
-                        _eq_hi_tol = 0.12 * atr_val
-                        _eq_hi_count = sum(
-                            1 for _j in range(max(0, i - 40), i - 2)
-                            if abs(float(high.iloc[_j]) - l2) <= _eq_hi_tol
-                        )
-                        if _eq_hi_count >= 2:
-                            reasons.append("Equal highs (liq cluster)")
-
-                        # v10 — Previous battlefield (+1): SHORT mirror
-                        if _is_prior_battlefield(high, low, close, i, hv, l2, atr_val):
-                            score += 1; reasons.append("Prior battlefield")
-
-                        # Gap 10 — Multi-TF synchrony (+1)
-                        _bar_hour_s = hour if isinstance(hour, int) else int(hours.iloc[i])
-                        if _bar_hour_s % 4 == 0:
-                            score += 1; reasons.append("H4 sync")
-                        elif _bar_hour_s == 0:
-                            score += 1; reasons.append("D1 sync")
-
-                        # Gap 7 — USDJPY macro filter (SHORT, DXY-inverse instruments).
-                        # USDJPY bullish (USD strong) → DXY-inverse pairs weaken → tailwind for shorts.
-                        # USDJPY bearish (USD weak) → DXY-inverse pairs strengthen → headwind for shorts.
-                        if self._uj_h4_bias != 0:
-                            if self._uj_h4_bias == 1:
-                                score += 1; reasons.append("UJ macro tailwind (short)")
-                            else:  # _uj_h4_bias == -1
-                                score -= 1; reasons.append("-UJ macro headwind (short)")
-
-                        if score >= self.min_score:
+                        is_model3 = ob_lo is not None and min(ob_hi, l2) - max(ob_lo, hv) > 0
+                        reasons = ["FVG"]
+                        if ob_lo is not None:
+                            reasons.append("OB")
+                        _in_discount = (not np.isnan(swing_hi) and swing_hi > swing_lo
+                                        and cv <= swing_lo + (swing_hi - swing_lo) * self.discount_pct)
+                        if not _in_discount and not _w1_in_discount:
                             active_fvgs.append({
                                 "dir":      "bear",
                                 "fvg_lo":   hv,
@@ -1006,7 +659,7 @@ class AiDENIndexStrategy(Strategy):
                                 "fvg_ce":   (hv + l2) / 2,
                                 "ob_lo":    ob_lo,
                                 "ob_hi":    ob_hi,
-                                "score":    score,
+                                "score":    0,
                                 "reasons":  reasons,
                                 "formed":   i,
                                 "tested":   False,
@@ -1024,223 +677,79 @@ class AiDENIndexStrategy(Strategy):
                 if htf_bias == 1 or not self.h4_bias_gate:
                     # ── Sweep reversal long ───────────────────────────────────
                     _swept_lo, _sl_lo = _sweep_reversal_bull(close, low, i, self.liq_lookback * 2)
-                    if _swept_lo is not None and not _alt_dup(active_fvgs, "bull", _sl_lo, atr_val):
-                        _sc = 2 if htf_bias == 1 else 1; _rs = ["H4 bias +2"] if htf_bias == 1 else ["Sweep reversal"]
-                        _sc += 2; _rs.append("Liq sweep reversal +2")
-
-                        if not np.isnan(swing_hi) and swing_hi > swing_lo:
-                            _mid = swing_lo + (swing_hi - swing_lo) * self.discount_pct
-                            if cv < _mid:
-                                _sc += 1; _rs.append("Discount zone")
-                            _h4r = swing_hi - swing_lo
-                            if _h4r > 0 and abs(cv - _mid) <= 0.10 * _h4r:
-                                _sc += 1; _rs.append("H4 impulse 50%")
-
-                        if in_session:
-                            _sc += 1; _rs.append("Session")
-                        if in_prime and self.use_prime_bonus:
-                            _sc += 1; _rs.append("Prime window")
-                        if self.use_rsi and not np.isnan(rsi_val):
-                            if self.rsi_long_lo <= rsi_val <= self.rsi_long_hi:
-                                _sc += 1; _rs.append("RSI zone")
-                        if strongly_trending:
-                            _sc += 1; _rs.append("Trend regime")
-                        if _manipulation_m(high, low, i, lookback=min(20, i)):
-                            _sc -= 1; _rs.append("-Opposing Manip M")
-                        if self.use_rsi and rsi_s is not None:
-                            _rn = float(rsi_s.iloc[i])
-                            if not np.isnan(_rn) and _rn > 75.0:
-                                _sc -= 1; _rs.append("-RSI overbought")
-                        if (not np.isnan(_alt_pdh_i) and not np.isnan(_alt_pdl_i)
-                                and _alt_pdh_i > _alt_pdl_i):
-                            _dr = _alt_pdh_i - _alt_pdl_i
-                            if _dr > 0 and 0.40 <= (cv - _alt_pdl_i) / _dr <= 0.60:
-                                _sc -= 1; _rs.append("-Mid daily range")
-                        if self._uj_h4_bias == 1:
-                            _sc -= 1; _rs.append("-UJ macro headwind (long)")
-                        elif self._uj_h4_bias == -1:
-                            _sc += 1; _rs.append("UJ macro tailwind (long)")
-
-                        if _sc >= self.min_score:
-                            active_fvgs.append({
-                                "dir":      "bull",
-                                "fvg_lo":   _sl_lo,
-                                "fvg_hi":   _swept_lo + 0.3 * atr_val,
-                                "fvg_ce":   _swept_lo + 0.15 * atr_val,
-                                "ob_lo":    _sl_lo,
-                                "ob_hi":    None,
-                                "score":    _sc,
-                                "reasons":  _rs,
-                                "formed":   i,
-                                "tested":   True,
-                                "test_bar": i,
-                                "model3":   False,
-                                "trend_s":  trend_strength,
-                            })
+                    if _swept_lo is not None and not _w1_in_premium and not _alt_dup(active_fvgs, "bull", _sl_lo, atr_val):
+                        active_fvgs.append({
+                            "dir":      "bull",
+                            "fvg_lo":   _sl_lo,
+                            "fvg_hi":   _swept_lo + 0.3 * atr_val,
+                            "fvg_ce":   _swept_lo + 0.15 * atr_val,
+                            "ob_lo":    _sl_lo,
+                            "ob_hi":    None,
+                            "score":    0,
+                            "reasons":  ["Sweep reversal"],
+                            "formed":   i,
+                            "tested":   True,
+                            "test_bar": i,
+                            "model3":   False,
+                            "trend_s":  trend_strength,
+                        })
 
                     # ── BOS long ──────────────────────────────────────────────
                     _bos_level, _bos_hit = _bos_bull(high, close, i, self.ob_lookback)
-                    if _bos_hit and _bos_level is not None and not _alt_dup(active_fvgs, "bull", _bos_level, atr_val):
-                        _sc = 2; _rs = ["H4 bias +2"]
-                        _sc += 1; _rs.append("BOS (structure break)")
-
-                        if _liq_swept_low(low, i, self.liq_lookback):
-                            _sc += 1; _rs.append("Liquidity sweep")
-                        else:
-                            _sc -= 1; _rs.append("-No sweep")
-
-                        if not np.isnan(swing_hi) and swing_hi > swing_lo:
-                            _mid = swing_lo + (swing_hi - swing_lo) * self.discount_pct
-                            if cv < _mid:
-                                _sc += 1; _rs.append("Discount zone")
-
-                        if in_session:
-                            _sc += 1; _rs.append("Session")
-                        if in_prime and self.use_prime_bonus:
-                            _sc += 1; _rs.append("Prime window")
-                        if self.use_rsi and not np.isnan(rsi_val):
-                            if self.rsi_long_lo <= rsi_val <= self.rsi_long_hi:
-                                _sc += 1; _rs.append("RSI zone")
-                        if strongly_trending:
-                            _sc += 1; _rs.append("Trend regime")
-                        if _manipulation_m(high, low, i, lookback=min(20, i)):
-                            _sc -= 1; _rs.append("-Opposing Manip M")
-                        if (not np.isnan(_alt_pdh_i) and not np.isnan(_alt_pdl_i)
-                                and _alt_pdh_i > _alt_pdl_i):
-                            _dr = _alt_pdh_i - _alt_pdl_i
-                            if _dr > 0 and 0.40 <= (cv - _alt_pdl_i) / _dr <= 0.60:
-                                _sc -= 1; _rs.append("-Mid daily range")
-                        if self._uj_h4_bias == 1:
-                            _sc -= 1; _rs.append("-UJ macro headwind (long)")
-                        elif self._uj_h4_bias == -1:
-                            _sc += 1; _rs.append("UJ macro tailwind (long)")
-
-                        if _sc >= self.min_score:
-                            active_fvgs.append({
-                                "dir":      "bull",
-                                "fvg_lo":   _bos_level,
-                                "fvg_hi":   _bos_level + 0.5 * atr_val,
-                                "fvg_ce":   _bos_level + 0.25 * atr_val,
-                                "ob_lo":    float(low.iloc[i]),
-                                "ob_hi":    None,
-                                "score":    _sc,
-                                "reasons":  _rs,
-                                "formed":   i,
-                                "tested":   True,
-                                "test_bar": i,
-                                "model3":   False,
-                                "trend_s":  trend_strength,
-                            })
+                    if _bos_hit and _bos_level is not None and not _w1_in_premium and not _alt_dup(active_fvgs, "bull", _bos_level, atr_val):
+                        active_fvgs.append({
+                            "dir":      "bull",
+                            "fvg_lo":   _bos_level,
+                            "fvg_hi":   _bos_level + 0.5 * atr_val,
+                            "fvg_ce":   _bos_level + 0.25 * atr_val,
+                            "ob_lo":    float(low.iloc[i]),
+                            "ob_hi":    None,
+                            "score":    0,
+                            "reasons":  ["BOS"],
+                            "formed":   i,
+                            "tested":   True,
+                            "test_bar": i,
+                            "model3":   False,
+                            "trend_s":  trend_strength,
+                        })
 
                 if (htf_bias == -1 or not self.h4_bias_gate) and not self.long_only:
                     # ── Sweep reversal short ──────────────────────────────────
                     _swept_hi, _sl_hi = _sweep_reversal_bear(close, high, i, self.liq_lookback * 2)
-                    if _swept_hi is not None and not _alt_dup(active_fvgs, "bear", _sl_hi, atr_val):
-                        _sc = 2 if htf_bias == -1 else 1; _rs = ["H4 bias +2"] if htf_bias == -1 else ["Sweep reversal"]
-                        _sc += 2; _rs.append("Liq sweep reversal +2")
-
-                        if not np.isnan(swing_hi) and swing_hi > swing_lo:
-                            _mid = swing_lo + (swing_hi - swing_lo) * self.discount_pct
-                            if cv > _mid:
-                                _sc += 1; _rs.append("Premium zone")
-                            _h4r = swing_hi - swing_lo
-                            if _h4r > 0 and abs(cv - _mid) <= 0.10 * _h4r:
-                                _sc += 1; _rs.append("H4 impulse 50%")
-
-                        if in_session:
-                            _sc += 1; _rs.append("Session")
-                        if in_prime and self.use_prime_bonus:
-                            _sc += 1; _rs.append("Prime window")
-                        if self.use_rsi and not np.isnan(rsi_val):
-                            if self.rsi_short_lo <= rsi_val <= self.rsi_short_hi:
-                                _sc += 1; _rs.append("RSI zone")
-                        if strongly_trending:
-                            _sc += 1; _rs.append("Trend regime")
-                        if _manipulation_w(high, low, i, lookback=min(20, i)):
-                            _sc -= 1; _rs.append("-Opposing Manip W")
-                        if self.use_rsi and rsi_s is not None:
-                            _rn = float(rsi_s.iloc[i])
-                            if not np.isnan(_rn) and _rn < 25.0:
-                                _sc -= 1; _rs.append("-RSI oversold")
-                        if (not np.isnan(_alt_pdh_i) and not np.isnan(_alt_pdl_i)
-                                and _alt_pdh_i > _alt_pdl_i):
-                            _dr = _alt_pdh_i - _alt_pdl_i
-                            if _dr > 0 and 0.40 <= (cv - _alt_pdl_i) / _dr <= 0.60:
-                                _sc -= 1; _rs.append("-Mid daily range")
-                        if self._uj_h4_bias == 1:
-                            _sc += 1; _rs.append("UJ macro tailwind (short)")
-                        elif self._uj_h4_bias == -1:
-                            _sc -= 1; _rs.append("-UJ macro headwind (short)")
-
-                        if _sc >= self.min_score:
-                            active_fvgs.append({
-                                "dir":      "bear",
-                                "fvg_lo":   _swept_hi - 0.3 * atr_val,
-                                "fvg_hi":   _sl_hi,
-                                "fvg_ce":   _swept_hi - 0.15 * atr_val,
-                                "ob_lo":    None,
-                                "ob_hi":    _sl_hi,
-                                "score":    _sc,
-                                "reasons":  _rs,
-                                "formed":   i,
-                                "tested":   True,
-                                "test_bar": i,
-                                "model3":   False,
-                                "trend_s":  trend_strength,
-                            })
+                    if _swept_hi is not None and not _w1_in_discount and not _alt_dup(active_fvgs, "bear", _sl_hi, atr_val):
+                        active_fvgs.append({
+                            "dir":      "bear",
+                            "fvg_lo":   _swept_hi - 0.3 * atr_val,
+                            "fvg_hi":   _sl_hi,
+                            "fvg_ce":   _swept_hi - 0.15 * atr_val,
+                            "ob_lo":    None,
+                            "ob_hi":    _sl_hi,
+                            "score":    0,
+                            "reasons":  ["Sweep reversal"],
+                            "formed":   i,
+                            "tested":   True,
+                            "test_bar": i,
+                            "model3":   False,
+                            "trend_s":  trend_strength,
+                        })
 
                     # ── BOS short ─────────────────────────────────────────────
                     _bos_level, _bos_hit = _bos_bear(low, close, i, self.ob_lookback)
-                    if _bos_hit and _bos_level is not None and not _alt_dup(active_fvgs, "bear", _bos_level - 0.5 * atr_val, atr_val):
-                        _sc = 2; _rs = ["H4 bias +2"]
-                        _sc += 1; _rs.append("BOS (structure break)")
-
-                        if _liq_swept_high(high, i, self.liq_lookback):
-                            _sc += 1; _rs.append("Liquidity sweep")
-                        else:
-                            _sc -= 1; _rs.append("-No sweep")
-
-                        if not np.isnan(swing_hi) and swing_hi > swing_lo:
-                            _mid = swing_lo + (swing_hi - swing_lo) * self.discount_pct
-                            if cv > _mid:
-                                _sc += 1; _rs.append("Premium zone")
-
-                        if in_session:
-                            _sc += 1; _rs.append("Session")
-                        if in_prime and self.use_prime_bonus:
-                            _sc += 1; _rs.append("Prime window")
-                        if self.use_rsi and not np.isnan(rsi_val):
-                            if self.rsi_short_lo <= rsi_val <= self.rsi_short_hi:
-                                _sc += 1; _rs.append("RSI zone")
-                        if strongly_trending:
-                            _sc += 1; _rs.append("Trend regime")
-                        if _manipulation_w(high, low, i, lookback=min(20, i)):
-                            _sc -= 1; _rs.append("-Opposing Manip W")
-                        if (not np.isnan(_alt_pdh_i) and not np.isnan(_alt_pdl_i)
-                                and _alt_pdh_i > _alt_pdl_i):
-                            _dr = _alt_pdh_i - _alt_pdl_i
-                            if _dr > 0 and 0.40 <= (cv - _alt_pdl_i) / _dr <= 0.60:
-                                _sc -= 1; _rs.append("-Mid daily range")
-                        if self._uj_h4_bias == 1:
-                            _sc += 1; _rs.append("UJ macro tailwind (short)")
-                        elif self._uj_h4_bias == -1:
-                            _sc -= 1; _rs.append("-UJ macro headwind (short)")
-
-                        if _sc >= self.min_score:
-                            active_fvgs.append({
-                                "dir":      "bear",
-                                "fvg_lo":   _bos_level - 0.5 * atr_val,
-                                "fvg_hi":   _bos_level,
-                                "fvg_ce":   _bos_level - 0.25 * atr_val,
-                                "ob_lo":    None,
-                                "ob_hi":    float(high.iloc[i]),
-                                "score":    _sc,
-                                "reasons":  _rs,
-                                "formed":   i,
-                                "tested":   True,
-                                "test_bar": i,
-                                "model3":   False,
-                                "trend_s":  trend_strength,
+                    if _bos_hit and _bos_level is not None and not _w1_in_discount and not _alt_dup(active_fvgs, "bear", _bos_level - 0.5 * atr_val, atr_val):
+                        active_fvgs.append({
+                            "dir":      "bear",
+                            "fvg_lo":   _bos_level - 0.5 * atr_val,
+                            "fvg_hi":   _bos_level,
+                            "fvg_ce":   _bos_level - 0.25 * atr_val,
+                            "ob_lo":    None,
+                            "ob_hi":    float(high.iloc[i]),
+                            "score":    0,
+                            "reasons":  ["BOS"],
+                            "formed":   i,
+                            "tested":   True,
+                            "test_bar": i,
+                            "model3":   False,
+                            "trend_s":  trend_strength,
                             })
 
                 # Trim FVG queue
