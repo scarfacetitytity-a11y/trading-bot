@@ -2728,10 +2728,8 @@ class TradingEngine(Component):
                                     _range_label, _score_over_floor_rb,
                                 )
 
-                    # ── M1 structural confirmation ─────────────────────────────
-                    # Require the last completed M1 candle to break above/below the
-                    # prior candle's high/low in the trade direction. Filters entries
-                    # where price hasn't shown any intent — the "never worked" class.
+                    # ── M1 structural confirmation (confluence only, not a gate) ──
+                    # +1 score when M1 candle direction aligns with trade. No block.
                     _df_m1c = self._fetch_ltf_bars("M1", count=10)
                     if _df_m1c is not None and len(_df_m1c) >= 3:
                         _m1_close = float(_df_m1c["close"].iloc[-2])   # last completed bar
@@ -2741,15 +2739,20 @@ class TradingEngine(Component):
                         _m1_bull  = _m1_close > _m1_open
                         _m1_bear  = _m1_close < _m1_open
                         _m1_ok    = _m1_bull if desired == 1 else _m1_bear
-                        if not _m1_ok:
+                        if _m1_ok:
+                            signal_score += 1
+                            _extra_reasons.append("M1 confirmed")
                             logger.info(
-                                "[%s] M1 CONFIRM GATE: no %s structural break — skip "
-                                "(close=%.5f phigh=%.5f plow=%.5f)",
+                                "[%s] M1 confluence: %s candle confirmed — +1 score → %d",
+                                self.name, "bull" if desired == 1 else "bear", signal_score,
+                            )
+                        else:
+                            logger.info(
+                                "[%s] M1 no confluence: no %s candle (close=%.5f phigh=%.5f plow=%.5f) — proceeding",
                                 self.name, "bull" if desired == 1 else "bear",
                                 _m1_close, _m1_phigh, _m1_plow,
                             )
-                            _shad.gates["m1_confirm"] = {"blocked": True}; _shad.blocking_gate = "m1_confirm"; _shadow_logger.record(_shad)
-                            continue
+                        _shad.gates["m1_confirm"] = {"blocked": False, "confirmed": _m1_ok}
 
                     # ── Z-score regime gate (ruflo/neural-trader classifier) ──
                     # Classifies the symbol's statistical volatility regime from
@@ -3065,28 +3068,23 @@ class TradingEngine(Component):
                     # Grade A/B (real draw): full plan size. Grade C (no draw): allow at
                     # plan's 0.25x min size if score >= floor+2. Below floor+2 = skip.
                     direction_str = "BUY" if desired == 1 else "SELL"
-                    if self._last_plan is not None and not self._last_plan.tradeable:
-                        if _score_over_floor < 2:
-                            logger.info("[%s] NO-DRAW skip: %s (grade %s, score only %d over floor) — %s",
-                                        self.name, direction_str, self._last_plan.grade,
-                                        _score_over_floor, self._last_plan.thesis)
-                            _shad.gates["no_draw"] = {"blocked": True, "grade": str(self._last_plan.grade)}; _shad.blocking_gate = "no_draw"; _shadow_logger.record(_shad)
-                            continue
-                        logger.info("[%s] NO-DRAW allow: %s grade C, score %d over floor — proceeding at 0.25x",
-                                    self.name, direction_str, _score_over_floor)
-                        _shad.gates["no_draw"] = {"blocked": False, "grade": "C_override", "score_over_floor": _score_over_floor}
 
                     # ── Per-trade agent: Council adjudication + durable ticket ──
                     # Uses the plan already computed in _size_order (no recompute).
                     tick_e    = mt5.symbol_info_tick(self._symbol)
                     entry_px  = (tick_e.ask if desired == 1 else tick_e.bid) if tick_e else 0.0
                     dd_daily_room, dd_total_room = self._dd_room(equity)
+                    try:
+                        _se_atr = float(getattr(self._strategy, "_atr_cache", pd.Series()).iloc[-1])
+                    except Exception:
+                        _se_atr = 0.0
                     ticket = self._agent.evaluate(
                         symbol=self._symbol, direction=desired,
-                        df_m15=None, df_m5=None, entry=entry_px, ref_stop=sl or 0.0,
-                        atr=0.0, h4_bias=0, plan=self._last_plan,
+                        df_m15=df, df_m5=df_m5_entry, entry=entry_px, ref_stop=sl or 0.0,
+                        atr=_se_atr, h4_bias=h4_bias, plan=self._last_plan,
                         gates={"m5_trigger": True},   # gates already passed above
                         dd_room_daily=dd_daily_room, dd_room_total=dd_total_room,
+                        score=signal_score,
                     )
                     if ticket.verdict != "GO":
                         logger.info("[%s] AGENT NO_GO: %s | dissent: %s",

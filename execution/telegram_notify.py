@@ -288,7 +288,7 @@ def notify_trade_open(
         f"💰 <b>+${profit_usd:,.0f}</b>   🛡 −${risk_usd:,.0f}   ⚖️ {rr_str}\n\n"
         f"<b>Entry</b> <code>{entry:.5g}</code> · {lots:.2f} lots\n"
         f"🎯 <code>{tp_str}</code>  ·  🛡 <code>{sl:.5g}</code>\n\n"
-        f"📊 {score}/10 {_score_bar_blocks(score)} <b>{_conviction(score)}</b>\n"
+        f"📊 {score} {_score_bar_blocks(score, max_score=max(10, score))} <b>{_conviction(score)}</b>\n"
     )
     # Score breakdown — the confluences that built the number
     if reasons:
@@ -377,7 +377,7 @@ def notify_trade_review(
     if thesis:
         msg += f"<b>Thesis:</b> {thesis}\n\n"
 
-    msg += f"<b>Score:</b> {score}/10 {_score_bar_blocks(score)} <b>{_conviction(score)}</b>\n"
+    msg += f"<b>Score:</b> {score} {_score_bar_blocks(score, max_score=max(10, score))} <b>{_conviction(score)}</b>\n"
     if reasons:
         msg += "".join(f"   ✓ {r}\n" for r in reasons)
 

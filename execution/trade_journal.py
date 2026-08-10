@@ -181,6 +181,10 @@ class TradeJournal:
             rec.outcome = "win"
         elif rec.r_multiple < -0.2:
             rec.outcome = "loss"
+        elif rec.pnl_usd is not None and rec.pnl_usd < -2.0:
+            # Price barely moved but real dollar loss is significant (spread + commission
+            # at high lot sizes eats the margin). Don't lie — it's a loss.
+            rec.outcome = "loss"
         else:
             rec.outcome = "breakeven"
 
