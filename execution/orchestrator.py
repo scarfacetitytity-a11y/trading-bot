@@ -70,6 +70,7 @@ from core.amd_detector import AMDDetector, SweepEvent
 from execution.market_context_agent import MarketContextAgent, MarketContext
 from execution.probability_model import ProbabilityModel, TradeConfluences
 from execution.order_flow import analyse_order_flow, order_flow_score_modifier, get_dom_key_levels, cvd_divergence_score
+from execution.market_reader import read_market
 from execution import telegram_notify as tg
 from execution.telegram_commands import TelegramCommandHandler
 from backtests.run_multi_instrument import (
@@ -2500,6 +2501,9 @@ class TradingEngine(Component):
                         logger.info("[%s] M5 confirmed — +1 score → %d", self.name, signal_score)
 
                     # Order flow confluence: checks delta + imbalance + DOM alignment
+                    _of_snap = None   # safe default — overwritten below if M5 available
+                    _cvd_mod = 0      # safe default — overwritten below if CVD fires
+                    _df_m5   = None   # safe default
                     try:
                         _df_m5 = self._strategy._m5_df if hasattr(self._strategy, "_m5_df") else None
                         _of_snap = analyse_order_flow(self._symbol, _df_m5, mt5=mt5)
@@ -2686,13 +2690,41 @@ class TradingEngine(Component):
                                     self.name, _total_dd_pct, _boost_thr, old_needed, needed)
 
                     _shad.base_score = signal_score; _shad.final_score = signal_score; _shad.score_floor = needed; _shad.floor_reason = "counter_trend" if against_trend else "with_trend"; _shad.h4_aligned = (getattr(self._strategy, "_last_h4_bias", 0) == desired)
-                    if signal_score < needed:
-                        logger.info("[%s] LOW CONVICTION skip: %s score=%d < %d (%s)",
-                                    self.name, "BUY" if desired == 1 else "SELL",
-                                    signal_score, needed,
-                                    "counter-trend" if against_trend else "with-trend")
-                        _shad.gates["score_floor"] = {"blocked": True, "score": signal_score, "needed": needed}; _shad.blocking_gate = "score_floor"; _shadow_logger.record(_shad)
+
+                    # ── Market Reader — narrative gate (replaces score floor) ──────────
+                    # All signals synthesized into a market narrative. trade_bias IS the
+                    # gate. Score now drives position sizing only, not entry.
+                    try:
+                        _mr_atr = float(getattr(self._strategy, "_atr_cache", pd.Series()).iloc[-1])
+                        if math.isnan(_mr_atr): _mr_atr = 0.0
+                    except Exception:
+                        _mr_atr = 0.0
+                    _narrative = read_market(
+                        symbol=self._symbol, desired=desired,
+                        df_m15=df, df_m5=_df_m5, h4_bias=h4_bias,
+                        atr=_mr_atr, amd_sweep=_amd_sweep,
+                        of_snap=_of_snap, cvd_mod=_cvd_mod,
+                    )
+                    _shad.gates["market_reader"] = {
+                        "bias": _narrative.trade_bias, "vote": _narrative.vote,
+                        "phase": _narrative.phase, "confidence": _narrative.confidence,
+                        "reasons": _narrative.reasons, "blocking": _narrative.blocking,
+                    }
+                    if _narrative.trade_bias == 0:
+                        logger.info(
+                            "[%s] MARKET READER BLOCK: %s vote=%d phase=%s | blocking=%s",
+                            self.name, "BUY" if desired == 1 else "SELL",
+                            _narrative.vote, _narrative.phase, _narrative.blocking,
+                        )
+                        _shad.blocking_gate = "market_reader"
+                        _shadow_logger.record(_shad)
                         continue
+                    logger.info(
+                        "[%s] MARKET READER GO: %s vote=%d phase=%s conf=%.2f | %s",
+                        self.name, "BUY" if desired == 1 else "SELL",
+                        _narrative.vote, _narrative.phase, _narrative.confidence,
+                        _narrative.reasons,
+                    )
                     _shad.gates["score_floor"] = {"blocked": False, "score": signal_score, "needed": needed}
 
                     # ── Weak AMD counter-sweep gate (deferred to here for floor+2 check) ──
