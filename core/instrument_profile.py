@@ -110,7 +110,6 @@ def build_strategy_kwargs(symbol: str) -> dict:
         bias = opt.pop("h4_bias_method", tf_p.pop("h4_bias_method", "ema"))
         stop = opt.pop("atr_stop_buffer", tf_p.pop("atr_stop_buffer", 0.5))
         return dict(
-            min_score=opt.get("min_score", 4),
             min_fvg_atr=opt.get("min_fvg_atr", 0.10),
             rr_target=opt.get("rr_target", 2.5),
             session_start=opt.get("session_start", cfg.get("session_start", 7)),
@@ -122,7 +121,7 @@ def build_strategy_kwargs(symbol: str) -> dict:
     bias = tf_p.pop("h4_bias_method", "ema")
     stop = tf_p.pop("atr_stop_buffer", 0.5)
     return dict(
-        min_score=4, min_fvg_atr=0.10, rr_target=2.5,
+        min_fvg_atr=0.10, rr_target=2.5,
         session_start=cfg.get("session_start", 7),
         session_end=cfg.get("session_end", 21),
         h4_bias_method=bias, atr_stop_buffer=stop,

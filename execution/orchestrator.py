@@ -69,7 +69,7 @@ from execution.level_monitor import LevelMonitor
 from core.amd_detector import AMDDetector, SweepEvent
 from execution.market_context_agent import MarketContextAgent, MarketContext
 from execution.probability_model import ProbabilityModel, TradeConfluences
-from execution.order_flow import analyse_order_flow, order_flow_score_modifier, get_dom_key_levels
+from execution.order_flow import analyse_order_flow, order_flow_score_modifier, get_dom_key_levels, cvd_divergence_score
 from execution import telegram_notify as tg
 from execution.telegram_commands import TelegramCommandHandler
 from backtests.run_multi_instrument import (
@@ -2508,6 +2508,20 @@ class TradingEngine(Component):
                             signal_score += _of_mod
                             _extra_reasons.append(f"OrderFlow {'+' if _of_mod>0 else ''}{_of_mod}: {_of_snap.summary}")
                             logger.info("[%s] OrderFlow modifier %+d | %s", self.name, _of_mod, _of_snap.summary)
+                    except Exception:
+                        pass
+
+                    # CVD divergence: price vs cumulative volume delta over last 6 bars.
+                    # Bullish: price swept down but CVD rising = absorption. +1 long.
+                    # Bearish: price swept up but CVD falling = distribution. +1 short.
+                    try:
+                        _cvd_df = _df_m5 if _df_m5 is not None else None
+                        if _cvd_df is not None:
+                            _cvd_mod = cvd_divergence_score(_cvd_df, desired)
+                            if _cvd_mod > 0:
+                                signal_score += 1
+                                _extra_reasons.append("CVD divergence +1")
+                                logger.info("[%s] CVD divergence confirmed — +1 score → %d", self.name, signal_score)
                     except Exception:
                         pass
 

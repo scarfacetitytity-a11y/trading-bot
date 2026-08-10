@@ -15,6 +15,7 @@ import logging
 from dataclasses import dataclass
 from typing import Optional
 
+import numpy as np
 import pandas as pd
 
 logger = logging.getLogger(__name__)
@@ -187,6 +188,63 @@ def get_dom_key_levels(
     except Exception:
         logger.debug("[DOM] key level scan failed for %s", symbol)
         return []
+
+
+def cvd_divergence_score(df: pd.DataFrame, signal_dir: int, lookback: int = 6) -> int:
+    """
+    Detect CVD divergence over the last `lookback` bars.
+
+    Proxy CVD per bar = body_direction * tick_volume (up close = buy pressure, down = sell).
+    Cumulative delta trend is compared to price trend over the window.
+
+    Bullish divergence (long signal): price making lower lows but CVD rising
+    — institutions absorbing the sweep, not confirming the breakdown.
+
+    Bearish divergence (short signal): price making higher highs but CVD falling
+    — institutions distributing into the pump.
+
+    Returns +1 if divergence aligns with signal_dir, 0 otherwise.
+    MT5 tick_volume is not true bid/ask tape — this is a proxy, not gospel.
+    """
+    try:
+        if df is None or len(df) < lookback + 2:
+            return 0
+
+        recent = df.iloc[-(lookback + 1):]
+        o = recent["open"].astype(float).values
+        c = recent["close"].astype(float).values
+        h = recent["high"].astype(float).values
+        l = recent["low"].astype(float).values
+        vol_col = "tick_volume" if "tick_volume" in recent.columns else "volume"
+        v = recent[vol_col].astype(float).values
+
+        rng = h - l
+        # Bar delta: positive = net buy pressure (close above midpoint), normalized by range
+        bar_delta = np.where(rng > 0, (c - o) / rng * v, 0.0)
+        cvd = np.cumsum(bar_delta)
+
+        # Compare first half vs second half of window for trend direction
+        mid = len(cvd) // 2
+        cvd_trend = cvd[-1] - cvd[mid]       # positive = CVD rising
+        price_trend = c[-1] - c[mid]         # positive = price rising
+
+        # Divergence: price and CVD going opposite directions
+        divergence = (price_trend < 0 and cvd_trend > 0) or (price_trend > 0 and cvd_trend < 0)
+
+        if not divergence:
+            return 0
+
+        # Bullish divergence (price fell, CVD rose) confirms a long signal
+        if signal_dir == 1 and price_trend < 0 and cvd_trend > 0:
+            return 1
+        # Bearish divergence (price rose, CVD fell) confirms a short signal
+        if signal_dir == -1 and price_trend > 0 and cvd_trend < 0:
+            return 1
+
+        return 0
+
+    except Exception:
+        return 0
 
 
 def order_flow_score_modifier(snap: Optional[OrderFlowSnapshot], signal_dir: int) -> int:
