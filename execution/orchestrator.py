@@ -2699,11 +2699,24 @@ class TradingEngine(Component):
                         if math.isnan(_mr_atr): _mr_atr = 0.0
                     except Exception:
                         _mr_atr = 0.0
+                    # Weekly mid for premium/discount filter — compute from M15 bars
+                    _w1_mid_mr = float("nan")
+                    try:
+                        if df is not None and isinstance(df.index, pd.DatetimeIndex):
+                            _w1_wk = df.resample("W-MON").agg({"high": "max", "low": "min"})
+                            if len(_w1_wk) >= 1:
+                                _wh = float(_w1_wk["high"].iloc[-1])
+                                _wl = float(_w1_wk["low"].iloc[-1])
+                                if not (math.isnan(_wh) or math.isnan(_wl)):
+                                    _w1_mid_mr = (_wh + _wl) / 2.0
+                    except Exception:
+                        pass
                     _narrative = read_market(
                         symbol=self._symbol, desired=desired,
                         df_m15=df, df_m5=_df_m5, h4_bias=h4_bias,
                         atr=_mr_atr, amd_sweep=_amd_sweep,
                         of_snap=_of_snap, cvd_mod=_cvd_mod,
+                        w1_mid=_w1_mid_mr,
                     )
                     _shad.gates["market_reader"] = {
                         "bias": _narrative.trade_bias, "vote": _narrative.vote,
