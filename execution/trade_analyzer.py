@@ -69,10 +69,12 @@ class TradePlan:
     trade_type:  str                   # continuation | sweep_reversal | breakout | range
     grade:       str                   # A | B | C
     size_mult:   float                 # multiply base risk by this
-    target_src:  str                   # equal_highs | equal_lows | swing | atr_fallback
+    target_src:  str                   # equal_highs | equal_lows | swing_high | swing_low | fvg_ce | atr_fallback
     stop_src:    str                   # sweep | swing_low/high | order_block | atr_fallback
     thesis:      str                   # human-readable WHY
     n_touches:   int = 0               # liquidity-pool touch count (higher = stronger draw)
+    ote_aligned: bool = False          # price is in the ICT 62-79% Fibonacci OTE zone
+    breaker_block: bool = False        # entry is at a breached-OB breaker block zone
     # Gap 12 — T1 at first structural obstacle between entry and main target.
     # JP mentor: "when it hits a level, it's going to react — go risk-free there."
     # BE is triggered at t1_price rather than at a fixed R multiple.
@@ -118,11 +120,7 @@ def _find_target(
     if not cands:
         return None, "none", 0
 
-    # Only equal-level clusters count as targets — resting orders at tested levels.
-    # A single-touch swing (lone high/low) is NOT a liquidity target; it's arbitrary
-    # structure that price has no reason to seek. Returning it as a target produces
-    # the "weekly low" problem: bot latches onto the deepest swing in the window and
-    # treats it as an intraday draw.
+    # Primary: equal-level cluster (2+ touches) — resting order pool, strongest draw.
     best_level, best_touches, best_dist = None, 0, float("inf")
     for lvl in cands:
         touches = sum(1 for v in cands if abs(v - lvl) <= tol)
@@ -130,11 +128,15 @@ def _find_target(
         if touches >= 2 and (touches > best_touches or (touches == best_touches and dist < best_dist)):
             best_level, best_touches, best_dist = lvl, touches, dist
 
-    if best_level is None:
-        return None, "none", 0
+    if best_level is not None:
+        src = "equal_highs" if direction == 1 else "equal_lows"
+        return float(best_level), src, int(best_touches)
 
-    src = "equal_highs" if direction == 1 else "equal_lows"
-    return float(best_level), src, int(best_touches)
+    # Secondary: nearest single swing within reach (PDH/PDL-tier structure).
+    # Single-touch significant swing: valid IPDA target, just lower conviction than a cluster.
+    nearest = min(cands, key=lambda x: abs(x - entry))
+    src = "swing_high" if direction == 1 else "swing_low"
+    return float(nearest), src, 1
 
 
 def _find_t1(
@@ -292,18 +294,80 @@ def _find_fvg_target(
     best = None
     for i in range(2, len(df)):
         if direction == 1:
-            if h[i - 2] < l[i]:                          # bullish gap
-                edge = l[i]                              # near edge of the gap
-                if edge > entry + atr * MIN_BEYOND_ATR:
-                    if best is None or edge < best:      # nearest above
-                        best = edge
+            if h[i - 2] < l[i]:                              # bullish FVG
+                ce = (h[i - 2] + l[i]) / 2                  # CE — 50% of gap
+                if ce > entry + atr * MIN_BEYOND_ATR:
+                    if best is None or ce < best:             # nearest above
+                        best = ce
         else:
-            if l[i - 2] > h[i]:                          # bearish gap
-                edge = h[i]
-                if edge < entry - atr * MIN_BEYOND_ATR:
-                    if best is None or edge > best:      # nearest below
-                        best = edge
+            if l[i - 2] > h[i]:                              # bearish FVG
+                ce = (l[i - 2] + h[i]) / 2                  # CE — 50% of gap
+                if ce < entry - atr * MIN_BEYOND_ATR:
+                    if best is None or ce > best:             # nearest below
+                        best = ce
     return float(best) if best is not None else None
+
+
+def _ote_check(
+    df: pd.DataFrame, direction: int, entry: float, atr: float, lookback: int = 30,
+) -> bool:
+    """True if entry sits in the ICT 62-79% Fibonacci OTE retracement zone of the
+    most recent significant swing. Institutional re-entry zone after a BOS impulse."""
+    if df is None or len(df) < lookback + 2 or atr <= 0:
+        return False
+    window = df.iloc[-(lookback + 1):-1]
+    if direction == 1:
+        A = float(window["low"].min())
+        B = float(window["high"].max())
+        if B - A < atr * 0.5:
+            return False
+        ote_hi = B - (B - A) * 0.62
+        ote_lo = B - (B - A) * 0.79
+    else:
+        A = float(window["high"].max())
+        B = float(window["low"].min())
+        if A - B < atr * 0.5:
+            return False
+        ote_lo = B + (A - B) * 0.62
+        ote_hi = B + (A - B) * 0.79
+    return ote_lo <= entry <= ote_hi
+
+
+def _breaker_block_check(
+    df: pd.DataFrame, direction: int, entry: float, atr: float, lookback: int = 40,
+) -> bool:
+    """True if a breached OB is being retested at the entry price from the other side.
+
+    Bullish breaker: a prior bearish candle whose high was later closed above by a BOS
+    candle, and price is now retesting its body zone from above.
+    Bearish breaker: a prior bullish candle whose low was later closed below, now retested from below.
+    """
+    if df is None or len(df) < lookback + 2 or atr <= 0:
+        return False
+    window = df.iloc[-(lookback + 1):-1]
+    o = window["open"].values
+    c = window["close"].values
+    h = window["high"].values
+    l = window["low"].values
+    tol = atr * 0.1
+
+    n = len(o)
+    if direction == 1:
+        for i in range(n - 4):
+            if c[i] < o[i]:  # bearish candle — potential breaker
+                ob_hi = h[i]; ob_lo = l[i]
+                # Check if a later BOS closed above this candle's high
+                bos = any(c[j] > ob_hi for j in range(i + 1, n))
+                if bos and ob_lo - tol <= entry <= ob_hi + tol:
+                    return True
+    else:
+        for i in range(n - 4):
+            if c[i] > o[i]:  # bullish candle — potential breaker
+                ob_hi = h[i]; ob_lo = l[i]
+                bos = any(c[j] < ob_lo for j in range(i + 1, n))
+                if bos and ob_lo - tol <= entry <= ob_hi + tol:
+                    return True
+    return False
 
 
 def analyze_entry(
@@ -377,7 +441,7 @@ def analyze_entry(
         fvg_rr = abs(fvg - entry) / dist
         pool_ok = tgt is not None and (abs(tgt - entry) / dist) >= MIN_RR_TRADEABLE
         if not pool_ok and fvg_rr >= MIN_RR_TRADEABLE:
-            tgt, src, touches = fvg, "fvg_fill", 0
+            tgt, src, touches = fvg, "fvg_ce", 0
 
     rr = abs(tgt - entry) / dist if tgt is not None else 0.0
 
@@ -400,6 +464,8 @@ def analyze_entry(
             trade_type=trade_type, grade="C", size_mult=0.25,
             target_src="atr_fallback", stop_src=stop_src,
             thesis=thesis, n_touches=touches,
+            ote_aligned=_ote_check(df_m15, direction, entry, atr),
+            breaker_block=_breaker_block_check(df_m15, direction, entry, atr),
         )
 
     # Real target found. Grade on draw strength + RR + HTF alignment + stop quality.
@@ -424,10 +490,14 @@ def analyze_entry(
     if t1_px is None:
         t1_px, t1_src = _find_t1(df_m15, direction, entry, tgt, atr)
 
+    ote = _ote_check(df_m15, direction, entry, atr)
+    bb  = _breaker_block_check(df_m15, direction, entry, atr)
+
     return TradePlan(
         tradeable=(grade != "C"), tp=round(tgt, 6), stop=round(s_stop, 6),
         rr=round(rr, 2), trade_type=trade_type, grade=grade, size_mult=size_mult,
         target_src=src, stop_src=stop_src, thesis=thesis, n_touches=touches,
+        ote_aligned=ote, breaker_block=bb,
         t1_price=round(t1_px, 6) if t1_px is not None else None, t1_src=t1_src,
     )
 

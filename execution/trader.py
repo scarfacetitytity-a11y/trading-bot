@@ -19,6 +19,11 @@ logger = logging.getLogger(__name__)
 # Filled once at startup from config
 _MAGIC: int = 234001
 
+# Tracks consecutive INVALID_STOPS (10016) failures per ticket — cleared on success.
+# After 3 failures the ticket is skipped to avoid hammering the broker.
+_modify_fail_counts: dict[int, int] = {}
+_MODIFY_FAIL_MAX = 3
+
 
 def set_magic(magic: int) -> None:
     global _MAGIC
@@ -256,14 +261,20 @@ def modify_sl_tp(
     if new_sl is not None:
         tick     = mt5.symbol_info_tick(symbol)
         stop_pts = getattr(info, "trade_stops_level", 0) or 0
-        min_dist = stop_pts * (getattr(info, "point", 0.00001) or 0.00001)
-        if tick is not None and min_dist > 0:
-            sl_above = new_sl > tick.bid
-            dist = (new_sl - tick.ask) if sl_above else (tick.bid - new_sl)
-            if dist < min_dist:
-                logger.debug("modify_sl_tp: SL %.5f within stop_level %.5f of price — skip",
-                             new_sl, min_dist)
-                return False
+        point    = getattr(info, "point", 0.00001) or 0.00001
+        min_dist = stop_pts * point
+        if tick is not None:
+            # Fallback: some brokers report stops_level=0 but still enforce a
+            # minimum distance based on spread. Use spread when stops_level is 0.
+            if min_dist <= 0:
+                min_dist = max(tick.ask - tick.bid, 0.0)
+            if min_dist > 0:
+                sl_above = new_sl > tick.bid
+                dist = (new_sl - tick.ask) if sl_above else (tick.bid - new_sl)
+                if dist < min_dist:
+                    logger.debug("modify_sl_tp: SL %.5f within stop_level %.5f of price — skip",
+                                 new_sl, min_dist)
+                    return False
 
     request: dict = {"action": mt5.TRADE_ACTION_SLTP, "symbol": symbol, "position": ticket}
     if new_sl is not None:
@@ -271,12 +282,28 @@ def modify_sl_tp(
     if new_tp is not None:
         request["tp"] = round(new_tp, info.digits)
 
+    # Skip tickets that have repeatedly failed with invalid stops — broker won't accept them.
+    if _modify_fail_counts.get(ticket, 0) >= _MODIFY_FAIL_MAX:
+        return False
+
+    # Verify position still exists before sending — avoids modifying a closed position.
+    if not mt5.positions_get(ticket=ticket):
+        _modify_fail_counts.pop(ticket, None)
+        return False
+
     result = mt5.order_send(request)
     if result is None or result.retcode != mt5.TRADE_RETCODE_DONE:
         code = result.retcode if result else "None"
+        if code in (10016, 10025, 10031):
+            _modify_fail_counts[ticket] = _modify_fail_counts.get(ticket, 0) + 1
+            if _modify_fail_counts[ticket] >= _MODIFY_FAIL_MAX:
+                logger.warning("modify_sl_tp: ticket=%s suppressed after %d consecutive failures (last retcode=%s)",
+                               ticket, _MODIFY_FAIL_MAX, code)
+                return False
         logger.error("modify_sl_tp FAILED: ticket=%s retcode=%s", ticket, code)
         return False
 
+    _modify_fail_counts.pop(ticket, None)
     logger.info("modify_sl_tp OK: ticket=%s sl=%s tp=%s", ticket, new_sl, new_tp)
     return True
 

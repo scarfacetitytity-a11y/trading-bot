@@ -178,7 +178,7 @@ class MarketContextAgent:
             council.append(
                 f"[C02 Architect] BLOCKED: {direction:+d} entry at {lv_str} "
                 f"({dist_str}) — this level is {_dir_name(best_level.direction)}, "
-                f"not a long entry zone."
+                f"not a {_dir_name(direction)} entry zone."
             )
             council.append(
                 f"[C11 Reality Gap] M15 signal says {_dir_name(direction)} but "

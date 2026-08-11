@@ -22,6 +22,7 @@ from pathlib import Path
 from typing import Optional
 
 from execution.trade_analyzer import analyze_entry, analyze_exit, TradePlan
+from execution.scenario_engine import ScenarioEngine, ScenarioResult
 
 logger = logging.getLogger(__name__)
 
@@ -70,7 +71,7 @@ class TradeTicket:
 # ── Council voices (deterministic per-trade inspectors) ───────────────────────
 
 def _council_review(plan: TradePlan, gates: dict, dd_room_daily: float,
-                    dd_room_total: float) -> list[CouncilVoice]:
+                    dd_room_total: float, score: int = 0) -> list[CouncilVoice]:
     voices: list[CouncilVoice] = []
 
     # #05 Compliance — is there DD room for this trade?
@@ -81,10 +82,13 @@ def _council_review(plan: TradePlan, gates: dict, dd_room_daily: float,
         voices.append(CouncilVoice("05 Compliance", "go",
             f"DD room ok (daily {dd_room_daily:.2f}%, total {dd_room_total:.2f}%)"))
 
-    # #06 App Engineer — grade / size sanity
-    if plan.grade == "C" or not plan.tradeable:
+    # #06 App Engineer — grade / size sanity; score ≥9 overrides grade C
+    if (plan.grade == "C" or not plan.tradeable) and score < 9:
         voices.append(CouncilVoice("06 App", "veto",
             f"grade {plan.grade}, not tradeable — {plan.thesis}"))
+    elif plan.grade == "C" and score >= 9:
+        voices.append(CouncilVoice("06 App", "go",
+            f"score={score} overrides grade C — proceeding at 0.25x"))
     else:
         voices.append(CouncilVoice("06 App", "go",
             f"grade {plan.grade}, size {plan.size_mult}x"))
@@ -95,8 +99,8 @@ def _council_review(plan: TradePlan, gates: dict, dd_room_daily: float,
     else:
         voices.append(CouncilVoice("08 Perf", "note", "entry timing ok"))
 
-    # #11 Reality Gap — does the drawn liquidity actually exist?
-    if plan.target_src == "atr_fallback" or plan.stop_src == "atr_fallback":
+    # #11 Reality Gap — does the drawn liquidity actually exist? score ≥9 overrides ATR fallback
+    if (plan.target_src == "atr_fallback" or plan.stop_src == "atr_fallback") and score < 9:
         voices.append(CouncilVoice("11 Reality Gap", "veto",
             f"no real structure (stop {plan.stop_src}, target {plan.target_src})"))
     else:
@@ -122,6 +126,7 @@ class TradeAgent:
     def __init__(self, persist: bool = True):
         self._persist = persist
         self._open: dict[str, TradeTicket] = {}
+        self._scenario = ScenarioEngine()
 
     def evaluate(
         self,
@@ -139,6 +144,7 @@ class TradeAgent:
         rr_fallback: float = 2.0,
         swept:     bool = False,
         plan:      Optional[TradePlan] = None,
+        score:     int = 0,
     ) -> TradeTicket:
         gates = gates or {}
         if plan is None:
@@ -147,7 +153,18 @@ class TradeAgent:
                 stop=ref_stop, atr=atr, h4_bias=h4_bias, rr_fallback=rr_fallback, swept=swept,
                 symbol=symbol,
             )
-        voices = _council_review(plan, gates, dd_room_daily, dd_room_total)
+        scenario = self._scenario.evaluate(
+            symbol=symbol, direction=direction, df_m15=df_m15, df_m5=df_m5,
+            h4_bias=h4_bias, atr=atr,
+        )
+        # Scenario engine as primary qualifier — no scenario = veto
+        scenario_voice = CouncilVoice(
+            "00 Scenario",
+            "go" if "GO" in scenario.verdict else "veto",
+            f"{scenario.scenario} phase={scenario.phase} conf={scenario.confidence}"
+            + (f" missing={scenario.missing}" if scenario.missing else ""),
+        )
+        voices = [scenario_voice] + _council_review(plan, gates, dd_room_daily, dd_room_total, score=score)
         vetoes = [v for v in voices if v.vote == "veto"]
         # hard gate failures also veto
         gate_fail = [k for k, v in gates.items() if v is False]

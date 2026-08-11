@@ -135,6 +135,10 @@ def entry_gate(result: Optional[RegimeResult], desired: int, trade_type: str) ->
         return False, f"regime=flatline (maxZ={result.max_z:.2f}) — no statistical edge"
 
     if r in _REGIME_RANGING and trade_type == "continuation":
+        # cluster-outlier + low flips = price broke baseline and stayed — that's a trend,
+        # not a range. Only block when it's oscillating in/out of the extreme zone.
+        if r == "cluster-outlier" and result.sign_flip_pct < _OSCIL_FLIP_PCT:
+            return True, ""
         return False, (
             f"regime={r} — ranging context, continuation blocked "
             f"(signFlips={result.sign_flip_pct:.0%})"
