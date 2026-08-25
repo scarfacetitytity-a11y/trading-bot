@@ -28,6 +28,27 @@ def connect(terminal_path: Optional[str] = None) -> bool:
     initialized = mt5.initialize(path=terminal_path) if terminal_path else mt5.initialize()
 
     if not initialized:
+        err = mt5.last_error()
+        # Error -6 = Authorization failed: terminal is open but session expired.
+        # If credentials are available, pass them directly to initialize() to
+        # re-authenticate the expired session before giving up.
+        if err[0] == -6:
+            _login = os.environ.get("MT5_LOGIN")
+            _password = os.environ.get("MT5_PASSWORD", "")
+            _server = os.environ.get("MT5_SERVER", "")
+            if _login:
+                logger.warning(
+                    "MT5 initialize() failed with authorization error — retrying with credentials for account %s",
+                    _login,
+                )
+                kwargs = dict(login=int(_login), password=_password, server=_server)
+                if terminal_path:
+                    kwargs["path"] = terminal_path
+                initialized = mt5.initialize(**kwargs)
+                if initialized:
+                    logger.info("MT5 re-initialized with credentials for account %s", _login)
+
+    if not initialized:
         logger.error("MT5 initialize() failed: %s", mt5.last_error())
         logger.error(
             "Checklist: MT5 terminal installed? Terminal open? "
