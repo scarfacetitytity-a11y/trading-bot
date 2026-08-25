@@ -130,13 +130,15 @@ def detect_phase(
         phase      = Phase.RETRACEMENT
         confidence = 0.65
 
-    elif in_range:
+    elif in_range and h4_bias == 0:
+        # Ranging with no HTF trend context = genuine consolidation, stand aside
         phase      = Phase.CONSOLIDATION
         confidence = 0.60
 
     elif h4_bias != 0:
+        # Ranging within a clear H4 trend = accumulation before next leg → continuation
         phase      = Phase.CONTINUATION
-        confidence = 0.45
+        confidence = 0.45 if not in_range else 0.35  # slight confidence penalty if in range
 
     else:
         phase      = Phase.UNKNOWN

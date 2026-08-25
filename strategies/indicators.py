@@ -51,3 +51,21 @@ def session_vwap(df: pd.DataFrame, vol_col: str = "tick_volume") -> pd.Series:
     pv  = (tp * df[vol_col]).groupby(day).cumsum()
     vv  = df[vol_col].groupby(day).cumsum().replace(0, np.nan)
     return pv / vv
+
+
+def bollinger_bands(
+    close: pd.Series,
+    period: int = 20,
+    std_dev: float = 2.0,
+) -> tuple[pd.Series, pd.Series, pd.Series, pd.Series]:
+    """Bollinger Bands.
+
+    Returns (upper, mid, lower, bandwidth) where bandwidth = (upper - lower) / mid.
+    Bandwidth is normalised so squeeze thresholds are price-independent.
+    """
+    mid       = close.rolling(period).mean()
+    sigma     = close.rolling(period).std()
+    upper     = mid + std_dev * sigma
+    lower     = mid - std_dev * sigma
+    bandwidth = (upper - lower) / mid.replace(0, np.nan)
+    return upper, mid, lower, bandwidth

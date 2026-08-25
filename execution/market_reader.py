@@ -116,7 +116,14 @@ def read_market(
     phase_name = phase_result.phase.value
 
     # Consolidation = institutional range building. Stand aside, no edge.
-    if phase_result.phase == Phase.CONSOLIDATION:
+    # Exception: strong AMD sweep aligned with desired = accumulation → distribution
+    # transition. The sweep IS the manipulation that precedes the real move.
+    _amd_overrides_consol = (
+        amd_sweep is not None
+        and amd_sweep.direction == desired
+        and amd_sweep.strong
+    )
+    if phase_result.phase == Phase.CONSOLIDATION and not _amd_overrides_consol:
         blocking.append("consolidation_phase")
         return MarketNarrative(
             symbol=symbol, trade_bias=0, confidence=0.0,

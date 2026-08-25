@@ -73,7 +73,7 @@ from strategies.base import Strategy
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 # Indicators live in the shared single-source module (strategies/indicators.py).
-from strategies.indicators import atr as _atr, rsi as _rsi   # noqa: E402
+from strategies.indicators import atr as _atr, rsi as _rsi, bollinger_bands as _bb   # noqa: E402
 
 # Per-instrument active session windows (UTC hours, inclusive start exclusive end).
 # Session confluence fires when the bar hour falls inside ANY of the listed ranges.
@@ -232,6 +232,12 @@ class AiDENIndexStrategy(Strategy):
         t1_partial_pct: float    = 0.5,   # fraction to exit at T1 (0.5 = 50%)
         # Time stop — exit if no TP progress after N bars; 0 = disabled
         time_stop_bars: int      = 0,
+        # Bollinger Bands — +1 score when BB confirms premium/discount zone at FVG detection
+        # +1 additional when BB is in squeeze (bandwidth < bb_squeeze_pct of mid)
+        use_bb: bool             = True,
+        bb_period: int           = 20,
+        bb_std: float            = 2.0,
+        bb_squeeze_pct: float    = 0.04,  # bandwidth / mid < 4% = squeeze
     ):
         self.htf_lookback         = htf_lookback
         self.h4_swing_lookback    = h4_swing_lookback
@@ -273,6 +279,10 @@ class AiDENIndexStrategy(Strategy):
         self.t1_r                 = t1_r
         self.t1_partial_pct       = t1_partial_pct
         self.time_stop_bars       = time_stop_bars
+        self.use_bb               = use_bb
+        self.bb_period            = bb_period
+        self.bb_std               = bb_std
+        self.bb_squeeze_pct       = bb_squeeze_pct
         self._last_h4_bias:       int = 0   # updated on each generate_signals call
         # Gap 7 — USDJPY macro H4 bias; set externally by orchestrator before each bar.
         # +1 = USD trending up (JPY weak), -1 = USD trending down, 0 = neutral/unknown.
@@ -323,6 +333,10 @@ class AiDENIndexStrategy(Strategy):
         atr_s = _atr(high, low, close, self.atr_period)
         self._atr_cache = atr_s
         rsi_s = _rsi(close, self.rsi_period) if self.use_rsi else None
+        bb_upper_s, bb_mid_s, bb_lower_s, bb_bw_s = (
+            _bb(close, self.bb_period, self.bb_std) if self.use_bb
+            else (None, None, None, None)
+        )
 
         vol_s    = df["tick_volume"].astype(float) if "tick_volume" in df.columns else None
         vol_mean = vol_s.rolling(20).mean() if vol_s is not None else None
@@ -490,7 +504,8 @@ class AiDENIndexStrategy(Strategy):
         active_fvgs: list[dict] = []
 
         warmup = max(self.atr_period + 3, self.ob_lookback, self.liq_lookback,
-                     self.rsi_period + 2 if self.use_rsi else 0)
+                     self.rsi_period + 2 if self.use_rsi else 0,
+                     self.bb_period if self.use_bb else 0)
 
         for i in range(warmup, len(df)):
             cv       = float(close.iloc[i])
@@ -617,8 +632,19 @@ class AiDENIndexStrategy(Strategy):
                         ob_lo, ob_hi = _find_bullish_ob(open_, close, high, low, i - 2, self.ob_lookback)
                         is_model3 = ob_lo is not None and min(ob_hi, lv) - max(ob_lo, h2) > 0
                         reasons = ["FVG"]
+                        score = 0
                         if ob_lo is not None:
                             reasons.append("OB")
+                            score += 1
+                        if self.use_bb and bb_mid_s is not None:
+                            _bb_mid_i = float(bb_mid_s.iloc[i])
+                            _bb_bw_i  = float(bb_bw_s.iloc[i])
+                            if not np.isnan(_bb_mid_i) and cv < _bb_mid_i:
+                                reasons.append("BB Discount")
+                                score += 1
+                            if not np.isnan(_bb_bw_i) and _bb_bw_i < self.bb_squeeze_pct:
+                                reasons.append("BB Squeeze")
+                                score += 1
                         _in_premium = (not np.isnan(swing_hi) and swing_hi > swing_lo
                                        and cv >= swing_lo + (swing_hi - swing_lo) * self.discount_pct)
                         if not _in_premium and not _w1_in_premium:
@@ -629,7 +655,7 @@ class AiDENIndexStrategy(Strategy):
                                 "fvg_ce":   (h2 + lv) / 2,
                                 "ob_lo":    ob_lo,
                                 "ob_hi":    ob_hi,
-                                "score":    0,
+                                "score":    score,
                                 "reasons":  reasons,
                                 "formed":   i,
                                 "tested":   False,
@@ -647,8 +673,19 @@ class AiDENIndexStrategy(Strategy):
                         ob_lo, ob_hi = _find_bearish_ob(open_, close, high, low, i - 2, self.ob_lookback)
                         is_model3 = ob_lo is not None and min(ob_hi, l2) - max(ob_lo, hv) > 0
                         reasons = ["FVG"]
+                        score = 0
                         if ob_lo is not None:
                             reasons.append("OB")
+                            score += 1
+                        if self.use_bb and bb_mid_s is not None:
+                            _bb_mid_i = float(bb_mid_s.iloc[i])
+                            _bb_bw_i  = float(bb_bw_s.iloc[i])
+                            if not np.isnan(_bb_mid_i) and cv > _bb_mid_i:
+                                reasons.append("BB Premium")
+                                score += 1
+                            if not np.isnan(_bb_bw_i) and _bb_bw_i < self.bb_squeeze_pct:
+                                reasons.append("BB Squeeze")
+                                score += 1
                         _in_discount = (not np.isnan(swing_hi) and swing_hi > swing_lo
                                         and cv <= swing_lo + (swing_hi - swing_lo) * self.discount_pct)
                         if not _in_discount and not _w1_in_discount:
@@ -659,7 +696,7 @@ class AiDENIndexStrategy(Strategy):
                                 "fvg_ce":   (hv + l2) / 2,
                                 "ob_lo":    ob_lo,
                                 "ob_hi":    ob_hi,
-                                "score":    0,
+                                "score":    score,
                                 "reasons":  reasons,
                                 "formed":   i,
                                 "tested":   False,

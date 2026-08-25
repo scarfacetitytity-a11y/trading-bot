@@ -12,7 +12,7 @@ Best config on XAUUSD H1 2015-2025: RSI 35/65, +107.9%, 59.4% WR, 224 trades, Sh
 """
 import numpy as np
 import pandas as pd
-from strategies.indicators import atr as _atr, rsi as _rsi
+from strategies.indicators import atr as _atr, rsi as _rsi, bollinger_bands as _bb
 
 
 from strategies.base import Strategy
@@ -68,10 +68,7 @@ class SniperStrategy(Strategy):
         macd_bull   = raw_bull.rolling(5).max().astype(bool)
         macd_bear   = raw_bear.rolling(5).max().astype(bool)
 
-        bb_mid   = close.rolling(self.bb_period).mean()
-        bb_std_s = close.rolling(self.bb_period).std()
-        bb_upper = bb_mid + self.bb_std * bb_std_s
-        bb_lower = bb_mid - self.bb_std * bb_std_s
+        bb_upper, bb_mid, bb_lower, _ = _bb(close, self.bb_period, self.bb_std)
 
         atr = _atr(high, low, close, self.atr_period)
 
