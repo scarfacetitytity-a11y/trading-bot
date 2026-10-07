@@ -92,12 +92,14 @@ def test_low_wr_halves_size(agent):
     assert "half" in reason.lower() or "0.5" in reason or "30" in reason
 
 
-def test_very_low_wr_halts(agent):
-    # 10 trades, 1 win (10%) — below 20% halt threshold
+def test_very_low_wr_quarter_size(agent):
+    # Spec (risk_agent.py step 8): WR <= wr_halt_threshold scales to 0.25x rather
+    # than halting. Old test asserted a halt. Whether to restore a hard pause is
+    # an open human decision (docs/RISK_INVARIANTS.md, D3).
     _set_state(agent, recent_trades=[-1, -1, -1, -1, -1, -1, -1, -1, -1, 1])
-    can, _, reason = agent.pre_trade_check(10_000)
-    assert not can
-    assert "pause" in reason.lower() or "wr" in reason.lower()
+    can, mult, reason = agent.pre_trade_check(10_000)
+    assert can and mult == 0.25
+    assert "wr" in reason.lower()
 
 
 # ── Consecutive losses → pause ────────────────────────────────────────────────
@@ -110,12 +112,36 @@ def test_consecutive_losses_trigger_pause(agent):
     agent.state.weekly_start_equity = 10_000
     agent.state.consecutive_losses = 0
 
+    # Spec: graduated size reduction (3 losses -> 0.5x), pause at
+    # max_consecutive_losses (7). Size never increases after a loss.
     for _ in range(3):
         agent.record_trade(-1.0, 9_900)
+    can, mult, _ = agent.pre_trade_check(9_900)
+    assert can and mult == 0.5
 
+    for _ in range(4):
+        agent.record_trade(-1.0, 9_900)
     can, _, reason = agent.pre_trade_check(9_900)
     assert not can
     assert "consecutive" in reason.lower() or "paused" in reason.lower()
+
+
+def test_size_never_increases_with_losses(agent):
+    agent.state.peak_equity = agent.state.daily_start_equity = agent.state.weekly_start_equity = 10_000
+    prev = 1.0
+    for _ in range(6):
+        agent.record_trade(-1.0, 9_990)
+        can, mult, _ = agent.pre_trade_check(9_990)
+        assert mult <= prev
+        prev = mult
+
+
+def test_risk_config_clamped_to_invariants():
+    from core.system_invariants import INVARIANTS
+    cfg = RiskConfig(max_daily_loss_pct=0.5, max_concurrent_trades=99, max_account_dd_pct=0.5)
+    assert cfg.max_daily_loss_pct == INVARIANTS.max_daily_loss_pct / 100
+    assert cfg.max_concurrent_trades == INVARIANTS.max_concurrent_trades
+    assert cfg.max_account_dd_pct == INVARIANTS.max_total_kill_pct / 100
 
 
 def test_pause_expires(agent):
