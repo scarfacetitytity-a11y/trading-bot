@@ -7,11 +7,25 @@ an always-on compliance daemon.
 
 **Demo accounts only.** `trading.allow_real_account: false` is a hard invariant.
 
+**Human approval is mandatory by default.** `execution_mode: live` (default) means
+every order needs a Telegram APPROVE and fails closed. See
+[`docs/RISK_INVARIANTS.md`](docs/RISK_INVARIANTS.md),
+[`docs/SELF_UPGRADE.md`](docs/SELF_UPGRADE.md),
+[`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
+
+Canonical knowledge/policy lives in the private `os` repo; this repo enforces it.
+
 ## Architecture
 
 ```
 trading-bot/
+├── core/
+│   ├── system_invariants.py     # PROTECTED: immutable risk/approval envelope
+│   ├── self_upgrade.py          # PROTECTED: proposal lifecycle + evidence bar
+│   ├── paths.py                 # portable machine paths (AIDEN_* env vars)
+│   └── ...                      # v3 stack (analyzer_engine, probability_stack)
 ├── execution/
+│   ├── upgrade_gate.py          # PROTECTED: what may reach live execution
 │   ├── orchestrator.py          # main daemon: per-symbol engines, RiskGuard, reconciler
 │   ├── probability_model.py     # Bayesian P(win) + quarter-Kelly sizing, live-updated lifts
 │   ├── market_context_agent.py  # HTF level intelligence: blocks entries fighting key levels
@@ -26,6 +40,7 @@ trading-bot/
 │   └── news_gate.py             # macro event windows
 ├── strategies/                  # AiDEN Index v2 (FVG+OB confluence scoring)
 ├── backtests/                   # engine + multi-instrument runners
+├── research/                    # autoresearch + upgrade_loop.py, upgrades/ ledger
 ├── tests/                       # pytest suite (gates, tracker, risk, portfolio)
 ├── config/config.example.yaml   # template — copy to config.yaml (gitignored)
 └── scripts/                     # setup, VPS bootstrap, watchdog, utilities
@@ -37,7 +52,8 @@ Every entry passes ~14 sequential gates: council halt flag → DD circuit breake
 → FTMO limits → market-context block → continuation gates → Bayesian EV gate →
 portfolio risk cap → min-stop floor (0.75 ATR) → no naked orders → burned-target
 guard (90 min) → duplicate guard → liquidity thesis (NO-DRAW) → per-trade agent
-verdict → optional Telegram approval. Sizing is quarter-Kelly from P(win),
+verdict → system invariants (emergency halt, hard stop, R:R ≥ 1.5, risk ceiling)
+→ human approval (mandatory in live mode). Sizing is quarter-Kelly from P(win),
 scaled by context lift and concentration, bounded by a 4% portfolio cap.
 
 ## Cadre agent loops (autonomous)
@@ -45,8 +61,8 @@ scaled by context lift and concentration, bounded by a 4% portfolio cap.
 | Agent | Cadence | Output |
 |-------|---------|--------|
 | Scout | 30 min | `logs/cadre_regime_state.json` → DXY/regime alignment into entry confluences |
-| Quant | 2 h + every trade close | `logs/quant_lift_proposals.json` → Bayesian lift corrections |
-| Builder | hourly error scan | targeted code fixes on new ERROR/CRITICAL log entries |
+| Quant | 2 h + every trade close | `logs/quant_lift_proposals.json` → lift corrections, applied only via the upgrade gate (n ≥ 30) |
+| Builder | hourly error scan | targeted code fixes; may not touch protected safety files |
 | Sage | Mon 07:00 UTC | weekly strategy/regime review |
 
 ## Running
@@ -78,5 +94,6 @@ python -m backtests.run_multi_instrument           # FTMO multi-engine simulatio
 - `ftmo_tracker_state.json` — challenge progress; `day_start_equity` anchors daily DD
 - `prob_model_state.json` — live Bayesian lift table
 - `burned_targets.json` — 90-min re-entry blocks per direction+target
-- `council_halt.flag` — external halt; orchestrator refuses new entries while present
+- `council_halt.flag` — daily external halt; orchestrator refuses new entries while present
+- `emergency_halt.flag` — persistent human-only halt (`python -m execution.upgrade_gate --halt/--clear-halt`)
 - `trades.jsonl` — full trade journal with thesis validation and lessons
