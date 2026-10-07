@@ -35,7 +35,8 @@ def _get_vault() -> Path:
             return Path(vp)
     except Exception:
         pass
-    return Path(r"C:\Users\anton\OneDrive\Desktop\Aiden")
+    from core.paths import vault_root
+    return vault_root()
 
 
 VAULT = _get_vault()

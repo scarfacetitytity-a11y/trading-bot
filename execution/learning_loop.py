@@ -601,7 +601,11 @@ def auto_apply(result: dict) -> list[str]:
       — ProbabilityModel reads this file on next estimate() call and blends
       updates with smoothing (n/20 blend weight, so 3 obs = 15% influence).
 
-    Tier 2 (n >= 30, HIGH confidence): structural config changes applied now.
+    Tier 1 proposals only reach the live model through the upgrade gate
+      (execution/upgrade_gate.gate_lift_proposals: n >= 30, bounded).
+
+    Tier 2 (n >= 30, HIGH confidence): structural changes are recorded as
+      self-upgrade proposals (core/self_upgrade.py) — never applied directly.
       Devil's Advocate (#12) veto blocks all tier-2 until 30 trades.
 
     Returns list of human-readable applied-change strings for Telegram/report.
@@ -630,25 +634,29 @@ def auto_apply(result: dict) -> list[str]:
         applied.append(f"Tier-2 structural changes deferred: Devil's Advocate veto (n={n}, need 30)")
         return applied
 
-    # Each structural fix: check current value vs evidence, apply + log
+    # Structural fixes become self-upgrade proposals. This function used to
+    # regex-rewrite execution/trade_analyzer.py in place, contradicting the
+    # HARD RULE above; now evidence is recorded and a human promotes it.
     for obs in result["proposals"]:
         if obs["confidence"] != "high":
             continue
         title = obs["title"].lower()
-
-        # MAX_REACH_ATR reduction — 0% liquidity target hit rate
         if "liquidity target" in title or "max_reach_atr" in title:
-            ta_file = Path(__file__).parent / "trade_analyzer.py"
             try:
-                src = ta_file.read_text(encoding="utf-8")
-                import re
-                m = re.search(r"MAX_REACH_ATR\s*=\s*([\d.]+)", src)
-                if m and float(m.group(1)) > 5.0:
-                    new_src = re.sub(r"(MAX_REACH_ATR\s*=\s*)[\d.]+", r"\g<1>5.0", src)
-                    ta_file.write_text(new_src, encoding="utf-8")
-                    applied.append(f"MAX_REACH_ATR reduced to 5.0 (was {m.group(1)}) — 0% hit rate")
+                from execution.upgrade_gate import record_structural_proposal
+                prop = record_structural_proposal(
+                    title="Reduce MAX_REACH_ATR in trade_analyzer",
+                    observation=obs.get("evidence", obs["title"]),
+                    problem=obs["title"],
+                    hypothesis="Closer liquidity targets will be hit more often without "
+                               "reducing expectancy",
+                    changes={"MAX_REACH_ATR": (None, 5.0)},
+                    kind="strategy",
+                )
+                applied.append(f"Upgrade proposal {prop.id} recorded ({prop.stage}) — MAX_REACH_ATR; "
+                               "needs backtest + review before it can change live code")
             except Exception as exc:
-                applied.append(f"MAX_REACH_ATR update failed: {exc}")
+                applied.append(f"MAX_REACH_ATR proposal failed: {exc}")
 
     return applied
 

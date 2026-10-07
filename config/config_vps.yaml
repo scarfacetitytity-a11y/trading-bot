@@ -70,19 +70,20 @@ trading:
   soft_dd_halt_pct: 9.0
   total_kill_pct:   9.5
 
-  bank_tp_r: 2.5
-  prevent_weekend_entries: false
+  # Weekly DD for RiskAgent. Previously RiskAgent was fed soft_dd_halt_pct (9%).
+  weekly_dd_halt_pct: 7.0
 
-  dd_score_boost: 2
-  dd_score_boost_threshold: 1.5
-  min_stop_atr_mult: 0.5
-  min_stop_pct: 0.05
-  max_notional_x: 30
+  # Human approval (core/system_invariants.approval_policy). Default when unset:
+  # "live" = every order needs Telegram APPROVE; no Telegram / timeout = VETO.
+  # To let the FTMO demo trade autonomously you must opt in explicitly:
+  #   execution_mode: demo_autonomous
+  # Ignored on a real account.
+  execution_mode: live
 
 v3_cutover:
   live:
     - XAUUSD
-  go_no_go_min_samples: 0
+  go_no_go_min_samples: 50   # invariant floor; 0 bypassed cutover validation
   born_threshold: 35.0
   entry_thresholds:
     sniper:    62

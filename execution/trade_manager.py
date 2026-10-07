@@ -262,9 +262,41 @@ class TradeManager:
             reasons.append(f"portfolio_gate(pnl={portfolio_pnl_r:.1f}R pos={cur_r:.1f}R):noted")
 
         reason_str = " | ".join(reasons) if reasons else "no_signals"
-        return self._select_action(
+        action = self._select_action(
             position, df_m5, df_m15, atr_m5, c, co, sweep_risk, reason_str
         )
+        return self._apply_profit_lock_floor(position, action)
+
+    @staticmethod
+    def _profit_lock_r(peak_r: float) -> Optional[float]:
+        if peak_r >= 2.0:
+            return 1.0
+        if peak_r >= 1.2:
+            return 0.5
+        if peak_r >= 0.6:
+            return 0.05
+        return None
+
+    def _apply_profit_lock_floor(self, position: PositionState, action: TradeAction) -> TradeAction:
+        # TIGHTEN_SL / EXTEND_TP / HOLD_RUNNER branches return before the ladder
+        # in _select_action, so a structural SL below the lock level used to win
+        # (a 0.9R trade got SL 99.75 instead of BE+0.05R). The floor is enforced
+        # here so no SL-moving branch can place a stop worse than the lock.
+        if action.new_sl is None or position.risk_dist <= 0:
+            return action
+        lock_r = self._profit_lock_r(max(position.peak_r, position.current_r))
+        if lock_r is None:
+            return action
+        d = position.direction
+        lock_px = position.entry_price + d * lock_r * position.risk_dist
+        worse = (d == 1 and action.new_sl < lock_px) or (d == -1 and action.new_sl > lock_px)
+        # A stop on the wrong side of price is rejected by the broker; leave the
+        # action unchanged rather than send an invalid modify.
+        valid = (d == 1 and lock_px < position.current_price) or (d == -1 and lock_px > position.current_price)
+        if worse and valid:
+            action.new_sl = lock_px
+            action.reason = f"{action.reason} | PROFIT_LOCK_FLOOR +{lock_r:.2f}R"
+        return action
 
     # ── Action selection ──────────────────────────────────────────────────────
 

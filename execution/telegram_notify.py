@@ -554,15 +554,22 @@ def request_approval(
     council_notes: str = "",
     timeout_sec: int   = 90,
     auto_approve_score: int = 6,
+    fail_closed: bool = True,
+    allow_auto_approve: bool = False,
 ) -> bool:
     """Send trade proposal with APPROVE/VETO buttons. Returns True = go ahead.
 
-    If no Telegram configured, always returns True (non-blocking).
-    On timeout: auto-approves if score >= auto_approve_score, else auto-vetoes.
+    fail_closed (live default): no Telegram, a failed send or a timeout is a VETO.
+    Only demo_autonomous mode passes fail_closed=False / allow_auto_approve=True,
+    which restores the old behaviour (no Telegram = approve; timeout approves
+    when score >= auto_approve_score).
     """
     global _last_update_id
 
     if not _TOKEN or not _CHAT_ID:
+        if fail_closed:
+            logger.critical("[Telegram] approval required but Telegram not configured — VETO %s", symbol)
+            return False
         return True
 
     dir_str  = "LONG 📈" if direction == 1 else "SHORT 📉"
@@ -573,7 +580,7 @@ def request_approval(
         dist_tp = abs(tp - entry)
         rr_str  = f"1:{dist_tp/dist_sl:.1f}" if dist_sl > 0 else "—"
 
-    auto_action = "AUTO-APPROVE" if score >= auto_approve_score else "AUTO-VETO"
+    auto_action = "AUTO-APPROVE" if (allow_auto_approve and score >= auto_approve_score) else "AUTO-VETO"
     base_text = (
         f"{dir_icon} <b>TRADE SIGNAL — {symbol}</b>\n\n"
         f"<b>Direction:</b>  {dir_str}\n"
@@ -595,6 +602,9 @@ def request_approval(
     ]]})
 
     msg_id = _send_with_keyboard(base_text, reply_markup)
+    if msg_id is None and fail_closed:
+        logger.critical("[Telegram] approval request could not be sent — VETO %s", symbol)
+        return False
 
     deadline = time.time() + timeout_sec
     while time.time() < deadline:
@@ -615,7 +625,7 @@ def request_approval(
                 logger.info("[Telegram] Trade %s %s by user", symbol, result_str)
                 return approved
 
-    auto  = score >= auto_approve_score
+    auto  = allow_auto_approve and score >= auto_approve_score
     label = "✅ AUTO-APPROVED (timeout)" if auto else "❌ AUTO-VETOED (timeout)"
     _edit_message(msg_id, base_text + f"\n\n<b>{label}</b>")
     logger.info("[Telegram] Trade %s %s", symbol, label)

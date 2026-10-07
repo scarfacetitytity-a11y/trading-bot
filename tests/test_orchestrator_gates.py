@@ -271,10 +271,17 @@ class TestRiskGuardTiers:
             kill_switch.set()
 
     def test_daily_loss_triggers_soft_halt(self):
+        # Daily hard halt moved 2.0% -> 4.0% (tiered score floors below it);
+        # this test still asserted the old 2% flat block.
         guard, kill_switch, soft_halt = self._guard()
-        self._run_once(guard, 9_790)       # -2.1% daily
+        self._run_once(guard, 9_590)       # -4.1% daily
         assert soft_halt.is_set()
         assert not kill_switch.is_set()
+
+    def test_daily_loss_below_hard_halt_does_not_halt(self):
+        guard, kill_switch, soft_halt = self._guard()
+        self._run_once(guard, 9_790)       # -2.1% daily — tier-2 score floor, not a halt
+        assert not soft_halt.is_set()
 
     def test_cumulative_7pct_triggers_soft_halt(self):
         guard, kill_switch, soft_halt = self._guard()
@@ -693,14 +700,21 @@ class TestProbabilityModel:
     def test_quant_proposal_applied_within_bounds(self, tmp_path):
         import json as _json
         (tmp_path / "quant_lift_proposals.json").write_text(
-            _json.dumps({"confluences": {"fvg_present": 1.40}}))
+            _json.dumps({"confluences": {"fvg_present": 1.40}, "n_trades": 40}))
         m = self._model(tmp_path)
         assert m._lifts["fvg_present"]["lift"] == pytest.approx(1.40)
+
+    def test_quant_proposal_small_sample_not_applied(self, tmp_path):
+        import json as _json
+        (tmp_path / "quant_lift_proposals.json").write_text(
+            _json.dumps({"confluences": {"fvg_present": 1.40}, "n_trades": 20}))
+        m = self._model(tmp_path)
+        assert m._lifts["fvg_present"]["lift"] == pytest.approx(1.30)
 
     def test_quant_proposal_out_of_bounds_rejected(self, tmp_path):
         import json as _json
         (tmp_path / "quant_lift_proposals.json").write_text(
-            _json.dumps({"confluences": {"fvg_present": 9.9}}))   # typo guard
+            _json.dumps({"confluences": {"fvg_present": 9.9}, "n_trades": 40}))   # typo guard
         m = self._model(tmp_path)
         assert m._lifts["fvg_present"]["lift"] == pytest.approx(1.30)
 

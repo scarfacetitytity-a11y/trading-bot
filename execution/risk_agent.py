@@ -46,9 +46,10 @@ class RiskConfig:
     wr_scale_threshold: float     = 0.35    # WR below this → half size
     wr_halt_threshold: float      = 0.20    # WR below this → pause
 
-    # Max open trades at once — risk is governed by risk_pct per trade, not a count cap.
-    # Set high so valid setups never get blocked by position count alone.
-    max_concurrent_trades: int    = 20
+    # Max open trades at once. Was 20 ("risk is governed by risk_pct, not a count"),
+    # which was no cap; now bounded by the invariant envelope (8 = 4% portfolio
+    # cap / 0.5% min trade risk, so non-binding for current config).
+    max_concurrent_trades: int    = 8
 
     # Max entries per UTC day across all symbols — JP mentor v7: "I do more when I do less.
     # Decision fatigue kicks in; every trade after the first few is lower quality."
@@ -61,6 +62,18 @@ class RiskConfig:
     # Set to 0.0 to disable (default: disabled until live trading proves the system).
     daily_profit_target_pct: float = 0.0   # % of day-start equity; 0 = feature off
     daily_profit_floor_pct:  float = 0.0   # % of day-start equity to protect
+
+    def __post_init__(self):
+        # Envelope clamp: whatever the caller passes, RiskAgent can never be
+        # configured looser than core/system_invariants.
+        from core.system_invariants import INVARIANTS as I
+        self.max_daily_loss_pct    = min(self.max_daily_loss_pct, I.max_daily_loss_pct / 100)
+        self.max_weekly_dd_pct     = min(self.max_weekly_dd_pct, I.max_weekly_dd_pct / 100)
+        self.max_account_dd_pct    = min(self.max_account_dd_pct, I.max_total_kill_pct / 100)
+        self.max_concurrent_trades = min(self.max_concurrent_trades, I.max_concurrent_trades)
+        self.max_daily_entries     = min(self.max_daily_entries, I.max_daily_entries)
+        self.max_consecutive_losses = min(self.max_consecutive_losses,
+                                          I.max_consecutive_losses_before_pause)
 
 
 @dataclass

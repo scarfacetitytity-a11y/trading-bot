@@ -2,9 +2,12 @@
 from __future__ import annotations
 
 import re
+import sys
 from pathlib import Path
 
-VAULT_TRADES = Path(r"C:\Users\anton\OneDrive\Desktop\Aiden\AiDEN\Trades")
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from core.paths import aiden_dir
+VAULT_TRADES = aiden_dir() / "Trades"
 
 _TABLE = {
     "Symbol":      ("symbol",      str),
