@@ -2,6 +2,28 @@
 
 Adapted from Karpathy's autoresearch. Autonomous parameter optimization for the FTMO challenge.
 
+> **Superseded for promotion decisions (2026-10, aiden-self-upgrade-v1).**
+> Exploration with this loop is still fine, but nothing found here may reach
+> live config except through the controlled upgrade loop:
+>
+> ```
+> python -m research.upgrade_loop propose --title "..." --param SCORE_FLOOR=75 \
+>     --observation "..." --problem "..." --hypothesis "..."
+> python -m research.upgrade_loop run UPG-...
+> python -m research.upgrade_loop review UPG-... --reviewer <human> --approve
+> ```
+>
+> Known flaws of the loop below, fixed there:
+> 1. `backtest_harness.py` only reads BASE_RISK, CAP_CONCURRENT and SCORE_FLOOR.
+>    MIN_RR, MIN_GRADE, EDGE_FILTER, SL_BUFFER_ATR, COUSIN_BLOCK_HOURS and
+>    DAILY_DD_LIMIT are printed but never used, so keep/discard on them was noise.
+>    `upgrade_loop` rejects changes it cannot measure (and does measure DAILY_DD_LIMIT).
+> 2. "Keep if pass rate improved" on one in-sample window is overfitting by design.
+>    `upgrade_loop` requires in-sample + chronological out-of-sample + stress evidence.
+> 3. The loop may raise BASE_RISK / DAILY_DD_LIMIT / CAP_CONCURRENT. Automatic
+>    loosening of any risk parameter is now rejected (core/system_invariants.py).
+> 4. Promotion needs a named human reviewer. See docs/SELF_UPGRADE.md.
+
 ## Setup
 
 To set up a new research run:
