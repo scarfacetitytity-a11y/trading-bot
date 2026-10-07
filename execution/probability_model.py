@@ -302,19 +302,17 @@ class ProbabilityModel:
             if age_secs > 4 * 3600:
                 return   # stale — ignore
             data = json.loads(proposals_file.read_text())
+            # Upgrade gate: minimum sample + 0.5x–2x bounds (was bounds only,
+            # so a 20-trade Quant pass or a 3-trade learning-loop pass went live).
+            from execution.upgrade_gate import gate_lift_proposals
+            accepted, rejected = gate_lift_proposals(
+                data, {k: v["lift"] for k, v in self._lifts.items()})
+            for r in rejected:
+                logger.info("[ProbModel] Lift proposal not applied: %s", r)
             updated = []
-            for key, proposed_lift in data.get("confluences", {}).items():
-                if key not in self._lifts:
-                    continue
-                if not isinstance(proposed_lift, (int, float)):
-                    continue
-                proposed_lift = float(proposed_lift)
-                # Only apply if Quant's proposal is within ±50% of current lift
-                # — prevents typos from crashing the model
-                current = self._lifts[key]["lift"]
-                if 0.5 * current <= proposed_lift <= 2.0 * current:
-                    self._lifts[key]["lift"] = proposed_lift
-                    updated.append(f"{key}={proposed_lift:.3f}")
+            for key, proposed_lift in accepted.items():
+                self._lifts[key]["lift"] = proposed_lift
+                updated.append(f"{key}={proposed_lift:.3f}")
             if updated:
                 logger.info("[ProbModel] Applied Quant lift proposals: %s", ", ".join(updated))
         except Exception as e:

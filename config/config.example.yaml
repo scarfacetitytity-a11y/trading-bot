@@ -9,6 +9,7 @@ mt5:
 obsidian:
   # Path to the Obsidian vault root. Override in config.yaml for your machine.
   # VPS example: "C:/aiden-vault" (set up OneDrive sync there, or use a local path)
+  # Or set AIDEN_VAULT_PATH. Default: legacy Windows path on Windows, ~/aiden-vault elsewhere.
   vault_path: "C:/Users/YOUR_USERNAME/OneDrive/Desktop/Aiden"
 
 data:
@@ -39,9 +40,22 @@ trading:
   # Position sizing
   risk_mode: fixed                 # 'fixed' = use lot_size; 'risk_pct' = size by risk %
   lot_size: 0.01                   # used when risk_mode=fixed
-  risk_pct: 1.0                    # % of balance to risk per trade (risk_mode=risk_pct)
+  risk_pct: 0.5                    # % of balance to risk per trade (risk_mode=risk_pct); ceiling 1.0
   stop_loss_points: 200            # SL distance in points (also used for risk_pct sizing)
   take_profit_points: 0            # 0 = no TP (rely on strategy exit signal)
 
   # Safety: must explicitly set to true to trade a real (non-demo) account
   allow_real_account: false
+
+  # Human approval — see docs/RISK_INVARIANTS.md.
+  # live (default): every order needs Telegram APPROVE; missing Telegram/timeout = VETO.
+  # demo_autonomous: explicit opt-in for unattended demo trading; ignored on real accounts.
+  execution_mode: live
+
+  # Risk limits (percent). Values looser than core/system_invariants.py are
+  # clamped at startup and logged as INVARIANT violations.
+  daily_halt_pct: 4.0
+  weekly_dd_halt_pct: 7.0
+  soft_dd_halt_pct: 9.0
+  total_kill_pct: 9.5
+  max_portfolio_risk_pct: 4.0

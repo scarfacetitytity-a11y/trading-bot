@@ -62,6 +62,7 @@ from strategies.london_breakout import LondonBreakoutStrategy
 from strategies.fvg_ob import FVGOrderBlockStrategy
 from strategies.aiden_index import AiDENIndexStrategy
 from execution.risk_agent import RiskAgent, RiskConfig
+from core.system_invariants import INVARIANTS, approval_policy, check_pre_order
 from execution.ftmo_tracker import FTMOTracker
 from execution.trade_journal import TradeJournal
 from execution.portfolio_manager import PortfolioAllocator, PortfolioBook, OpenPos, Trim
@@ -3199,11 +3200,25 @@ class TradingEngine(Component):
                     except Exception as _cr_exc:
                         logger.debug("[%s] CouncilRouter error (non-blocking): %s", self.name, _cr_exc)
 
-                    # ── Council gate: Telegram approval before order fires ──
-                    require_approval = self._trade_cfg.get("require_approval", False)
-                    if require_approval and not self._dry_run:
+                    # ── System invariants: last gate before the order ──────────
+                    _tick_inv = mt5.symbol_info_tick(self._symbol)
+                    _entry_inv = (_tick_inv.ask if desired == 1 else _tick_inv.bid) if _tick_inv else entry_px
+                    _inv = check_pre_order(
+                        direction=desired, entry=_entry_inv, sl=sl, tp=tp,
+                        risk_pct=float(self._trade_cfg.get("risk_pct", 1.0)),
+                    )
+                    if not _inv.ok:
+                        logger.critical("[%s] INVARIANT BLOCK: %s", self.name, "; ".join(_inv.reasons))
+                        _shad.gates["invariants"] = {"blocked": True, "reasons": _inv.reasons}; _shad.blocking_gate = "invariants"; _shadow_logger.record(_shad)
+                        continue
+
+                    # ── Human approval before order fires ─────────────────────
+                    # Live mode (the default) is mandatory and fail-closed: no
+                    # Telegram, timeout or error => veto. See core/system_invariants.
+                    _policy = approval_policy(self._trade_cfg, getattr(self, "_is_real_account", True))
+                    if _policy.required and not self._dry_run:
                         tick_now  = mt5.symbol_info_tick(self._symbol)
-                        entry_est = tick_now.ask if desired == 1 else tick_now.bid
+                        entry_est = (tick_now.ask if desired == 1 else tick_now.bid) if tick_now else _entry_inv
                         approved  = tg.request_approval(
                             symbol        = self._symbol,
                             direction     = desired,
@@ -3216,6 +3231,8 @@ class TradingEngine(Component):
                             council_notes = reason,
                             timeout_sec   = self._trade_cfg.get("approval_timeout_sec", 90),
                             auto_approve_score = self._trade_cfg.get("auto_approve_score", 6),
+                            fail_closed        = _policy.fail_closed,
+                            allow_auto_approve = _policy.allow_auto_approve,
                         )
                         if not approved:
                             logger.info("[%s] Trade vetoed via Telegram", self.name)
@@ -3387,6 +3404,19 @@ class Orchestrator:
         self._threads: list   = []
         self._components: list = []
 
+        # Invariant envelope + upgrade gate run before anything reads trade config:
+        # looser-than-envelope values are clamped (not refused — a refused start
+        # would leave open positions unmanaged), and a cutover bypass is closed.
+        from execution.upgrade_gate import startup_check
+        self._gate_report = startup_check(cfg)
+        cfg["trading"]    = self._gate_report.trade_cfg
+        cfg["v3_cutover"] = self._gate_report.v3_cfg
+        for _v in self._gate_report.violations:
+            logger.critical("[INVARIANT] %s", _v)
+        for _n in self._gate_report.notes:
+            logger.warning("[INVARIANT] %s", _n)
+        self._is_real_account = True   # until _safety_check proves otherwise
+
         mt5_cfg   = cfg.get("mt5", {})
         data_cfg  = cfg.get("data", {})
         trade_cfg = cfg.get("trading", {})
@@ -3416,7 +3446,13 @@ class Orchestrator:
             config=RiskConfig(
                 max_account_dd_pct=float(trade_cfg.get("total_kill_pct", 9.5)) / 100,
                 max_daily_loss_pct=float(trade_cfg.get("daily_halt_pct", 2.0)) / 100,
-                max_weekly_dd_pct=float(trade_cfg.get("soft_dd_halt_pct", 9.0)) / 100,
+                # Was soft_dd_halt_pct (9%), which made the weekly check a no-op.
+                max_weekly_dd_pct=float(trade_cfg.get(
+                    "weekly_dd_halt_pct", INVARIANTS.max_weekly_dd_pct)) / 100,
+                max_concurrent_trades=int(trade_cfg.get(
+                    "max_concurrent_trades", INVARIANTS.max_concurrent_trades)),
+                max_daily_entries=int(trade_cfg.get(
+                    "max_daily_entries", INVARIANTS.max_daily_entries)),
                 daily_profit_target_pct=float(trade_cfg.get("daily_profit_target_pct", 0.0)) / 100,
                 daily_profit_floor_pct=float(trade_cfg.get("daily_profit_floor_pct", 0.0)) / 100,
             ),
@@ -3558,6 +3594,7 @@ class Orchestrator:
             engine._mc_agent      = MarketContextAgent(level_monitor)
             engine._cousin_router = cousin_router
             engine._corr_matrix   = self._corr_matrix
+            engine._is_real_account = self._is_real_account
             components.append(engine)
 
             # Phase 3/4: AnalyzerEngine runs alongside every live engine.
@@ -3767,12 +3804,16 @@ class Orchestrator:
             return f"Error reading shadow log: {exc}"
 
     def _tg_set_risk(self, pct: float) -> str:
+        from execution.upgrade_gate import gate_runtime_risk_change
+        pct, _msg = gate_runtime_risk_change(float(self._trade_cfg.get("risk_pct", 0.5)), pct)
+        if _msg.startswith("rejected"):
+            return _msg
         self._trade_cfg["risk_pct"] = pct
         for comp in self._components:
             if hasattr(comp, "_trade_cfg"):
                 comp._trade_cfg["risk_pct"] = pct
-        logger.info("[TgCmd] risk_pct set to %.2f via Telegram", pct)
-        return f"risk_pct={pct:.2f}%"
+        logger.info("[TgCmd] risk_pct set to %.2f via Telegram (%s)", pct, _msg)
+        return _msg
 
     # ── Component runner with auto-restart ───────────────────────────────────
 
@@ -3811,6 +3852,12 @@ class Orchestrator:
         is_demo    = account.trade_mode == mt5.ACCOUNT_TRADE_MODE_DEMO
         allow_real = self.cfg.get("trading", {}).get("allow_real_account", False)
 
+        self._is_real_account = not is_demo
+        for _c in getattr(self, "_components", []):
+            _c._is_real_account = self._is_real_account
+        logger.info("[INVARIANT] execution policy: %s",
+                    approval_policy(self.cfg.get("trading", {}), self._is_real_account))
+
         if not is_demo and not allow_real:
             logger.error(
                 "BLOCKED: real account detected and 'allow_real_account' is not set."
@@ -3846,7 +3893,22 @@ class Orchestrator:
 # ── Entry point ───────────────────────────────────────────────────────────────
 
 def _pid_is_python(pid: int) -> bool:
-    """True if pid is a live python process (Windows tasklist, no deps)."""
+    """True if pid is a live python process (no deps; Windows tasklist, POSIX /proc)."""
+    import os
+    if os.name != "nt":
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            pass   # exists but owned by another user
+        except OSError:
+            return True
+        try:
+            cmd = Path(f"/proc/{pid}/cmdline").read_bytes().lower()
+            return b"python" in cmd
+        except OSError:
+            return True   # can't verify — fail SAFE
     try:
         import subprocess
         out = subprocess.run(
