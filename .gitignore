@@ -41,3 +41,8 @@ research/run.log
 
 # Graph exports (regenerated)
 graphify-out/
+
+# Secrets — never commit. .env.example is the template.
+.env
+.env.*
+!.env.example
