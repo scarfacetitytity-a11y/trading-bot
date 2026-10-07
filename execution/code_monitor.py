@@ -35,7 +35,8 @@ MONITOR_PID = LOG_DIR / "code_monitor.pid"
 STATE_FILE  = LOG_DIR / "code_monitor_state.json"
 ENV_FILE    = ROOT / ".env"
 
-OBSIDIAN    = Path(r"C:\Users\anton\OneDrive\Desktop\Aiden\AiDEN")
+from core.paths import aiden_dir as _aiden_dir
+OBSIDIAN    = _aiden_dir()
 OBS_BRAIN   = OBSIDIAN / "Brain"
 OBS_SESSIONS= OBSIDIAN / "Sessions"
 

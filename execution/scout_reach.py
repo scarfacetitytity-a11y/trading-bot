@@ -30,7 +30,8 @@ ROOT      = Path(__file__).parent.parent
 LOG_DIR   = ROOT / "logs"
 PID_FILE  = LOG_DIR / "scout_reach.pid"
 STATE_FILE= LOG_DIR / "scout_reach_state.json"
-VAULT     = Path(r"C:\Users\anton\OneDrive\Desktop\Aiden\AiDEN\Brain\Scout")
+from core.paths import brain_dir as _brain_dir
+VAULT     = _brain_dir() / "Scout"
 ENV_FILE  = ROOT / ".env"
 
 RUN_HOUR  = 6    # UTC hour to generate daily brief

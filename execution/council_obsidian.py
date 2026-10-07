@@ -10,7 +10,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-VAULT_ROOT   = Path(r"C:\Users\anton\OneDrive\Desktop\Aiden")
+from core.paths import vault_root as _vault_root
+
+VAULT_ROOT   = _vault_root()
 BRAIN_DIR    = VAULT_ROOT / "AiDEN" / "Brain"
 SESSIONS_DIR = VAULT_ROOT / "AiDEN" / "Sessions"
 TRADES_DIR   = VAULT_ROOT / "AiDEN" / "Trades"

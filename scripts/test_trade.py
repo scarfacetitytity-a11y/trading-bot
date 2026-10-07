@@ -1,6 +1,6 @@
 """One-shot test trade — places a USDJPY buy, waits 10s, closes it. Verifies MT5 pipeline."""
 import sys, time
-sys.path.insert(0, r"C:\Users\anton\Documents\trading-bot")
+sys.path.insert(0, str(__import__("pathlib").Path(__file__).resolve().parent.parent))
 
 import MetaTrader5 as mt5
 

@@ -21,6 +21,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
+from core.paths import financial_mcp_dir, vault_root
+
 logger = logging.getLogger(__name__)
 
 BRIEF_INSTRUMENTS = [
@@ -48,7 +50,7 @@ def _call_financial_mcp(tool: str, args: dict) -> Optional[dict]:
         result = subprocess.run(
             ["python", "-m", "financial_mcp.client", payload],
             capture_output=True, text=True, timeout=15,
-            cwd=Path(r"C:\Users\anton\Documents\financial-mcp"),
+            cwd=financial_mcp_dir(),
         )
         if result.returncode == 0 and result.stdout.strip():
             return json.loads(result.stdout)
@@ -60,7 +62,7 @@ def _call_financial_mcp(tool: str, args: dict) -> Optional[dict]:
 def _fetch_calendar() -> list[dict]:
     """Get today's high-impact economic events."""
     try:
-        import sys; sys.path.insert(0, r"C:\Users\anton\Documents\financial-mcp")
+        import sys; sys.path.insert(0, str(financial_mcp_dir()))
         from tools import get_economic_calendar
         data = get_economic_calendar()
         if isinstance(data, list):
@@ -75,7 +77,7 @@ def _fetch_calendar() -> list[dict]:
 def _fetch_news() -> list[str]:
     """Get top market-moving headlines."""
     try:
-        import sys; sys.path.insert(0, r"C:\Users\anton\Documents\financial-mcp")
+        import sys; sys.path.insert(0, str(financial_mcp_dir()))
         from tools import get_financial_news
         data = get_financial_news(query="forex gold indices market", limit=5)
         if isinstance(data, list):
@@ -91,7 +93,7 @@ def _fetch_news() -> list[str]:
 def _fetch_dxy_price() -> Optional[float]:
     """Get current DXY level."""
     try:
-        import sys; sys.path.insert(0, r"C:\Users\anton\Documents\financial-mcp")
+        import sys; sys.path.insert(0, str(financial_mcp_dir()))
         from tools import get_forex_price
         data = get_forex_price("DXY")
         if isinstance(data, dict):
@@ -172,9 +174,9 @@ def write_brief_to_vault(vault_path: Optional[Path] = None) -> Path:
             from config.settings import load_config
             cfg = load_config()
             vp = cfg.get("obsidian", {}).get("vault_path")
-            vault_path = Path(vp) if vp else Path(r"C:\Users\anton\OneDrive\Desktop\Aiden")
+            vault_path = Path(vp) if vp else vault_root()
         except Exception:
-            vault_path = Path(r"C:\Users\anton\OneDrive\Desktop\Aiden")
+            vault_path = vault_root()
 
     out = vault_path / "AiDEN" / "System" / "intel_brief.md"
     out.parent.mkdir(parents=True, exist_ok=True)
