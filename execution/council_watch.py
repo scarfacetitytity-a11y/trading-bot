@@ -36,7 +36,8 @@ from typing import Any
 # ── Paths ────────────────────────────────────────────────────────────────────
 _BOT_ROOT   = Path(__file__).resolve().parent.parent
 _LOGS       = _BOT_ROOT / "logs"
-_FIRM_DB    = Path(r"C:\Users\anton\.firm\firm.db")
+from core import paths as _paths
+_FIRM_DB    = _paths.firm_db()
 _EVENTS_LOG = _LOGS / "council_events.jsonl"
 
 # State files written by the bot
@@ -47,10 +48,13 @@ _OPEN_TRADES = _LOGS / "open_trades.json"
 _HALT_FILE   = _LOGS / "council_halt.flag"  # council writes, orchestrator reads
 
 # ── Thresholds ───────────────────────────────────────────────────────────────
-DAILY_DD_WARN_PCT    = 3.5   # warn before RiskGuard fires at 2% (may lag on restart)
-DAILY_DD_HARD_PCT    = 4.5   # hard halt — 0.5% buffer before FTMO's 5%
-TOTAL_DD_WARN_PCT    = 7.0   # warn
-TOTAL_DD_HARD_PCT    = 9.0   # hard halt — 1% buffer before FTMO's 10%
+# Backstop thresholds derive from the invariant envelope so the watchdog can
+# never be looser than the bot it guards (was 4.5% daily vs RiskGuard's 4.0%).
+from core.system_invariants import INVARIANTS as _INV
+DAILY_DD_WARN_PCT    = 3.5                          # warn ahead of the hard halt
+DAILY_DD_HARD_PCT    = _INV.max_daily_loss_pct       # 4.0 — 1% buffer before FTMO's 5%
+TOTAL_DD_WARN_PCT    = 7.0                          # warn
+TOTAL_DD_HARD_PCT    = _INV.max_soft_dd_pct          # 9.0 — 1% buffer before FTMO's 10%
 STATE_STALE_SECS     = 300   # 5 min — RiskGuard beats every 60s; 5 min = bot likely dead
 ZOMBIE_TRADE_HOURS   = 24    # open trade older than this = zombie, flag for review
 POLL_INTERVAL        = 30    # seconds between checks
@@ -63,6 +67,7 @@ for _stream in (sys.stdout, sys.stderr):
     except (AttributeError, ValueError):
         pass
 
+_LOGS.mkdir(parents=True, exist_ok=True)   # FileHandler below fails on a fresh clone otherwise
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)-8s | %(message)s",
@@ -439,12 +444,12 @@ def _ctx_scout() -> str:
         f"Score overall regime: trending_bull / trending_bear / ranging / high_vol.\n\n"
         f"REQUIRED OUTPUT (two parts, both mandatory):\n"
         f"1. Write a JSON file to EXACTLY this path: "
-        f"C:\\Users\\anton\\Documents\\trading-bot\\logs\\cadre_regime_state.json\n"
+        f"{_LOGS / 'cadre_regime_state.json'}\n"
         f"   Format: {{\"regime\": \"ranging\", \"dxy_bias\": 0, \"session\": \"London\", "
         f"\"risk_events\": [], \"narrative\": \"one sentence\", \"ts_utc\": \"ISO timestamp\"}}\n"
         f"   dxy_bias must be +1, -1, or 0. This file is machine-read by the trading bot.\n\n"
         f"2. Write a markdown note to Brain vault: "
-        f"C:\\Users\\anton\\OneDrive\\Desktop\\Aiden\\AiDEN\\Brain\\Intelligence\\regime_{now_str}.md\n"
+        f"{_paths.brain_dir() / 'Intelligence' / f'regime_{now_str}.md'}\n"
         f"   Use MOP frontmatter (type: note, status: active, tags: [regime, scout])."
     )
     return "\n\n".join(parts)
@@ -476,13 +481,13 @@ def _ctx_quant_routine() -> str:
         f"prob_model_state.json, and recommend an adjusted lift where the data justifies it.\n\n"
         f"REQUIRED OUTPUT (two parts, both mandatory):\n"
         f"1. Write a JSON file to EXACTLY this path: "
-        f"C:\\Users\\anton\\Documents\\trading-bot\\logs\\quant_lift_proposals.json\n"
+        f"{_LOGS / 'quant_lift_proposals.json'}\n"
         f"   Format: {{\"confluences\": {{\"fvg_present\": 1.28, \"ob_present\": 1.20, ...}}, "
         f"\"ts\": \"ISO timestamp\", \"n_trades_analysed\": N}}\n"
         f"   Only include keys where observed WR meaningfully differs from current lift. "
         f"This file is machine-read by the trading bot.\n\n"
         f"2. Write a markdown analysis to Brain vault: "
-        f"C:\\Users\\anton\\OneDrive\\Desktop\\Aiden\\AiDEN\\Brain\\Quant\\performance_{now_str}.md\n"
+        f"{_paths.brain_dir() / 'Quant' / f'performance_{now_str}.md'}\n"
         f"   Include: WR table per confluence, lift recommendations, risk findings."
     )
     return "\n\n".join(parts)
@@ -526,7 +531,7 @@ def _ctx_builder_error_scan() -> str:
         f"Recent errors from orchestrator.log:\n" + "\n".join(errors) + "\n\n"
         "Task: Review these errors. For each: identify the root cause, determine if "
         "there is a code fix needed, and if yes — apply the minimal targeted fix to "
-        "C:\\Users\\anton\\Documents\\trading-bot\\. Log what changed to Brain vault "
+        f"{_BOT_ROOT}. Log what changed to Brain vault "
         "as Builder/fix_YYYYMMDD.md."
     )
 
