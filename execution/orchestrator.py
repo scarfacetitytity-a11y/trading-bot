@@ -45,6 +45,7 @@ import pandas as pd
 
 from config.settings import load_config
 from config.logging_setup import setup_logger
+import backtests.mt5_connector as _mt5_mod
 from backtests.mt5_connector import connect, disconnect
 from backtests.data_loader import TIMEFRAME_MAP
 from execution import trader, risk
@@ -2691,6 +2692,32 @@ class TradingEngine(Component):
 
                     _shad.base_score = signal_score; _shad.final_score = signal_score; _shad.score_floor = needed; _shad.floor_reason = "counter_trend" if against_trend else "with_trend"; _shad.h4_aligned = (getattr(self._strategy, "_last_h4_bias", 0) == desired)
 
+                    # ── Consolidation hour gate: 13–15 UTC (post-London ranging) ──────
+                    # Root cause from loss-streak-5: OB + H4 confluence overweights false
+                    # positives in ranging conditions. OB discount (−1 ≈ 0.7× weight) +
+                    # floor raised to 9. Trades scoring 7 in the bad cluster would have
+                    # discounted to 6 and been blocked before entry.
+                    _utc_hour = datetime.now(timezone.utc).hour
+                    if _utc_hour in {13, 14, 15}:
+                        _consol_score = signal_score - 1  # OB weight discount
+                        if _consol_score < 9:
+                            logger.info(
+                                "[%s] CONSOLIDATION GATE: hour=%d score=%d (discounted=%d) < 9 — blocked",
+                                self.name, _utc_hour, signal_score, _consol_score,
+                            )
+                            _shad.gates["consolidation_hour"] = {
+                                "blocked": True, "hour": _utc_hour,
+                                "score_raw": signal_score, "score_discounted": _consol_score,
+                            }
+                            _shad.blocking_gate = "consolidation_hour"
+                            _shadow_logger.record(_shad)
+                            continue
+                        signal_score = _consol_score
+                        logger.info(
+                            "[%s] Consolidation hour %d UTC — OB discount −1 → score %d (≥9, passing)",
+                            self.name, _utc_hour, signal_score,
+                        )
+
                     # ── Market Reader — narrative gate (replaces score floor) ──────────
                     # All signals synthesized into a market narrative. trade_bias IS the
                     # gate. Score now drives position sizing only, not entry.
@@ -3437,6 +3464,15 @@ class Orchestrator:
 
         _mt5_retries = 0
         while not connect(self._terminal_path):
+            # -10003: terminal process could not be created — this requires manual
+            # intervention (open MT5 terminal). Retrying will never fix it.
+            if _mt5_mod._last_connect_error == -10003:
+                logger.critical(
+                    "MT5 terminal process could not be launched (-10003). "
+                    "Open the MT5 terminal manually and then restart the bot."
+                )
+                tg.notify_council_flag("01 Principal", "MT5 terminal NOT open — manual launch required before restart.")
+                sys.exit(1)
             _mt5_retries += 1
             if _mt5_retries >= 10:
                 logger.critical("Cannot connect to MT5 after 10 attempts. Aborting.")
