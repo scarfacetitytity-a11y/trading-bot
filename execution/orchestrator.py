@@ -144,9 +144,9 @@ def _ipda_aligned(df: "pd.DataFrame", direction: int, price: float) -> bool:
         d1 = tmp.resample("1D", closed="left", label="left").agg(
             {"high": "max", "low": "min", "close": "last"}
         ).dropna()
-        if len(d1) < 20:
+        if len(d1) < 3:
             return False
-        recent = d1.tail(20)
+        recent = d1.tail(min(20, len(d1)))
         hi20 = float(recent["high"].max())
         lo20 = float(recent["low"].min())
         rng  = hi20 - lo20
@@ -1505,9 +1505,11 @@ class TradingEngine(Component):
     # +1 DXY bullish (USD strong): EURUSD -1, GBPUSD -1, XAUUSD -1, US30 +1, US100 +1
     _DXY_INSTRUMENT_BIAS: dict[str, int] = {
         "EURUSD": -1, "GBPUSD": -1, "USDJPY": +1, "USDCHF": +1,
+        "AUDUSD": -1, "NZDUSD": -1,
+        "AUDJPY": -1, "NZDJPY": -1, "GBPJPY": -1,  # risk pairs fall in USD-strong/risk-off
         "XAUUSD": -1, "XAGUSD": -1,
         "US30": +1, "US100": +1, "US500": +1, "US2000": +1,
-        "JP225": -1,
+        "JP225": -1, "UK100": -1,
     }
 
     def _scout_regime_aligned(self, symbol: str, direction: int) -> bool:
@@ -1516,8 +1518,8 @@ class TradingEngine(Component):
         dxy_bias = regime.get("dxy_bias", 0)
         if dxy_bias == 0:
             return False
-        # Find the instrument's DXY relationship
-        sym_base = symbol.upper().replace("_SB", "").replace(".", "")
+        # Find the instrument's DXY relationship — strip suffix like ".cash" before lookup
+        sym_base = symbol.upper().split(".")[0].replace("_SB", "")
         instr_dxy_dir = self._DXY_INSTRUMENT_BIAS.get(sym_base, 0)
         if instr_dxy_dir == 0:
             return False
@@ -2048,13 +2050,37 @@ class TradingEngine(Component):
                 _v3_mode = getattr(self, "_v3_mode", False)
 
                 if _v3_mode and _az is not None:
-                    # Phase 4 live: AnalyzerEngine drives the signal
+                    # Pre-compute AMD phase so AnalyzerEngine can read narrative as primary signal.
+                    # This runs BEFORE _az.update() so the phase is available when direction is decided.
+                    _amd_phase_v3 = None
+                    if self._amd_detector is not None and self._level_monitor is not None:
+                        _ls_v3 = self._level_monitor._level_sets.get(self._symbol)
+                        if _ls_v3 is not None:
+                            _atr_v3 = float(
+                                (df["high"] - df["low"]).rolling(14).mean().iloc[-1]
+                            ) if len(df) > 14 else 0.0
+                            try:
+                                _amd_phase_v3 = self._amd_detector.assess_phase(
+                                    self._symbol, df,
+                                    list(_ls_v3.levels) + list(_ls_v3.zones),
+                                    _atr_v3,
+                                )
+                                if _amd_phase_v3.phase.value not in ("unknown", "accumulation"):
+                                    logger.info("[%s] V3 AMD: %s", self.name, _amd_phase_v3)
+                            except Exception:
+                                pass
+                    # Phase 4 live: AnalyzerEngine drives the signal (AMD phase as primary)
                     try:
                         _df_m5_az = self._fetch_ltf_bars("M5", count=40)
-                        _az.update(df, _df_m5_az)
+                        _az.update(df, _df_m5_az, amd_phase=_amd_phase_v3)
                         desired = _az.get_armed_direction()
                         # Use stack score as signal_score proxy for downstream sizing
                         _az_score = _az.get_armed_score()
+                        # Store sizing multiplier — applied to combined_mult at trade entry
+                        self._v3_sizing_mult = _az.get_sizing_mult()
+                        if self._v3_sizing_mult != 1.0:
+                            logger.info("[%s] V3 sizing mult: %.2fx (score=%.1f)",
+                                        self.name, self._v3_sizing_mult, _az_score)
                         # Inject into strategy's _scores so downstream sizing picks it up
                         if hasattr(self._strategy, "_scores") and self._strategy._scores is not None and len(self._strategy._scores) > 0:
                             self._strategy._scores.iloc[-1] = round(_az_score / 10)  # normalize 0-100 → 0-10 scale
@@ -2075,6 +2101,12 @@ class TradingEngine(Component):
                             _az.update(df, _df_m5_az)
                         except Exception:
                             pass
+
+                # In v3 mode the AnalyzerEngine already evaluated all signal-quality
+                # confluences; skip the legacy quality gates (score floor, Market Reader,
+                # consolidation hour, AMD counter-sweep, HTF range bias, accumulation,
+                # liquidity draw). Only FTMO/DD hard limits and portfolio risk gates remain.
+                _v3_quality_skip = getattr(self, "_v3_mode", False)
 
                 current = trader.get_position_direction(self._symbol)
 
@@ -2128,7 +2160,8 @@ class TradingEngine(Component):
                     continue
 
                 # ── Pending M5 trigger: age out expired setups ────────────────
-                if self._pending_signal != 0 and current == 0:
+                # Skipped in v3 mode — AnalyzerEngine manages signal state (BORN→ARMED).
+                if not _v3_quality_skip and self._pending_signal != 0 and current == 0:
                     self._pending_bars += 1
                     df_m5_check = self._fetch_ltf_bars("M5", count=40)
                     atr_check   = 0.0
@@ -2318,9 +2351,10 @@ class TradingEngine(Component):
                         )
                     m5_confirmed = detect_m5_entry_trigger(df_m5_entry, desired, atr=atr_entry)
                     _shad.m5_confirmed = m5_confirmed
-                    if not m5_confirmed:
+                    if not m5_confirmed and not _v3_quality_skip:
                         # Route to pending M5 trigger — never enter without LTF confirmation.
                         # "entering anyway" produced 0 wins across live testing.
+                        # Skipped in v3 mode — AnalyzerEngine only arms signals after M5 confirms.
                         logger.info("[%s] M5 not confirmed — queuing pending trigger (not entering blind)", self.name)
                         if self._pending_signal == 0:
                             self._pending_signal = desired
@@ -2329,27 +2363,31 @@ class TradingEngine(Component):
                         continue
 
                     # ── Accumulation / distribution gate ─────────────────────
-                    accum_risk = detect_accumulation(
-                        df_m5_entry, desired, atr=atr_entry
-                    )
-                    if accum_risk >= 0.66:
-                        logger.warning(
-                            "[%s] ACCUM GATE: %.0f%% risk of opposing accumulation — blocked signal=%+d",
-                            self.name, accum_risk * 100, desired,
-                        )
-                        _shad.gates["accumulation"] = {"blocked": True, "value": round(accum_risk, 2)}; _shad.blocking_gate = "accumulation"; _shadow_logger.record(_shad)
-                        continue
+                    # Skipped in v3 mode — eq_liq_cluster weight in ProbabilityStack covers this.
+                    accum_risk = 0.0
+                    if not _v3_quality_skip:
+                        accum_risk = detect_accumulation(df_m5_entry, desired, atr=atr_entry)
+                        if accum_risk >= 0.66:
+                            logger.warning(
+                                "[%s] ACCUM GATE: %.0f%% risk of opposing accumulation — blocked signal=%+d",
+                                self.name, accum_risk * 100, desired,
+                            )
+                            _shad.gates["accumulation"] = {"blocked": True, "value": round(accum_risk, 2)}; _shad.blocking_gate = "accumulation"; _shadow_logger.record(_shad)
+                            continue
                     _shad.gates["accumulation"] = {"blocked": False, "value": round(accum_risk, 2)}
 
                     # ── Liquidity draw gate ───────────────────────────────────
-                    liq = detect_liquidity_draw(df_m5_entry, desired, atr=atr_entry)
-                    if liq["block_entry"]:
-                        logger.warning(
-                            "[%s] LIQUIDITY GATE: opposing pool %.1f ATR away vs aligned %.1f ATR — blocked",
-                            self.name, liq["opposing_pool"], liq["aligned_pool"],
-                        )
-                        _shad.gates["liquidity_draw"] = {"blocked": True, "opposing": liq["opposing_pool"], "aligned": liq["aligned_pool"]}; _shad.blocking_gate = "liquidity_draw"; _shadow_logger.record(_shad)
-                        continue
+                    # Skipped in v3 mode — at_htf_level + eq_liq_cluster weights cover this.
+                    liq = {"block_entry": False, "opposing_pool": 0.0, "aligned_pool": 0.0}
+                    if not _v3_quality_skip:
+                        liq = detect_liquidity_draw(df_m5_entry, desired, atr=atr_entry)
+                        if liq["block_entry"]:
+                            logger.warning(
+                                "[%s] LIQUIDITY GATE: opposing pool %.1f ATR away vs aligned %.1f ATR — blocked",
+                                self.name, liq["opposing_pool"], liq["aligned_pool"],
+                            )
+                            _shad.gates["liquidity_draw"] = {"blocked": True, "opposing": liq["opposing_pool"], "aligned": liq["aligned_pool"]}; _shad.blocking_gate = "liquidity_draw"; _shadow_logger.record(_shad)
+                            continue
                     _shad.gates["liquidity_draw"] = {"blocked": False}
 
                     # ── Correlation divergence gate ───────────────────────────
@@ -2504,6 +2542,7 @@ class TradingEngine(Component):
                     # Order flow confluence: checks delta + imbalance + DOM alignment
                     _of_snap = None   # safe default — overwritten below if M5 available
                     _cvd_mod = 0      # safe default — overwritten below if CVD fires
+                    _of_mod  = 0      # safe default — dir() never finds local vars; init here
                     _df_m5   = None   # safe default
                     try:
                         _df_m5 = self._strategy._m5_df if hasattr(self._strategy, "_m5_df") else None
@@ -2647,58 +2686,54 @@ class TradingEngine(Component):
                                 logger.info("[%s] DXY opposing: DXY bias=%+d, trade=%+d → score %d",
                                             self.name, _dxy_bias, desired, signal_score)
 
-                    # ── Trend-aware quality bar (fix #4) ──────────────────────
-                    # Bidirectional stays. The bar is NOT a flat score-6 on every
-                    # trade — that would miss too much. With-trend (aligned to the
-                    # H4 bias) clears a normal bar; a COUNTER-trend trade (e.g. an
-                    # index short into an up-bias) must be genuinely high-conviction.
-                    base_min    = int(self._trade_cfg.get("min_entry_score", 5))
-                    counter_min = int(self._trade_cfg.get("min_entry_score_counter", 6))
+                    # ── Score floor (v2) / stack threshold (v3) ───────────────
+                    # v2: integer score must clear a trend-aware floor.
+                    # v3: ProbabilityStack score is the gate; floor is 0 here (threshold
+                    #     was already applied in AnalyzerEngine.get_armed_direction()).
                     try:
                         h4_bias = (self._strategy.current_h4_bias(df)
                                    if hasattr(self._strategy, "current_h4_bias")
                                    else getattr(self._strategy, "_last_h4_bias", 0))
                     except Exception:
                         h4_bias = 0
-                    against_trend = (h4_bias != 0 and desired != h4_bias)
-                    needed = counter_min if against_trend else base_min
-                    if _daily_boost:
-                        old_needed = needed
-                        needed += _daily_boost
-                        logger.info(
-                            "[%s] Daily DD tier (%.2f%%) — score floor %d→%d (+%d)",
-                            self.name, _inline_daily_dd, old_needed, needed, _daily_boost,
-                        )
-
-                    # ── DD-aware score boost ───────────────────────────────────
-                    # When equity is deep in drawdown (within dd_score_boost_threshold %
-                    # of the soft halt), raise the bar. This gates marginal setups in
-                    # correlated instruments while still allowing genuinely high-conviction
-                    # trades to fire naturally (score high enough to clear the boosted floor).
-                    if self._risk_guard is not None:
-                        _init_eq   = getattr(self._risk_guard, "_initial_equity", None)
-                        _soft_pct  = float(self._trade_cfg.get("soft_dd_halt_pct", 7.0))
-                        _boost_thr = float(self._trade_cfg.get("dd_score_boost_threshold", 1.5))
-                        _boost_n   = int(self._trade_cfg.get("dd_score_boost", 2))
-                        if _init_eq and _init_eq > 0:
-                            _total_dd_pct = (_init_eq - equity) / _init_eq * 100
-                            if _total_dd_pct >= (_soft_pct - _boost_thr):
-                                old_needed = needed
-                                needed = needed + _boost_n
-                                logger.info(
-                                    "[%s] DD-boost active (DD=%.2f%%, within %.1f%% of soft halt): "
-                                    "score floor %d→%d",
-                                    self.name, _total_dd_pct, _boost_thr, old_needed, needed)
+                    if _v3_quality_skip:
+                        needed = 0
+                        against_trend = False
+                    else:
+                        base_min    = int(self._trade_cfg.get("min_entry_score", 0))
+                        counter_min = int(self._trade_cfg.get("min_entry_score_counter", 0))
+                        against_trend = (h4_bias != 0 and desired != h4_bias)
+                        needed = counter_min if against_trend else base_min
+                        if _daily_boost:
+                            old_needed = needed
+                            needed += _daily_boost
+                            logger.info(
+                                "[%s] Daily DD tier (%.2f%%) — score floor %d→%d (+%d)",
+                                self.name, _inline_daily_dd, old_needed, needed, _daily_boost,
+                            )
+                        # DD-aware score boost
+                        if self._risk_guard is not None:
+                            _init_eq   = getattr(self._risk_guard, "_initial_equity", None)
+                            _soft_pct  = float(self._trade_cfg.get("soft_dd_halt_pct", 7.0))
+                            _boost_thr = float(self._trade_cfg.get("dd_score_boost_threshold", 1.5))
+                            _boost_n   = int(self._trade_cfg.get("dd_score_boost", 2))
+                            if _init_eq and _init_eq > 0:
+                                _total_dd_pct = (_init_eq - equity) / _init_eq * 100
+                                if _total_dd_pct >= (_soft_pct - _boost_thr):
+                                    old_needed = needed
+                                    needed = needed + _boost_n
+                                    logger.info(
+                                        "[%s] DD-boost active (DD=%.2f%%, within %.1f%% of soft halt): "
+                                        "score floor %d→%d",
+                                        self.name, _total_dd_pct, _boost_thr, old_needed, needed)
 
                     _shad.base_score = signal_score; _shad.final_score = signal_score; _shad.score_floor = needed; _shad.floor_reason = "counter_trend" if against_trend else "with_trend"; _shad.h4_aligned = (getattr(self._strategy, "_last_h4_bias", 0) == desired)
 
-                    # ── Consolidation hour gate: 13–15 UTC (post-London ranging) ──────
-                    # Root cause from loss-streak-5: OB + H4 confluence overweights false
-                    # positives in ranging conditions. OB discount (−1 ≈ 0.7× weight) +
-                    # floor raised to 9. Trades scoring 7 in the bad cluster would have
-                    # discounted to 6 and been blocked before entry.
+                    # ── Consolidation hour gate: 13–15 UTC ────────────────────────
+                    # Skipped in v3 mode — time-of-day is a weight modifier in the stack,
+                    # not a binary gate. The stack score already discounts ranging hours.
                     _utc_hour = datetime.now(timezone.utc).hour
-                    if _utc_hour in {13, 14, 15}:
+                    if not _v3_quality_skip and _utc_hour in {13, 14, 15}:
                         _consol_score = signal_score - 1  # OB weight discount
                         if _consol_score < 9:
                             logger.info(
@@ -2718,57 +2753,60 @@ class TradingEngine(Component):
                             self.name, _utc_hour, signal_score,
                         )
 
-                    # ── Market Reader — narrative gate (replaces score floor) ──────────
-                    # All signals synthesized into a market narrative. trade_bias IS the
-                    # gate. Score now drives position sizing only, not entry.
-                    try:
-                        _mr_atr = float(getattr(self._strategy, "_atr_cache", pd.Series()).iloc[-1])
-                        if math.isnan(_mr_atr): _mr_atr = 0.0
-                    except Exception:
-                        _mr_atr = 0.0
-                    # Weekly mid for premium/discount filter — compute from M15 bars
-                    _w1_mid_mr = float("nan")
-                    try:
-                        if df is not None and isinstance(df.index, pd.DatetimeIndex):
-                            _w1_wk = df.resample("W-MON").agg({"high": "max", "low": "min"})
-                            if len(_w1_wk) >= 1:
-                                _wh = float(_w1_wk["high"].iloc[-1])
-                                _wl = float(_w1_wk["low"].iloc[-1])
-                                if not (math.isnan(_wh) or math.isnan(_wl)):
-                                    _w1_mid_mr = (_wh + _wl) / 2.0
-                    except Exception:
-                        pass
-                    _narrative = read_market(
-                        symbol=self._symbol, desired=desired,
-                        df_m15=df, df_m5=_df_m5, h4_bias=h4_bias,
-                        atr=_mr_atr, amd_sweep=_amd_sweep,
-                        of_snap=_of_snap, cvd_mod=_cvd_mod,
-                        w1_mid=_w1_mid_mr,
-                    )
-                    _shad.gates["market_reader"] = {
-                        "bias": _narrative.trade_bias, "vote": _narrative.vote,
-                        "phase": _narrative.phase, "confidence": _narrative.confidence,
-                        "reasons": _narrative.reasons, "blocking": _narrative.blocking,
-                    }
-                    if _narrative.trade_bias == 0:
-                        logger.info(
-                            "[%s] MARKET READER BLOCK: %s vote=%d phase=%s | blocking=%s",
-                            self.name, "BUY" if desired == 1 else "SELL",
-                            _narrative.vote, _narrative.phase, _narrative.blocking,
+                    # ── Market Reader — narrative gate (v2 only) ──────────────
+                    # Skipped in v3 mode — ProbabilityStack score IS the synthesized
+                    # narrative. The stack's archetype-weighted score replaces this gate.
+                    if not _v3_quality_skip:
+                        try:
+                            _mr_atr = float(getattr(self._strategy, "_atr_cache", pd.Series()).iloc[-1])
+                            if math.isnan(_mr_atr): _mr_atr = 0.0
+                        except Exception:
+                            _mr_atr = 0.0
+                        _w1_mid_mr = float("nan")
+                        try:
+                            if df is not None and isinstance(df.index, pd.DatetimeIndex):
+                                _w1_wk = df.resample("W-MON").agg({"high": "max", "low": "min"})
+                                if len(_w1_wk) >= 1:
+                                    _wh = float(_w1_wk["high"].iloc[-1])
+                                    _wl = float(_w1_wk["low"].iloc[-1])
+                                    if not (math.isnan(_wh) or math.isnan(_wl)):
+                                        _w1_mid_mr = (_wh + _wl) / 2.0
+                        except Exception:
+                            pass
+                        _narrative = read_market(
+                            symbol=self._symbol, desired=desired,
+                            df_m15=df, df_m5=_df_m5, h4_bias=h4_bias,
+                            atr=_mr_atr, amd_sweep=_amd_sweep,
+                            of_snap=_of_snap, cvd_mod=_cvd_mod,
+                            w1_mid=_w1_mid_mr,
                         )
-                        _shad.blocking_gate = "market_reader"
-                        _shadow_logger.record(_shad)
-                        continue
-                    logger.info(
-                        "[%s] MARKET READER GO: %s vote=%d phase=%s conf=%.2f | %s",
-                        self.name, "BUY" if desired == 1 else "SELL",
-                        _narrative.vote, _narrative.phase, _narrative.confidence,
-                        _narrative.reasons,
-                    )
+                        _shad.gates["market_reader"] = {
+                            "bias": _narrative.trade_bias, "vote": _narrative.vote,
+                            "phase": _narrative.phase, "confidence": _narrative.confidence,
+                            "reasons": _narrative.reasons, "blocking": _narrative.blocking,
+                        }
+                        if _narrative.trade_bias == 0:
+                            logger.info(
+                                "[%s] MARKET READER BLOCK: %s vote=%d phase=%s | blocking=%s",
+                                self.name, "BUY" if desired == 1 else "SELL",
+                                _narrative.vote, _narrative.phase, _narrative.blocking,
+                            )
+                            _shad.blocking_gate = "market_reader"
+                            _shadow_logger.record(_shad)
+                            continue
+                        logger.info(
+                            "[%s] MARKET READER GO: %s vote=%d phase=%s conf=%.2f | %s",
+                            self.name, "BUY" if desired == 1 else "SELL",
+                            _narrative.vote, _narrative.phase, _narrative.confidence,
+                            _narrative.reasons,
+                        )
                     _shad.gates["score_floor"] = {"blocked": False, "score": signal_score, "needed": needed}
 
-                    # ── Weak AMD counter-sweep gate (deferred to here for floor+2 check) ──
-                    if (_amd_sweep is not None
+                    # ── Weak AMD counter-sweep gate (v2 only — floor+2 check) ────
+                    # Skipped in v3 mode — sweep_present weight in ProbabilityStack already
+                    # penalises counter-sweep entries through the archetype scoring.
+                    if (not _v3_quality_skip
+                            and _amd_sweep is not None
                             and _amd_sweep.direction != desired
                             and not _amd_sweep.strong):
                         _sweep_sof = signal_score - needed
@@ -2792,12 +2830,10 @@ class TradingEngine(Component):
                             self.name, signal_score - needed,
                         )
 
-                    # ── HTF premium/discount range gate ────────────────────
-                    # If price is in the upper 25% of H4 range (premium), only take
-                    # sells; if in lower 25% (discount), only take buys. Counter-range
-                    # entries need floor+2 extra conviction — these are low-probability
-                    # trades. Mid-range (50%) = no constraint.
-                    if self._level_monitor is not None:
+                    # ── HTF premium/discount range gate (v2 only) ────────────
+                    # Skipped in v3 mode — premium_discount weight in ProbabilityStack
+                    # discounts counter-range entries through archetype scoring.
+                    if not _v3_quality_skip and self._level_monitor is not None:
                         _ls_rb = self._level_monitor._level_sets.get(self._symbol)
                         if _ls_rb is not None:
                             _cur_px   = float(df["close"].iloc[-1])
@@ -2921,7 +2957,7 @@ class TradingEngine(Component):
                             _scout_aligned,
                         )
 
-                    _of_aligned = bool(_of_mod > 0) if "_of_mod" in dir() else False
+                    _of_aligned = bool(_of_mod > 0)
                     _bar_time   = pd.to_datetime(df["time"].iloc[-1]) if df is not None and len(df) > 0 else None
                     _bar_price  = float(df["close"].iloc[-1]) if df is not None and len(df) > 0 else 0.0
                     if df is not None:
@@ -2929,7 +2965,8 @@ class TradingEngine(Component):
                     _smt_div    = _smt_divergence_present(self._symbol, df, desired) if df is not None else False
                     _sr_now     = getattr(self._strategy, "_score_reasons", None)
                     _cur_rsns   = list(_sr_now.iloc[-1]) if _sr_now is not None and len(_sr_now) > 0 else []
-                    _eq_liq     = any("liq cluster" in r for r in _cur_rsns)
+                    _eq_liq     = (any("liq cluster" in r for r in _cur_rsns)
+                                   or (bool(_amd_sweep.eq_liq) if _amd_sweep is not None else False))
                     # Early leakage: Asian session boundary broken before London open
                     # JP: "When I see price leak out of Asia early, London violates it harder"
                     _early_leak = False
@@ -3012,6 +3049,9 @@ class TradingEngine(Component):
                     n_open = len(trader.get_all_positions())   # magic-filtered (H3)
                     concentration_mult = 2.0 if n_open <= 1 else (1.5 if n_open <= 3 else 1.0)
                     combined_mult = size_mult * score_mult * concentration_mult
+                    # V3: apply checklist-based sizing multiplier (0.6–2.0) from AnalyzerEngine
+                    if getattr(self, "_v3_mode", False):
+                        combined_mult *= getattr(self, "_v3_sizing_mult", 1.0)
 
                     # ── Anti-tilt: geometric risk decay after consecutive losses ──
                     # Each unbroken loss shrinks the next trade's size by decay_factor.
@@ -3350,6 +3390,10 @@ class TradingEngine(Component):
                             _sr = getattr(self._strategy, "_score_reasons", None)
                             _reasons = list(_sr.iloc[-1]) if _sr is not None and len(_sr) else []
                             _reasons = _reasons + _extra_reasons
+                            _lc = getattr(self._strategy, "_last_confluences", {})
+                            _confluences = [k for k, v in _lc.items() if isinstance(v, bool) and v]
+                            if _bar_time is not None and _in_ict_macro(_bar_time):
+                                _confluences.append("in_ict_macro")
                             try:
                                 if self._journal is not None:
                                     self._journal.open_trade(
@@ -3368,6 +3412,7 @@ class TradingEngine(Component):
                                         target_price=_p.tp if _p else None,
                                         thesis=_p.thesis if _p else None,
                                         reasons=_reasons,
+                                        confluences=_confluences,
                                     )
                             except Exception as _je:
                                 logger.exception("[%s] Journal open_trade failed (trade live): %s", self.name, _je)
@@ -3603,8 +3648,15 @@ class Orchestrator:
             _v3_min_samples = int(_v3_cfg.get("go_no_go_min_samples", 50))
             _born_thr  = float(_v3_cfg.get("born_threshold", 35.0))
             try:
-                _az = AnalyzerEngine(symbol, self._strategies[symbol])
+                _az = AnalyzerEngine(symbol, self._strategies[symbol], news_gate=self._news_gate)
                 _az._BORN_THRESHOLD = _born_thr
+                # Override profile entry_threshold from config if present
+                # InstrumentProfile is a frozen dataclass — must use object.__setattr__
+                _cfg_thresholds = _v3_cfg.get("entry_thresholds", {})
+                if _az._profile is not None:
+                    _arch = _az._profile.archetype
+                    if _arch in _cfg_thresholds:
+                        object.__setattr__(_az._profile, "entry_threshold", int(_cfg_thresholds[_arch]))
                 if symbol in _v3_live:
                     _shadow_path = Path(__file__).parent.parent / "logs" / "shadow_stack.jsonl"
                     _ok, _msg = AnalyzerEngine.validate_cutover_ready(symbol, _shadow_path, _v3_min_samples)

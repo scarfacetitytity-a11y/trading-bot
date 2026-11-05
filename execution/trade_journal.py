@@ -60,6 +60,7 @@ class TradeRecord:
     target_price: Optional[float] = None   # liquidity target (structural TP)
     thesis:       Optional[str] = None
     reasons:      Optional[list] = None    # confluences that built the score
+    confluences:  Optional[list] = None    # active confluence names at entry (for quant analysis)
     atr:          Optional[float] = None   # ATR at entry (for stop-distance diagnostics)
     # ── Path tracking (MFE/MAE while open) ──
     path_high:    Optional[float] = None
@@ -96,7 +97,8 @@ class TradeJournal:
         try:
             if self._open_path.exists():
                 d = json.loads(self._open_path.read_text(encoding="utf-8"))
-                self._open = {k: TradeRecord(**v) for k, v in d.items()}
+                _fields = set(TradeRecord.__dataclass_fields__)
+                self._open = {k: TradeRecord(**{fk: fv for fk, fv in v.items() if fk in _fields}) for k, v in d.items()}
                 if self._open:
                     logger.info("[Journal] restored %d open trade(s) from disk", len(self._open))
         except Exception:
@@ -121,6 +123,7 @@ class TradeJournal:
         target_price: Optional[float] = None,
         thesis: Optional[str] = None,
         reasons: Optional[list] = None,
+        confluences: Optional[list] = None,
     ) -> None:
         now = datetime.now(tz=timezone.utc)
         self._open[symbol] = TradeRecord(
@@ -139,6 +142,7 @@ class TradeJournal:
             target_price=target_price,
             thesis=thesis,
             reasons=reasons or [],
+            confluences=confluences or [],
             atr=atr,
             path_high=entry_price,
             path_low=entry_price,

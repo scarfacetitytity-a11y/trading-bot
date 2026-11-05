@@ -46,6 +46,10 @@ _ARCHETYPES: dict[str, str] = {
     "GBPUSD":      "liquidity",
     "EURUSD":      "liquidity",
     "USDJPY":      "liquidity",
+    "AUDJPY":      "liquidity",
+    "NZDJPY":      "liquidity",
+    "GBPJPY":      "liquidity",
+    "AUDUSD":      "liquidity",
     "US30.cash":   "momentum",
     "US100.cash":  "momentum",
     "US500.cash":  "momentum",
@@ -56,9 +60,9 @@ _ARCHETYPES: dict[str, str] = {
 
 # Placeholder entry thresholds per archetype (probability-stack scale 0-100).
 _ENTRY_THRESHOLDS: dict[str, int] = {
-    "sniper":    62,
-    "liquidity": 65,
-    "momentum":  68,
+    "sniper":    35,   # AE max ~58; 35 passes decent S1/S2 setups, filters bare-minimum signals
+    "liquidity": 33,   # FX: slightly lower — fewer available confluence signals than metals
+    "momentum":  38,   # indices: trend-continuation needs stronger confirmation
 }
 
 # Placeholder confluence weights per archetype — CALIBRATED IN A LATER PHASE.

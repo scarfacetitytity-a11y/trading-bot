@@ -175,7 +175,9 @@ class AiDENIndexStrategy(Strategy):
 
     def __init__(
         self,
-        # Confluence gate
+        # Score floor — 0 = no gate (analysis-only). Strategy fires on all valid FVG setups;
+        # ProbabilityStack in AnalyzerEngine filters for live trading independently.
+        min_score: int           = 0,
         # H4 bias — in H4 BARS
         htf_lookback: int        = 20,
         h4_swing_lookback: int   = 40,
@@ -239,6 +241,7 @@ class AiDENIndexStrategy(Strategy):
         bb_std: float            = 2.0,
         bb_squeeze_pct: float    = 0.04,  # bandwidth / mid < 4% = squeeze
     ):
+        self.min_score            = min_score
         self.htf_lookback         = htf_lookback
         self.h4_swing_lookback    = h4_swing_lookback
         self.h4_bias_method       = h4_bias_method
@@ -289,6 +292,8 @@ class AiDENIndexStrategy(Strategy):
         self._uj_h4_bias:         int = 0
         # Set by orchestrator at startup so session windows are instrument-aware.
         self._symbol:             str = ""
+        # Confluence snapshot from the most recent fired entry — read by AnalyzerEngine.
+        self._last_confluences:   dict = {}
 
     @property
     def name(self) -> str:
@@ -830,6 +835,11 @@ class AiDENIndexStrategy(Strategy):
                                     bars_since_entry = 0
                                     self._scores.iloc[i] = fvg["score"]
                                     self._score_reasons.iloc[i] = fvg.get("reasons", [])
+                                    self._last_confluences = {
+                                        "ob_present": fvg["ob_lo"] is not None,
+                                        "sweep_present": "Sweep reversal" in fvg.get("reasons", []),
+                                        "level_strength": min(abs(fvg.get("trend_s", 0.0)) / max(self.rr_trend_threshold * 3, 1e-9), 1.0),
+                                    }
                                 to_remove.append(fvg)
 
                     else:  # bear
@@ -859,6 +869,11 @@ class AiDENIndexStrategy(Strategy):
                                     bars_since_entry = 0
                                     self._scores.iloc[i] = fvg["score"]
                                     self._score_reasons.iloc[i] = fvg.get("reasons", [])
+                                    self._last_confluences = {
+                                        "ob_present": fvg["ob_hi"] is not None,
+                                        "sweep_present": "Sweep reversal" in fvg.get("reasons", []),
+                                        "level_strength": min(abs(fvg.get("trend_s", 0.0)) / max(self.rr_trend_threshold * 3, 1e-9), 1.0),
+                                    }
                                 to_remove.append(fvg)
 
                 for fvg in to_remove:

@@ -12,6 +12,9 @@ import MetaTrader5 as mt5
 
 logger = logging.getLogger(__name__)
 
+# Set by connect() on every call; callers can inspect to distinguish error classes.
+_last_connect_error: Optional[int] = None
+
 _TRADE_MODE_NAMES = {
     mt5.ACCOUNT_TRADE_MODE_DEMO: "DEMO",
     mt5.ACCOUNT_TRADE_MODE_CONTEST: "CONTEST",
@@ -25,14 +28,19 @@ def connect(terminal_path: Optional[str] = None) -> bool:
     Returns True if connected to a logged-in account, False otherwise.
     Always logs the reason on failure.
     """
+    global _last_connect_error
+    _last_connect_error = None
+
     initialized = mt5.initialize(path=terminal_path) if terminal_path else mt5.initialize()
 
     if not initialized:
         err = mt5.last_error()
-        # Error -6 = Authorization failed: terminal is open but session expired.
-        # If credentials are available, pass them directly to initialize() to
-        # re-authenticate the expired session before giving up.
-        if err[0] == -6:
+        err_code = err[0]
+        _last_connect_error = err_code
+
+        # -6 = Authorization failed: terminal is open but session expired.
+        # Retry with credentials from env if available.
+        if err_code == -6:
             _login = os.environ.get("MT5_LOGIN")
             _password = os.environ.get("MT5_PASSWORD", "")
             _server = os.environ.get("MT5_SERVER", "")
@@ -47,6 +55,42 @@ def connect(terminal_path: Optional[str] = None) -> bool:
                 initialized = mt5.initialize(**kwargs)
                 if initialized:
                     logger.info("MT5 re-initialized with credentials for account %s", _login)
+                else:
+                    logger.error(
+                        "MT5 credential retry also failed: %s — "
+                        "session may require a manual login in the MT5 terminal.",
+                        mt5.last_error(),
+                    )
+            else:
+                logger.error(
+                    "MT5 authorization failed (-6) and no MT5_LOGIN env var is set — "
+                    "set MT5_LOGIN/MT5_PASSWORD/MT5_SERVER or manually log into the terminal."
+                )
+
+        # -10001 = IPC send failed: a stale IPC handle is open from a previous
+        # crashed terminal session. Shut down to release it so the next connect()
+        # call starts with a clean pipe.
+        elif err_code == -10001:
+            logger.error(
+                "MT5 IPC send failed (-10001) — stale IPC handle detected. "
+                "Releasing it so the next reconnect attempt starts clean."
+            )
+            mt5.shutdown()
+
+        # -10003 = IPC process create failed: MT5 could not launch the terminal
+        # executable. Common causes: wrong path, zombie process holding the lock,
+        # or UAC/permissions blocking the launch.
+        # Calling shutdown() releases any partial IPC state so the next retry
+        # attempt starts clean (mirrors the -10001 handling above).
+        elif err_code == -10003:
+            _path_used = terminal_path or "<default MT5 path>"
+            logger.error(
+                "MT5 cannot launch terminal process (-10003) at path: %s — "
+                "open Task Manager and kill any existing terminal64.exe, then "
+                "open the MT5 terminal manually before restarting the bot.",
+                _path_used,
+            )
+            mt5.shutdown()
 
     if not initialized:
         logger.error("MT5 initialize() failed: %s", mt5.last_error())

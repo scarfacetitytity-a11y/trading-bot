@@ -28,10 +28,34 @@ from core.market_reader import MarketReader, BarEvent, ZoneState, ZoneType, Zone
 from core.signal_lifecycle import SignalLifecycleManager, SignalCandidate, SignalState
 from core.probability_stack import StackInput, compute_stack_score
 from core.instrument_profile import PROFILES
+from execution.scenario_engine import ScenarioEngine
 
 logger = logging.getLogger(__name__)
 
 _LOG_PATH = Path(__file__).parent.parent / "logs" / "analyzer_v2.jsonl"
+
+# ICT algorithm delivery macro windows (UTC minutes from midnight).
+# Mirrors orchestrator._in_ict_macro — kept here to avoid circular import.
+_ICT_WINDOWS = [
+    (2*60+33, 3*60),
+    (4*60+3,  4*60+30),
+    (8*60+50, 9*60+10),
+    (9*60+50, 10*60+10),
+    (10*60+50, 11*60+10),
+    (13*60+10, 13*60+40),
+    (14*60+50, 15*60+10),
+    (15*60+15, 15*60+45),
+    (19*60+55, 20*60+5),
+]
+
+
+def _in_ict_macro_window(bar_time: str) -> bool:
+    try:
+        dt = pd.Timestamp(bar_time)
+        t = dt.hour * 60 + dt.minute
+        return any(s <= t <= e for s, e in _ICT_WINDOWS)
+    except Exception:
+        return False
 _LOG_LOCK = threading.Lock()
 
 
@@ -64,18 +88,21 @@ class AnalyzerEngine:
     SignalLifecycleManager. Does not interact with MT5 or place any order.
     """
 
-    # Minimum stack score for a candidate to be BORN (placeholder — calibrate from Phase 1 logs)
-    _BORN_THRESHOLD = 35.0
+    # Score gate disabled — ProbabilityStack is analysis-only, not an entry gate.
+    # All strategy signals are born; confluence data collected for quant analysis.
+    _BORN_THRESHOLD = 0.0
 
-    def __init__(self, symbol: str, strategy) -> None:
+    def __init__(self, symbol: str, strategy, news_gate=None) -> None:
         self.symbol   = symbol
         self._strategy = strategy
+        self._news_gate = news_gate
         self._reader   = MarketReader(symbol)
         self._slm      = SignalLifecycleManager(symbol, max_watch_bars=8)
         self._bar_idx  = 0
         self._state    = AnalyzerState(symbol=symbol)
         self._lock     = threading.Lock()
         self._profile  = PROFILES.get(symbol)
+        self._scenario_engine = ScenarioEngine()
 
         # Heartbeat support (compatible with orchestrator HeartbeatRegistry)
         self._last_beat: float = time.time()
@@ -92,7 +119,7 @@ class AnalyzerEngine:
 
     # ── Main update ───────────────────────────────────────────────────────────
 
-    def update(self, df: pd.DataFrame, df_m5: Optional[pd.DataFrame] = None) -> None:
+    def update(self, df: pd.DataFrame, df_m5: Optional[pd.DataFrame] = None, amd_phase=None) -> None:
         """Process one M15 bar. Call this after each bar closes."""
         if df is None or len(df) < 3:
             return
@@ -123,15 +150,48 @@ class AnalyzerEngine:
                     "note": ev.note,
                 })
 
-            # 2. Get strategy signal for this bar
-            desired = 0
+            # AMD phase: derive primary signal direction before strategy runs
+            _amd_direction = 0
+            if amd_phase is not None:
+                try:
+                    from core.amd_detector import MarketPhase as _MP
+                    if amd_phase.phase in (_MP.MANIPULATION, _MP.DISPLACEMENT):
+                        if amd_phase.sweep is not None:
+                            _amd_direction = amd_phase.sweep.direction
+                            logger.info(
+                                "[V3][%s] AMD %s | sweep %s @ %.5g → primary dir %+d",
+                                self.symbol, amd_phase.phase.value,
+                                "BULL" if _amd_direction == 1 else "BEAR",
+                                float(getattr(amd_phase.sweep, "swept_price", 0.0)),
+                                _amd_direction,
+                            )
+                except Exception:
+                    pass
+
+            # 2. Get strategy signal for this bar (entry zone data; AMD drives direction)
+            _strategy_desired = 0
             signal_score = 0
             try:
-                desired      = int(self._strategy.generate_signal(df))
-                _sc          = getattr(self._strategy, "_scores", None)
-                signal_score = int(_sc.iloc[-1]) if _sc is not None else 0
+                _sigs             = self._strategy.generate_signals(df)
+                _strategy_desired = int(_sigs.iloc[-1])
+                _sc               = getattr(self._strategy, "_scores", None)
+                signal_score      = int(_sc.iloc[-1]) if _sc is not None else 0
             except Exception:
                 pass
+            _confl = getattr(self._strategy, "_last_confluences", {})
+
+            # AMD direction takes priority; strategy is FVG/OB zone data only
+            desired = _amd_direction if _amd_direction != 0 else _strategy_desired
+
+            # News + ICT macro window — computed once per bar, used in StackInput below
+            _news_aligned = False
+            if self._news_gate is not None and desired != 0:
+                try:
+                    _nctx = self._news_gate.get_context()
+                    _news_aligned = _nctx.score_modifier(self.symbol, desired) > 0
+                except Exception:
+                    pass
+            _in_ict_macro = _in_ict_macro_window(bar_time)
 
             # 3. M5 confirmation check
             m5_confirmed_dirs: set[int] = set()
@@ -147,7 +207,42 @@ class AnalyzerEngine:
                     pass
 
             # 4. Compute stack score if signal present
-            if desired != 0 and signal_score > 0 and self._profile:
+            # AMD narrative is the gate; FVG/OB score gate removed
+            if desired != 0 and self._profile:
+                # Get H4 bias for scenario evaluation
+                _h4 = getattr(self._strategy, "_last_h4_bias", 0)
+                try:
+                    _h4 = int(self._strategy.current_h4_bias(df)) if hasattr(self._strategy, "current_h4_bias") else _h4
+                except Exception:
+                    pass
+
+                # Run ScenarioEngine to classify the setup (S1-S4)
+                _atr_val = 0.0
+                try:
+                    _a = getattr(self._strategy, "_atr_cache", None)
+                    if _a is not None and len(_a) > 0:
+                        import math
+                        _v = float(_a.iloc[-1])
+                        _atr_val = _v if not math.isnan(_v) else 0.0
+                except Exception:
+                    pass
+                try:
+                    _scenario = self._scenario_engine.evaluate(
+                        symbol=self.symbol, direction=desired,
+                        df_m15=df, df_m5=df_m5, h4_bias=_h4, atr=_atr_val,
+                    )
+                except Exception:
+                    _scenario = None
+
+                # fvg_present: True only if strategy found an FVG in the AMD direction.
+                # When AMD drives direction without a matching FVG, checklist score
+                # is lower (→ smaller sizing), but trade is not blocked.
+                _fvg_aligned = (_strategy_desired == desired and signal_score > 0)
+                # sweep_present: True when AMD sweep fired OR strategy detected it
+                _sweep_present = (
+                    _amd_direction != 0  # AMD phase detected a sweep
+                    or _confl.get("sweep_present", False)
+                )
                 inp = StackInput(
                     symbol=self.symbol,
                     signal_dir=desired,
@@ -155,8 +250,17 @@ class AnalyzerEngine:
                     archetype_threshold=self._profile.entry_threshold,
                     bar_time=bar_time,
                     base_score=signal_score,
+                    fvg_present=_fvg_aligned,
                     m5_confirmed=(desired in m5_confirmed_dirs),
-                    h4_aligned=(getattr(self._strategy, "_last_h4_bias", 0) == desired),
+                    h4_aligned=(_h4 == desired),
+                    ob_present=_confl.get("ob_present", False),
+                    sweep_present=_sweep_present,
+                    level_strength=_confl.get("level_strength", 0.0),
+                    news_aligned=_news_aligned,
+                    in_ict_macro=_in_ict_macro,
+                    scenario_class=_scenario.scenario if _scenario else "none",
+                    scenario_confidence=_scenario.confidence if _scenario else 0.0,
+                    scenario_go=(_scenario.verdict in ("GO", "SHADOW_GO")) if _scenario else False,
                 )
                 stack_score = compute_stack_score(inp)
 
@@ -224,14 +328,17 @@ class AnalyzerEngine:
     # ── V3 live mode interface ────────────────────────────────────────────────
 
     def get_armed_direction(self) -> int:
-        """Return the direction (+1/-1) of the highest-scoring ARMED candidate, or 0."""
+        """Return the direction (+1/-1) of the highest-scoring ARMED candidate, or 0.
+
+        Threshold gate removed: AMD narrative is the entry gate.
+        Sizing is modulated by get_sizing_mult() instead.
+        """
         with self._lock:
             armed = [c for c in self._slm.all_candidates() if c.state.value == "armed"]
             if not armed:
                 return 0
             best = max(armed, key=lambda c: c.stack_score)
-            threshold = self._profile.entry_threshold if self._profile else 65
-            return best.direction if best.stack_score >= threshold else 0
+            return best.direction
 
     def get_armed_score(self) -> float:
         """Return the stack score of the best ARMED candidate, or 0."""
@@ -240,6 +347,24 @@ class AnalyzerEngine:
             if not armed:
                 return 0.0
             return max(c.stack_score for c in armed)
+
+    def get_sizing_mult(self) -> float:
+        """Return sizing multiplier 0.6–2.0 based on checklist score.
+
+        Replaces threshold gate: low-context AMD trades fire at 0.6x,
+        high-confluence setups scale up to 2.0x. Nothing blocks except FTMO limits.
+        """
+        with self._lock:
+            armed = [c for c in self._slm.all_candidates() if c.state.value == "armed"]
+            if not armed:
+                return 1.0
+            score = max(c.stack_score for c in armed)
+            if score >= 70: return 2.0
+            if score >= 55: return 1.5
+            if score >= 40: return 1.25
+            if score >= 25: return 1.0
+            if score >= 15: return 0.75
+            return 0.6
 
     def consume_armed(self, direction: int) -> None:
         """Mark ARMED candidates in direction as FIRED (called by TradingEngine on trade fire)."""

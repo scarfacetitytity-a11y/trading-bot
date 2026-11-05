@@ -21,70 +21,108 @@ from typing import Dict, Optional
 
 # ── Confluence weights per archetype (0-100 normalized later) ────────────────
 # These are Phase 1 priors — calibrate from shadow logs before Phase 4.
+#
+# Scenario weights (S1-S4): ScenarioEngine classification feeds directly into
+# the stack. Weights reflect how well each scenario type matches the archetype's
+# primary edge. Scaled by scenario_confidence (0-1) for partial matches.
+#   S1 post-sweep-reversal: ICT kill shot — highest for sniper/liquidity
+#   S2 OB+FVG retracement:  universal retest quality — even across archetypes
+#   S3 continuation pullback: low-conviction for sniper; core for momentum
+#   S4 range sweep fade:    consolidation — best for FX liquidity archetype
 _WEIGHTS: Dict[str, Dict[str, float]] = {
     # Sniper (metals): sweep-to-POI entries, precision over volume
     "sniper": {
-        "h4_aligned":         5.0,
-        "fvg_present":        8.0,
-        "ob_present":         8.0,
-        "sweep_present":     12.0,
-        "m5_confirmed":       6.0,
-        "at_htf_level":       6.0,
-        "level_strength":     5.0,
-        "order_flow_aligned": 5.0,
-        "dom_aligned":        4.0,
-        "news_aligned":       3.0,
-        "in_ict_macro":       5.0,
-        "ipda_aligned":       5.0,
-        "smt_divergence":     8.0,
-        "eq_liq_cluster":     6.0,
-        "early_leakage":      4.0,
-        "scout_aligned":      5.0,
-        "regime_ok":          5.0,
+        "h4_aligned":               5.0,
+        "fvg_present":              8.0,
+        "ob_present":               8.0,
+        "sweep_present":           12.0,
+        "m5_confirmed":             6.0,
+        "at_htf_level":             6.0,
+        "level_strength":           5.0,
+        "order_flow_aligned":       5.0,
+        "dom_aligned":              4.0,
+        "news_aligned":             3.0,
+        "in_ict_macro":             5.0,
+        "ipda_aligned":             5.0,
+        "smt_divergence":           8.0,
+        "eq_liq_cluster":           6.0,
+        "early_leakage":            4.0,
+        "scout_aligned":            5.0,
+        "regime_ok":                5.0,
+        "s1_sweep_reversal":       15.0,
+        "s2_ob_fvg_retracement":   10.0,
+        "s3_continuation_pullback": 5.0,
+        "s4_range_sweep_fade":      8.0,
     },
     # Momentum (indices): trend continuation in session
     "momentum": {
-        "h4_aligned":        12.0,
-        "fvg_present":        6.0,
-        "ob_present":         6.0,
-        "sweep_present":      5.0,
-        "m5_confirmed":       8.0,
-        "at_htf_level":       5.0,
-        "level_strength":     4.0,
-        "order_flow_aligned": 8.0,
-        "dom_aligned":        5.0,
-        "news_aligned":       4.0,
-        "in_ict_macro":       6.0,
-        "ipda_aligned":       5.0,
-        "smt_divergence":     4.0,
-        "eq_liq_cluster":     4.0,
-        "early_leakage":      3.0,
-        "scout_aligned":      6.0,
-        "regime_ok":          9.0,
+        "h4_aligned":              12.0,
+        "fvg_present":              6.0,
+        "ob_present":               6.0,
+        "sweep_present":            5.0,
+        "m5_confirmed":             8.0,
+        "at_htf_level":             5.0,
+        "level_strength":           4.0,
+        "order_flow_aligned":       8.0,
+        "dom_aligned":              5.0,
+        "news_aligned":             4.0,
+        "in_ict_macro":             6.0,
+        "ipda_aligned":             5.0,
+        "smt_divergence":           4.0,
+        "eq_liq_cluster":           4.0,
+        "early_leakage":            3.0,
+        "scout_aligned":            6.0,
+        "regime_ok":                9.0,
+        "s1_sweep_reversal":        8.0,
+        "s2_ob_fvg_retracement":   10.0,
+        "s3_continuation_pullback": 14.0,
+        "s4_range_sweep_fade":      4.0,
     },
     # Liquidity (FX): engineered sweeps around session opens
     "liquidity": {
-        "h4_aligned":         8.0,
-        "fvg_present":        7.0,
-        "ob_present":         7.0,
-        "sweep_present":     12.0,
-        "m5_confirmed":       6.0,
-        "at_htf_level":       7.0,
-        "level_strength":     5.0,
-        "order_flow_aligned": 6.0,
-        "dom_aligned":        4.0,
-        "news_aligned":       4.0,
-        "in_ict_macro":       5.0,
-        "ipda_aligned":       6.0,
-        "smt_divergence":     6.0,
-        "eq_liq_cluster":     8.0,
-        "early_leakage":      5.0,
-        "scout_aligned":      5.0,
-        "regime_ok":          5.0,
+        "h4_aligned":               8.0,
+        "fvg_present":              7.0,
+        "ob_present":               7.0,
+        "sweep_present":           12.0,
+        "m5_confirmed":             6.0,
+        "at_htf_level":             7.0,
+        "level_strength":           5.0,
+        "order_flow_aligned":       6.0,
+        "dom_aligned":              4.0,
+        "news_aligned":             4.0,
+        "in_ict_macro":             5.0,
+        "ipda_aligned":             6.0,
+        "smt_divergence":           6.0,
+        "eq_liq_cluster":           8.0,
+        "early_leakage":            5.0,
+        "scout_aligned":            5.0,
+        "regime_ok":                5.0,
+        "s1_sweep_reversal":       12.0,
+        "s2_ob_fvg_retracement":   10.0,
+        "s3_continuation_pullback": 6.0,
+        "s4_range_sweep_fade":     10.0,
     },
 }
 
-_MAX_W: Dict[str, float] = {arch: sum(w.values()) for arch, w in _WEIGHTS.items()}
+# Scenario name → weight key mapping
+_SCENARIO_KEY: Dict[str, str] = {
+    "S1_post_sweep_reversal":    "s1_sweep_reversal",
+    "S2_ob_fvg_retracement":     "s2_ob_fvg_retracement",
+    "S3_continuation_pullback":  "s3_continuation_pullback",
+    "S4_range_sweep_fade":       "s4_range_sweep_fade",
+}
+
+# Scenario keys are mutually exclusive — at most one fires per bar.
+# max_w uses max(scenario_weights) not sum, so the ceiling is achievable.
+_SCENARIO_KEYS = frozenset(_SCENARIO_KEY.values())
+
+_MAX_W: Dict[str, float] = {
+    arch: (
+        sum(v for k, v in w.items() if k not in _SCENARIO_KEYS)
+        + max((v for k, v in w.items() if k in _SCENARIO_KEYS), default=0.0)
+    )
+    for arch, w in _WEIGHTS.items()
+}
 
 
 @dataclass
@@ -136,6 +174,12 @@ class StackInput:
     regime: str = "unknown"
     prob_model_prob: float = 0.0
 
+    # ScenarioEngine classification — scenario name + confidence fed as a weighted input.
+    # A GO verdict at full confidence contributes the full archetype scenario weight.
+    scenario_class: str = "none"       # e.g. "S1_post_sweep_reversal"
+    scenario_confidence: float = 0.0   # 0-1 from ScenarioEngine
+    scenario_go: bool = False          # True if verdict was GO (not NO_GO)
+
     fired: bool = False
 
 
@@ -162,6 +206,11 @@ def compute_stack_score(inp: StackInput) -> float:
     raw += w.get("early_leakage", 0)       * float(inp.early_leakage)
     raw += w.get("scout_aligned", 0)       * float(inp.scout_aligned)
     raw += w.get("regime_ok", 0)           * float(inp.regime not in ("flatline", "oscillation"))
+
+    # Scenario classification — scaled by confidence; only GO verdicts contribute.
+    _s_key = _SCENARIO_KEY.get(inp.scenario_class)
+    if _s_key and inp.scenario_go:
+        raw += w.get(_s_key, 0) * min(inp.scenario_confidence, 1.0)
 
     return round(raw / max_w * 100, 1)
 
@@ -222,6 +271,9 @@ class ShadowLogger:
                     "scout_aligned":      inp.scout_aligned,
                     "regime":             inp.regime,
                     "prob_model_prob":    inp.prob_model_prob,
+                    "scenario_class":     inp.scenario_class,
+                    "scenario_go":        inp.scenario_go,
+                    "scenario_confidence": inp.scenario_confidence,
                 },
                 "gates":            inp.gates,
                 "blocking_gate":    inp.blocking_gate,

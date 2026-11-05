@@ -5,7 +5,7 @@
 # Usage: powershell -ExecutionPolicy Bypass -File watchdog.ps1
 
 $BotDir    = $PSScriptRoot
-$PythonCmd = "C:\Python314\python.exe"
+$PythonCmd = "C:\Users\anton\Documents\trading-bot\venv\Scripts\python.exe"
 $LogFile   = Join-Path $BotDir "logs\watchdog.log"
 $PollSec   = 30
 
